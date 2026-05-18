@@ -1666,23 +1666,20 @@ private final class VideoSegmentProvider: HLSSegmentProvider {
         return segments[index].durationSeconds
     }
 
-    /// DIAGNOSTIC: VOD with `#EXT-X-ENDLIST` tells AVPlayer "this is the
-    /// complete asset, cache as much as RAM permits to enable arbitrary
-    /// backward seek." Empirically that's the 3 MB/sec RSS growth we've
-    /// been chasing on long 4K HDR HEVC sessions: every compressed
-    /// segment from session start stays resident because AVPlayer treats
-    /// VOD as cache-forever. `loadedTimeRanges` reports a 30 s window
-    /// but the actual byte retention is unbounded.
+    /// VOD per Apple HLS spec: every segment listed up-front with
+    /// `#EXT-X-ENDLIST`. AVPlayer treats VOD as cache-forever for
+    /// arbitrary backward seek; this is the 3 MB/sec RSS growth source
+    /// on long 4K HDR HEVC sessions and remains an open issue.
     ///
-    /// EVENT (no ENDLIST) tells AVPlayer "new segments may append over
-    /// time, don't aggressively cache." AVPlayer polls the playlist
-    /// every ~targetDuration/2 (≈ 2 s for our 4 s segments) and bounds
-    /// its segment cache to roughly the playable window.
-    ///
-    /// All segments are still listed in the playlist on every fetch, so
-    /// the user can still seek anywhere — AVPlayer just has to refetch
-    /// segments past its current cache when they jump out.
-    var playlistType: HLSPlaylistType { .event }
+    /// EVENT was tested as the alternative: it bounded growth to
+    /// ~1.7 MB/sec but AVPlayer rejected the static playlist with
+    /// CoreMediaErrorDomain -12888 ("Playlist File unchanged for longer
+    /// than 1.5 * target duration") because EVENT playlists are required
+    /// by spec to grow over time. Reverted; a proper sliding-window
+    /// playlist (append a segment per refresh until all are listed,
+    /// then add ENDLIST) is the real fix and is bigger than a one-line
+    /// diagnostic switch.
+    var playlistType: HLSPlaylistType { .vod }
     var masterCodecs: String? { codecsString }
     var masterSupplementalCodecs: String? { supplementalCodecsString }
     var masterResolution: (width: Int, height: Int)? {
