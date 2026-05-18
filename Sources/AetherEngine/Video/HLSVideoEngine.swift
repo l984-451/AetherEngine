@@ -1666,7 +1666,23 @@ private final class VideoSegmentProvider: HLSSegmentProvider {
         return segments[index].durationSeconds
     }
 
-    var playlistType: HLSPlaylistType { .vod }
+    /// DIAGNOSTIC: VOD with `#EXT-X-ENDLIST` tells AVPlayer "this is the
+    /// complete asset, cache as much as RAM permits to enable arbitrary
+    /// backward seek." Empirically that's the 3 MB/sec RSS growth we've
+    /// been chasing on long 4K HDR HEVC sessions: every compressed
+    /// segment from session start stays resident because AVPlayer treats
+    /// VOD as cache-forever. `loadedTimeRanges` reports a 30 s window
+    /// but the actual byte retention is unbounded.
+    ///
+    /// EVENT (no ENDLIST) tells AVPlayer "new segments may append over
+    /// time, don't aggressively cache." AVPlayer polls the playlist
+    /// every ~targetDuration/2 (≈ 2 s for our 4 s segments) and bounds
+    /// its segment cache to roughly the playable window.
+    ///
+    /// All segments are still listed in the playlist on every fetch, so
+    /// the user can still seek anywhere — AVPlayer just has to refetch
+    /// segments past its current cache when they jump out.
+    var playlistType: HLSPlaylistType { .event }
     var masterCodecs: String? { codecsString }
     var masterSupplementalCodecs: String? { supplementalCodecsString }
     var masterResolution: (width: Int, height: Int)? {
