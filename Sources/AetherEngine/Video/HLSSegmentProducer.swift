@@ -1149,11 +1149,14 @@ final class HLSSegmentProducer: @unchecked Sendable {
         }
         guard !cPath.isEmpty else { return nil }
         let fd = cPath.withUnsafeBufferPointer { buf -> Int32 in
-            // O_WRONLY | O_CREAT | O_TRUNC, mode 0644. Fail loud if
-            // creation fails so the muxer surfaces -ENOMEM-style errors
-            // back to its caller; better than silently routing into a
-            // black-hole sink.
-            return open(buf.baseAddress, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+            // creat(path, mode) == open(path, O_WRONLY|O_CREAT|O_TRUNC,
+            // mode). Used instead of open() because Swift on Darwin
+            // marks the variadic 3-arg open form unavailable; creat
+            // is the non-variadic equivalent for the create-and-truncate
+            // path. Fail loud if it fails so the muxer surfaces
+            // -ENOMEM-style errors back to its caller, better than
+            // silently routing writes into a black-hole sink.
+            return creat(buf.baseAddress, 0o644)
         }
         guard fd >= 0 else { return nil }
 
