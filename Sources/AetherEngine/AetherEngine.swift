@@ -1,4 +1,3 @@
-import Darwin
 import Foundation
 import QuartzCore
 import CoreMedia
@@ -246,60 +245,6 @@ public final class AetherEngine: ObservableObject {
     /// On macOS / aetherctl the line goes to stdout; on tvOS it goes to
     /// `EngineLog.handler` so the host's diagnostic overlay sees it too.
     private var memoryProbeTask: Task<Void, Never>?
-
-    /// DIAGNOSTIC POC: how often the memprobe should trigger an
-    /// AVPlayerItem reload. Zero disables the POC (production
-    /// behaviour). Single test run (2026-05-18) with this at 300s
-    /// confirmed:
-    ///   - reload mechanism functions (AVPlayer rebuilds item, seek
-    ///     to position restores correctly)
-    ///   - RSS drop after reload + 2s wait was only ~73 MB out of
-    ///     ~900 MB above baseline → most accumulated state survives
-    ///     item replacement
-    ///   - playback broke 30s after reload because the producer-side
-    ///     pipeline had pruned the next-up segments based on the
-    ///     pre-reload AVPlayer target; AVPlayer asked for them after
-    ///     reload, cache timed out → 404 → stall
-    /// Conclusion: AVPlayer's deep state (HEVC decoder pool,
-    /// IOSurface pool, internal HLS-fMP4 demuxer cache) does NOT
-    /// release on item replacement. The AVQueuePlayer-chunked
-    /// approach would have the same fundamental limitation. Path
-    /// scrapped — see test results in PR / commit history.
-    /// Keep at 0 in production.
-    private static let DIAG_RELOAD_INTERVAL_SEC: TimeInterval = 0
-
-    /// Wall-clock timestamp of the last POC reload, or nil if no reload
-    /// has fired yet this session. Compared against the memprobe tick
-    /// to decide when to trigger the next reload.
-    private var lastReloadAt: Date?
-
-    /// DIAGNOSTIC POC: how often the memprobe should force-restart the
-    /// HLSVideoEngine producer (libavformat hlsenc + mp4 sub-muxer
-    /// teardown + recreate at the current playback position) to
-    /// discriminate the long-form 4K HDR HEVC leak source. With
-    /// `vmIntDrop=0` confirming the bytes are genuinely referenced
-    /// (not malloc fragmentation) and `vmExt` / `vmIOS` flat, the
-    /// remaining candidates are libavformat's accumulating internal
-    /// state or AVPlayer's HLS demuxer parser state in our process.
-    ///
-    /// Periodic producer restart tears down the AVFormatContext for
-    /// hlsenc and its child mp4 sub-muxer. AVPlayer keeps fetching
-    /// from cache uninterrupted because the cache window covers
-    /// 30+ s of upcoming segments. If `vmInt` drops sharply after
-    /// the restart, libavformat was holding the bytes (which means
-    /// either workaround via periodic restart or rewrite the muxer).
-    /// If `vmInt` keeps climbing, AVPlayer is the source and we have
-    /// to pivot to the VTDecompressionSession + AVSampleBufferDisplayLayer
-    /// architecture instead of HLS-loopback.
-    ///
-    /// Set to 0 in production. Set to a positive value (e.g. 120 s)
-    /// when running the diagnostic test.
-    private static let DIAG_PRODUCER_RESTART_INTERVAL_SEC: TimeInterval = 120
-
-    /// Wall-clock timestamp of the last diagnostic producer restart.
-    /// Compared against the memprobe tick to decide when to trigger
-    /// the next restart.
-    private var lastProducerRestartAt: Date?
 
     /// The URL of the current playback session. Used by
     /// `reloadAtCurrentPosition()` to rebuild the pipeline after
@@ -636,16 +581,7 @@ public final class AetherEngine: ObservableObject {
         case AV_CODEC_ID_VP9:
             useSoftwarePath = true
         default:
-            // POC: HEVC can be forced through the VT-backed software
-            // host via `LoadOptions.forceSoftwareForHEVC = true` for
-            // memory diagnostics. Default routing stays on the native
-            // AVPlayer path because the long-form 4K HDR HEVC memory
-            // issue is being investigated as an HLS-fMP4 fragment
-            // problem first; if that path closes, the routing flag
-            // becomes the default true and the VT POC ships as the
-            // production HEVC path.
-            useSoftwarePath = options.forceSoftwareForHEVC
-                && detectedCodecID == AV_CODEC_ID_HEVC
+            useSoftwarePath = false
         }
         EngineLog.emit("[AetherEngine] dispatch: codec=\(detectedCodecID.rawValue) → \(useSoftwarePath ? "software" : "native")", category: .engine)
 
@@ -1501,8 +1437,6 @@ public final class AetherEngine: ObservableObject {
         // leak the panel mode into the next playback.
         memoryProbeTask?.cancel()
         memoryProbeTask = nil
-        lastReloadAt = nil
-        lastProducerRestartAt = nil
         nativeCancellables.removeAll()
         nativeHost?.tearDown()
         nativeHost = nil
@@ -1596,24 +1530,13 @@ public final class AetherEngine: ObservableObject {
                 // (mmap'd cache files, dyld) vs IOSurface (HEVC decoded
                 // frames) vs compressed (kernel-compressed pages still
                 // accounted to us).
-                //
-                // The probe also asks malloc to release back to the OS
-                // any free pages it's holding in its arenas, and reports
-                // the vmInt drop. If `vmIntDrop` is large, the leak is
-                // really malloc arena fragmentation; if it's near zero,
-                // the bytes are genuinely retained somewhere upstream.
-                let vmBefore = Self.vmBreakdownMB()
-                Self.releaseMallocFreePages()
-                let vm = Self.vmBreakdownMB()
                 let vmStr: String
-                if let vm = vm, let vmBefore = vmBefore {
-                    let drop = max(0, vmBefore.internalMB - vm.internalMB)
+                if let vm = Self.vmBreakdownMB() {
                     vmStr = "vmInt=\(vm.internalMB)MB "
                         + "vmExt=\(vm.externalMB)MB "
                         + "vmCmp=\(vm.compressedMB)MB "
                         + "vmIOS=\(vm.iosurfaceMB)MB "
                         + "physFP=\(vm.physFootprintMB)MB "
-                        + "vmIntDrop=\(drop)MB "
                 } else {
                     vmStr = ""
                 }
@@ -1641,90 +1564,6 @@ public final class AetherEngine: ObservableObject {
                 // One line per 30 s is cheap; the rest of EngineLog stays
                 // single-sink to avoid console spam.
                 print(line)
-
-                // DIAGNOSTIC POC: trigger AVPlayerItem reload if enough
-                // time has passed since the last one (or since session
-                // start). Measures whether AVPlayer's item replacement
-                // actually releases accumulated state.
-                if Self.DIAG_RELOAD_INTERVAL_SEC > 0,
-                   let host = self.nativeHost {
-                    let referenceTime = self.lastReloadAt ?? sessionStart
-                    let sinceLastReload = Date().timeIntervalSince(referenceTime)
-                    if sinceLastReload >= Self.DIAG_RELOAD_INTERVAL_SEC {
-                        let rssBefore = Self.residentMemoryMB()
-                        let reloadStart = DispatchTime.now()
-                        let position = host.reloadCurrentItem()
-                        let elapsedMs = Double(
-                            DispatchTime.now().uptimeNanoseconds
-                            - reloadStart.uptimeNanoseconds
-                        ) / 1_000_000
-                        // Wait 2 s so AVPlayer's async teardown of the
-                        // old item has time to actually release memory
-                        // before we sample. The synchronous part of
-                        // load() returns fast, but ARC + AVFoundation
-                        // internal cleanup happens off the main actor.
-                        try? await Task.sleep(for: .seconds(2))
-                        let rssAfter2s = Self.residentMemoryMB()
-                        let delta = rssAfter2s - rssBefore
-                        let pocLine = "[AetherEngine] POC reload result: "
-                            + "rssBefore=\(rssBefore)MB rssAfter+2s=\(rssAfter2s)MB "
-                            + "delta=\(delta)MB callDuration=\(String(format: "%.0f", elapsedMs))ms "
-                            + "position=\(position.map { String(format: "%.2fs", $0) } ?? "nil")"
-                        EngineLog.emit(pocLine, category: .engine)
-                        print(pocLine)
-                        self.lastReloadAt = Date()
-                    }
-                }
-
-                // DIAGNOSTIC: trigger HLSVideoEngine producer restart
-                // (libavformat hlsenc + mp4 sub-muxer teardown +
-                // recreate at current playback time) if enough time
-                // has passed. Measures vmInt drop after restart to
-                // discriminate libavformat-side vs AVPlayer-side leak.
-                if Self.DIAG_PRODUCER_RESTART_INTERVAL_SEC > 0,
-                   let videoEngine = self.nativeVideoSession,
-                   let avPlayer = self.currentAVPlayer,
-                   let item = avPlayer.currentItem {
-                    let referenceTime = self.lastProducerRestartAt ?? sessionStart
-                    let sinceLastRestart = Date().timeIntervalSince(referenceTime)
-                    if sinceLastRestart >= Self.DIAG_PRODUCER_RESTART_INTERVAL_SEC {
-                        let nowSeconds = item.currentTime().seconds
-                            + self.playlistShiftSeconds
-                        let vmBefore = Self.vmBreakdownMB()
-                        let restartStart = DispatchTime.now()
-                        let restartedIdx = videoEngine.diagnosticForceRestart(
-                            forCurrentSeconds: nowSeconds
-                        )
-                        let elapsedMs = Double(
-                            DispatchTime.now().uptimeNanoseconds
-                            - restartStart.uptimeNanoseconds
-                        ) / 1_000_000
-                        // Wait 3 s so the old producer's AVFormatContext
-                        // teardown + libavformat free path actually run
-                        // before we sample. The pump's waitForFinish in
-                        // restartProducer is bounded at 5 s; 3 s after the
-                        // call returns is enough for the heap state to
-                        // settle.
-                        try? await Task.sleep(for: .seconds(3))
-                        let vmAfter = Self.vmBreakdownMB()
-                        if let vmBefore = vmBefore, let vmAfter = vmAfter {
-                            let intDelta = vmBefore.internalMB - vmAfter.internalMB
-                            let cmpDelta = vmBefore.compressedMB - vmAfter.compressedMB
-                            let fpDelta = vmBefore.physFootprintMB - vmAfter.physFootprintMB
-                            let pocLine = "[AetherEngine] DIAG producer-restart: "
-                                + "atSeg=\(restartedIdx.map(String.init) ?? "nil") "
-                                + "callDuration=\(String(format: "%.0f", elapsedMs))ms "
-                                + "vmIntBefore=\(vmBefore.internalMB)MB "
-                                + "vmIntAfter=\(vmAfter.internalMB)MB "
-                                + "vmIntDelta=\(intDelta)MB "
-                                + "vmCmpDelta=\(cmpDelta)MB "
-                                + "physFPDelta=\(fpDelta)MB"
-                            EngineLog.emit(pocLine, category: .engine)
-                            print(pocLine)
-                        }
-                        self.lastProducerRestartAt = Date()
-                    }
-                }
             }
         }
     }
@@ -1746,28 +1585,9 @@ public final class AetherEngine: ObservableObject {
         return Int(info.resident_size / 1024 / 1024)
     }
 
-    /// Ask every malloc zone to return free pages it's holding to the
-    /// kernel. The default zone holds freed allocations in per-zone
-    /// arenas for reuse — at high alloc + free throughput (the
-    /// libavformat AVPacket + AVBuffer churn under steady playback)
-    /// the arenas grow and rarely give pages back without explicit
-    /// pressure. Calling pressure_relief synchronously walks the zone
-    /// freelists and `madvise(MADV_FREE_REUSABLE)`s anything that's
-    /// fully free, telling the kernel the page can be reclaimed.
-    ///
-    /// Called from the 30-second memprobe BEFORE the post-relief
-    /// `task_vm_info` read so the probe's `vmIntDrop` field shows how
-    /// much malloc was holding. Large drop = malloc arena
-    /// fragmentation; near-zero drop = bytes genuinely retained.
-    static func releaseMallocFreePages() {
-        // 0 = all zones. The flags arg is unused by Darwin's
-        // implementation.
-        malloc_zone_pressure_relief(nil, 0)
-    }
-
-    /// Detailed VM breakdown via `task_vm_info`. The fields split
-    /// the process's phys_footprint (jetsam-accounted bytes) into
-    /// the buckets the kernel actually tracks separately:
+    /// Detailed VM breakdown via `task_vm_info`. Splits the process's
+    /// phys_footprint (jetsam-accounted bytes) into the buckets the
+    /// kernel tracks separately:
     ///
     ///   internal:   anonymous memory — heap, stack, NSData backing,
     ///               anything malloc'd
@@ -1778,12 +1598,8 @@ public final class AetherEngine: ObservableObject {
     ///   iosurfaces: IOSurface-backed device memory (decoded video
     ///               frames, AVPlayer's HEVC reference pool)
     ///
-    /// When phys_footprint climbs at ~3 MB/sec the breakdown tells us
-    /// which bucket is growing: heap (Swift / libavformat alloc) vs
-    /// mmap (segment cache / dyld) vs IOSurface (decoder pool). That
-    /// disambiguation is what we need to attack the long-form 4K HDR
-    /// HEVC leak from the right direction instead of patching
-    /// theories blind.
+    /// Surfaced in the 30 s memprobe line so memory-growth investigations
+    /// can see which bucket moved between samples.
     static func vmBreakdownMB() -> (internalMB: Int,
                                     externalMB: Int,
                                     compressedMB: Int,
