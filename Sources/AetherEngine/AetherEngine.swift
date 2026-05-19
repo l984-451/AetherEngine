@@ -1561,8 +1561,26 @@ public final class AetherEngine: ObservableObject {
                 let packetsWritten = stats?.producerPacketsWritten ?? 0
                 let audioFifo = stats?.audioFifoSamples ?? 0
 
+                // VM breakdown so the leak source is visible at probe
+                // time: internal (Swift / libavformat heap) vs external
+                // (mmap'd cache files, dyld) vs IOSurface (HEVC decoded
+                // frames) vs compressed (kernel-compressed pages still
+                // accounted to us).
+                let vm = Self.vmBreakdownMB()
+                let vmStr: String
+                if let vm = vm {
+                    vmStr = "vmInt=\(vm.internalMB)MB "
+                        + "vmExt=\(vm.externalMB)MB "
+                        + "vmCmp=\(vm.compressedMB)MB "
+                        + "vmIOS=\(vm.iosurfaceMB)MB "
+                        + "physFP=\(vm.physFootprintMB)MB "
+                } else {
+                    vmStr = ""
+                }
+
                 let line = "[AetherEngine] memprobe t=\(elapsed)s "
                     + "rss=\(rssMB)MB "
+                    + vmStr
                     + "avioFetchedMB=\(avioMB) "
                     + "cacheCount=\(cacheCount) cacheMB=\(cacheMB) "
                     + "packetsWritten=\(packetsWritten) "
@@ -1636,6 +1654,49 @@ public final class AetherEngine: ObservableObject {
         }
         guard kr == KERN_SUCCESS else { return 0 }
         return Int(info.resident_size / 1024 / 1024)
+    }
+
+    /// Detailed VM breakdown via `task_vm_info`. The fields split
+    /// the process's phys_footprint (jetsam-accounted bytes) into
+    /// the buckets the kernel actually tracks separately:
+    ///
+    ///   internal:   anonymous memory — heap, stack, NSData backing,
+    ///               anything malloc'd
+    ///   external:   file-backed memory — mmap'd files, dyld text/data,
+    ///               our SegmentCache reads via `.alwaysMapped`
+    ///   compressed: pages the kernel compressed under pressure (still
+    ///               counted against the process footprint)
+    ///   iosurfaces: IOSurface-backed device memory (decoded video
+    ///               frames, AVPlayer's HEVC reference pool)
+    ///
+    /// When phys_footprint climbs at ~3 MB/sec the breakdown tells us
+    /// which bucket is growing: heap (Swift / libavformat alloc) vs
+    /// mmap (segment cache / dyld) vs IOSurface (decoder pool). That
+    /// disambiguation is what we need to attack the long-form 4K HDR
+    /// HEVC leak from the right direction instead of patching
+    /// theories blind.
+    static func vmBreakdownMB() -> (internalMB: Int,
+                                    externalMB: Int,
+                                    compressedMB: Int,
+                                    iosurfaceMB: Int,
+                                    physFootprintMB: Int)? {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(
+            MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size
+        )
+        let kr = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+            }
+        }
+        guard kr == KERN_SUCCESS else { return nil }
+        return (
+            internalMB: Int(info.internal / 1024 / 1024),
+            externalMB: Int(info.external / 1024 / 1024),
+            compressedMB: Int(info.compressed / 1024 / 1024),
+            iosurfaceMB: Int(info.device / 1024 / 1024),
+            physFootprintMB: Int(info.phys_footprint / 1024 / 1024)
+        )
     }
 
     // MARK: - Decoder identity helpers
