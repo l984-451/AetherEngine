@@ -74,28 +74,31 @@ final class AVIOReader: @unchecked Sendable {
 
     // MARK: - Seekable Mode (Range requests)
 
-    /// Settled chunk size: 4 MB (PROBE).
+    /// Settled chunk size: 4 MB.
     ///
-    /// Lowered 2026-05-22 from 8 MB to push cold-start latency down
-    /// from ~1.4 s to ~0.7 s on 45 Mbps 4K HEVC. The delegate-based
-    /// fetch path (`chunkSession` + `ChunkFetchDelegate`) handles
-    /// arbitrary frequency without invalidation backlog, so the leak
-    /// risk that drove the 8 MB → 64 MB revert (10dbf76) under the
-    /// completion-handler pattern doesn't apply here. Field
-    /// validation pending; if mallocMB stays bounded under a 5+ min
-    /// run, this sticks. Otherwise revert to 8 MB.
+    /// Field-validated 2026-05-22: paired with the delegate-based
+    /// fetch path (`chunkSession` + `ChunkFetchDelegate`), 4 MB
+    /// chunks stay bounded through 5+ min runs and deliver ~0.7 s
+    /// cold-start chunk wait on 45 Mbps 4K HEVC (versus ~1.4 s at
+    /// 8 MB, ~10 s at the historic 64 MB). Promoted from PROBE to
+    /// shipped after field validation confirmed no leak at the
+    /// 4 MB / ~1.4 ops/sec cadence.
     ///
-    /// Why not even smaller (2 MB / 1 MB): diminishing returns on
-    /// cold-start (sub-0.5 s gains) versus rising HTTP roundtrip
-    /// overhead (5+ ops/sec on remote CDN starts to add up to
-    /// 50-275 ms/sec of server-side processing time per second of
-    /// playback).
+    /// Why this works at any chunk size (where the historic 8 MB
+    /// attempt leaked): delegate-based incremental delivery doesn't
+    /// accumulate a monolithic response body in URLSession's task
+    /// object. Each chunk is force-copied into the delegate's body
+    /// buffer per `urlSession(_:dataTask:didReceive data:)` call,
+    /// and URLSession releases the source dispatch_data after the
+    /// delegate ack returns. No per-request `finishTasksAndInvalidate`
+    /// either (shared session), so no invalidation backlog at high
+    /// fetch frequency.
     ///
-    /// Field-validated history at 8 MB (the previous shipped value):
-    /// mallocMB plateaus 103-139 MB through a 5-min Harry Potter 4K
-    /// HDR run with mid-session scrub. avioFetched climbed linearly
-    /// to 2144 MB as expected. Reference for the safe baseline if
-    /// 4 MB needs reverting.
+    /// Why not even smaller (2 MB / 1 MB): diminishing returns. From
+    /// 8 MB → 4 MB the cold-start improved noticeably; from 4 MB →
+    /// 2 MB the gain is sub-0.5 s while HTTP roundtrip overhead at
+    /// 5+ ops/sec on remote CDN starts adding 50-275 ms/sec of
+    /// server processing time per playback second. Not worth it.
     ///
     /// Why the previous 8 MB attempt (e327e5e) leaked at 6 MB/sec
     /// where this one doesn't: the old path used per-request
@@ -164,7 +167,7 @@ final class AVIOReader: @unchecked Sendable {
     ///     would need re-validating that force-copy makes the pool
     ///     drop bytes promptly enough.
     ///   - Bounded pool of N reusable URLSessions, round-robin.
-    private static let chunkSize = 4 * 1024 * 1024  // 4 MB per chunk (probe)
+    private static let chunkSize = 4 * 1024 * 1024  // 4 MB per chunk
     private static let avioBufferSize: Int32 = 256 * 1024  // 256 KB
     private static let streamTrimThreshold = 1024 * 1024  // 1 MB, keep for small backward seeks
 
