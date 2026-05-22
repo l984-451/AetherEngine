@@ -74,28 +74,24 @@ final class AVIOReader: @unchecked Sendable {
 
     // MARK: - Seekable Mode (Range requests)
 
-    /// Diagnostic A/B round 2: bumped from 64 MB to 256 MB to test
-    /// whether the residual ~0.65 MB/s leak that survives the 64 MB
-    /// jump is still proportional to URLSession call count or has
-    /// shifted to a per-recycle teardown leak (the parallel hypothesis).
+    /// Settled chunk size: 64 MB.
     ///
-    /// 8 MB chunks  → 3.20 MB/s leak (URLSession-dominated)
-    /// 64 MB chunks → 0.64 MB/s leak (5x reduction; partial fix)
-    /// 256 MB chunks → ?
+    /// A/B history:
+    ///   8 MB chunks  → 3.20 MB/s leak (URLSession-call-count dominated)
+    ///   64 MB chunks → 0.64 MB/s leak (5x reduction; sweet spot)
+    ///   256 MB chunks → 4.85 MB/s leak + memory warnings (worse than 8 MB)
     ///
-    /// If 256 MB drops the rate to ~0.16 MB/s (linear with call count
-    /// reduction) → URLSession is still the primary source. The
-    /// "remaining" leak is just the same per-call leak at lower rate.
-    /// If 256 MB stays at ~0.64 MB/s → URLSession is no longer the
-    /// dominant contributor; the remainder is in demuxer recycle
-    /// teardown (old AVIOReader / AVFormatContext retention) or
-    /// elsewhere.
-    ///
-    /// Memory cost during this spike: ~512 MB peak (one current + one
-    /// prefetch chunk). Acceptable on a 4 GB Apple TV 4K for a
-    /// diagnostic; not appropriate for production until we know which
-    /// chunk size to commit to.
-    private static let chunkSize = 256 * 1024 * 1024  // 256 MB per chunk (diagnostic A/B round 2)
+    /// The 256 MB attempt failed because at 50 Mbps source bitrate each
+    /// chunk fetch takes ~40 s, which is comparable to the 120 s
+    /// demuxer-recycle cadence. Every recycle now catches a prefetch
+    /// closure in flight on `prefetchQueue`, and the closure's
+    /// `prefetchBuffer = data` assignment writes a fresh 256 MB Data
+    /// after `close()` has already nil'd the field. Plus the underlying
+    /// URLSession stays alive (async `finishTasksAndInvalidate`) with
+    /// the response body pinned. 64 MB is short enough that the fetch
+    /// usually completes well before the recycle window, so the race
+    /// happens rarely.
+    private static let chunkSize = 64 * 1024 * 1024  // 64 MB per chunk
     private static let avioBufferSize: Int32 = 256 * 1024  // 256 KB
     private static let streamTrimThreshold = 1024 * 1024  // 1 MB, keep for small backward seeks
 
@@ -434,6 +430,23 @@ final class AVIOReader: @unchecked Sendable {
         prefetchQueue.async { [weak self] in
             guard let self = self else { return }
 
+            // Bail before issuing the fetch if close already ran.
+            // Without this the closure would still spend up to one
+            // chunk-size worth of network time downloading data that
+            // we're about to throw away — and at high source bitrates
+            // that download window is comparable to the periodic
+            // demuxer-recycle cadence, so the closure was reliably
+            // completing AFTER close() had cleared the buffers and
+            // writing its fresh chunk-size Data back into
+            // `prefetchBuffer`, undoing the cleanup.
+            if self.isFullyClosed {
+                self.bufferLock.lock()
+                self.isPrefetching = false
+                self.bufferLock.unlock()
+                self.prefetchReady.signal()
+                return
+            }
+
             let size: Int
             if self.fileSize > 0 {
                 size = min(Self.chunkSize, Int(self.fileSize - offset))
@@ -444,8 +457,17 @@ final class AVIOReader: @unchecked Sendable {
             let data = size > 0 ? self.fetchChunk(from: offset, size: size) : nil
 
             self.bufferLock.lock()
-            self.prefetchBuffer = data
-            self.prefetchOffset = offset
+            // Re-check under lock: close() may have fired while
+            // fetchChunk was blocking on the network. If so, drop the
+            // freshly-fetched data on the floor instead of pinning
+            // chunk-size bytes in prefetchBuffer for an
+            // already-discarded reader. The Data goes out of scope at
+            // the end of this block and its backing buffer is freed
+            // immediately.
+            if !self.isFullyClosed {
+                self.prefetchBuffer = data
+                self.prefetchOffset = offset
+            }
             self.isPrefetching = false
             self.bufferLock.unlock()
 
