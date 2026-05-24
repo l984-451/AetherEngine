@@ -1687,7 +1687,7 @@ public final class AetherEngine: ObservableObject {
     /// Resident memory footprint of the current process in MB, read via
     /// `mach_task_basic_info`. Returns 0 on error. Cheap to call (no
     /// allocations) and safe from any thread.
-    private static func residentMemoryMB() -> Int {
+    static func residentMemoryMB() -> Int {
         var info = mach_task_basic_info()
         var count = mach_msg_type_number_t(
             MemoryLayout<mach_task_basic_info>.size / MemoryLayout<integer_t>.size
