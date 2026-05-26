@@ -1093,38 +1093,31 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // routing in the first place. SDR HEVC has nothing to advertise
         // and stays on the media playlist regardless of panel state.
         //
-        // DV5 routing on non-DV panels: ALWAYS media playlist.
+        // DV5 routing on non-DV panels: narrowed to SDR-locked only.
         //
-        // Earlier code routed P5 on HDR-ready non-DV panels to master,
-        // betting on AVPlayer tonemapping DV → HDR10 via the master
-        // `dvh1.05` CODECS hint (DrHurt #4 #63 hypothesis from
-        // testing on a DV-system-in-HDR10-mode panel). Vincent test
-        // 2026-05-26 on a true non-DV HDR10 Samsung empirically
-        // disproved this:
+        // The earlier "always media" guard was a defensive workaround
+        // for a DV5 master playlist + match-on failure with
+        // `CODECS="dvh1.05.06,ec+3"` + `VIDEO-RANGE=PQ` on a true
+        // non-DV HDR10 Samsung. Subsequent investigation traced the
+        // actual root cause to the non-standard `ec+3` audio CODECS
+        // token (b5462d7 fix): tvOS 26.5's HLS variant validator
+        // strictly enforces RFC 6381 and rejects any variant whose
+        // CODECS contains tokens not in the IANA registry. With the
+        // canonical `ec-3` emitted instead, P5 master playlist
+        // routing on HDR-ready non-DV panels is worth retrying;
+        // DrHurt #4 #63's hypothesis ("AVPlayer tone-maps DV→HDR10
+        // via the master `dvh1.05` CODECS hint") may yet hold true
+        // for the corrected master signaling.
         //
-        //   - Master playlist with `CODECS="dvh1.05.06,ec+3",
-        //     VIDEO-RANGE=PQ` served, criteria emit as `format=sdr
-        //     codec=hvc1 extensions=none` (because detectVideoFormat
-        //     returns .sdr for this P5 source — its color_primaries /
-        //     color_trc / color_space are all `unspecified` per the
-        //     IPT-PQ-c2 spec, so the standard PQ-transfer check
-        //     misses it).
-        //   - AVPlayer sees PQ master + SDR panel-mode criteria and
-        //     fails with `AVFoundationErrorDomain -11848 /
-        //     CoreMediaErrorDomain -15517 'Öffnen fehlgeschlagen'`.
-        //     errorLog / accessLog empty, item.duration indef.
-        //   - Same source on the media-playlist path (match-off)
-        //     plays cleanly with AVPlayer's tonemap engaged via the
-        //     dvh1 sample entry in init.mp4.
-        //
-        // So: P5 on any non-DV panel goes via media. Plain HEVC base
-        // never exists for P5 (IPT-PQ-c2 elementary stream is the
-        // only thing the source carries), so the master path's
-        // theoretical "downgrade to HDR10 base" doesn't apply
-        // anyway — the dvh1 sample entry is the only legal packaging
-        // regardless of routing, and AVPlayer's media-playlist
-        // tonemap path handles the DV-to-display downgrade
-        // internally.
+        // The narrower SDR-locked guard remains because the existing
+        // comment at line 690-694 documents tvOS 26's master-level
+        // codec filter rejecting bare `dvh1.05` CODECS with -11868
+        // when the panel can't engage HDR/DV mode at all — that's
+        // an independent failure from the audio-codec parser issue,
+        // and the empirically-validated workaround (route via media,
+        // let AVPlayer tonemap from the dvh1 sample entry) still
+        // applies to truly SDR-locked panels with no HDR mode
+        // reachable.
         //
         // DV8.1 and DV8.4 on non-DV panels already downgrade their
         // CODECS string to `hvc1.*` in the HEVC dispatch above + strip
@@ -1134,9 +1127,11 @@ public final class HLSVideoEngine: @unchecked Sendable {
         let sourceIsHDR = videoRange != .sdr || effectiveDvMode
         let panelReadyForHDR = panelIsInHDRMode
             || (displaySupportsHDR && matchContentEnabled)
-        let dv5OnNonDVPanel = dvVariant == .profile5 && !effectiveDvMode
+        let dv5OnSdrLockedNonDVPanel = dvVariant == .profile5
+            && !effectiveDvMode
+            && !panelReadyForHDR
         let useMasterPlaylist: Bool
-        if dv5OnNonDVPanel {
+        if dv5OnSdrLockedNonDVPanel {
             useMasterPlaylist = false
         } else {
             useMasterPlaylist = sourceIsHDR && panelReadyForHDR
