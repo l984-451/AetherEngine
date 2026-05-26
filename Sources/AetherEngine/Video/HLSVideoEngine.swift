@@ -705,23 +705,26 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 // the private CoreMedia dvvC hook and writes the
                 // right DV criteria the panel honours.
                 //
-                // On DV-capable panels with master routing the
-                // SUPPLEMENTAL-CODECS hint upgrades the HDR10 master
-                // variant to DV; on DV-locked panels with match OFF
-                // (media-playlist path) the `hvc1` sample entry's
-                // dvvC box engages DV directly via the formatDescription
-                // path. On non-DV panels the supplemental is ignored
-                // and the HDR10 base layer plays via the hvcC box.
-                //
-                // Mirrors P8.4's working pattern. Replaces the prior
-                // branched emission (bare `dvh1` on DV panels, `hvc1`
-                // with no supplemental otherwise) which was missing
-                // the `/db1p` brand identifier and unreliable on
-                // DV-panel first-attempt per DrHurt#4 Build 176.
+                // SUPPLEMENTAL-CODECS is emitted ONLY on DV-capable
+                // panels. Spec says non-DV clients should ignore the
+                // hint, but AVPlayer empirically reads `/db1p` as
+                // "DV available with HDR10 base" and engages the DV
+                // codec selection path even on HDR10-only displays,
+                // which then fails asset open silently when the panel
+                // can't reach DV mode (Vincent test 2026-05-26: HDR10
+                // TV + match dynamic range ON, panel switches to HDR
+                // correctly but picture stays black, no error). On
+                // non-DV panels we revert to the prior working
+                // emission: plain `hvc1.2.4.LXX` master variant,
+                // AVPlayer plays it as HDR10 via the hvcC box; the
+                // dvvC box in the same sample entry is silently
+                // ignored by the HEVC path.
                 codecTagOverride = "hvc1"
                 videoRange = .pq
                 primaryCodecs = "hvc1.2.4.L\(hevcLevel)"
-                supplementalCodecs = "dvh1.08.\(dvLevelStr)/db1p"
+                supplementalCodecs = effectiveDvMode
+                    ? "dvh1.08.\(dvLevelStr)/db1p"
+                    : nil
             case .profile84:
                 // P8.4 (HLG-compat base layer). Bare `dvh1` empirically
                 // does NOT play on either an HDR-mode or SDR-locked
