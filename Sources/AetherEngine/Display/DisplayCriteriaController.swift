@@ -33,6 +33,19 @@ final class DisplayCriteriaController {
     /// this with their own resolver in one place.
     nonisolated(unsafe) static var windowProvider: (@MainActor () -> Any?)?
 
+    /// Tracks whether this controller actually wrote
+    /// `preferredDisplayCriteria` during the most recent session.
+    /// `reset()` is gated on this so AVKit-sole-writer hosts (those
+    /// passing `LoadOptions.suppressDisplayCriteria = true`) get
+    /// zero engine writes against `avDisplayManager` — neither
+    /// apply nor reset. Otherwise a stop / reload cycle's `nil` write
+    /// races AVKit's in-flight criteria negotiation and shows up as
+    /// a spurious panel-mode regression mid-session (DrHurt#4 Build
+    /// 176: multiple "[DisplayCriteria] RESET" lines during the
+    /// succeeding retry attempt, EDR headroom collapsing from the
+    /// panel's locked DV value to 1.0).
+    private var didApply: Bool = false
+
     init() {}
 
     /// Apply display criteria for the next playback session.
@@ -144,6 +157,7 @@ final class DisplayCriteriaController {
         let effectiveRate = Float(frameRate ?? 24.0)
         let criteria = AVDisplayCriteria(refreshRate: effectiveRate, formatDescription: desc)
         displayManager.preferredDisplayCriteria = criteria
+        didApply = true
 
         EngineLog.emit(
             "[DisplayCriteria] SET: format=\(format) codec=\(fourccString(codecType)) "
@@ -251,11 +265,21 @@ final class DisplayCriteriaController {
     }
 
     /// Clear the preferred display criteria so the panel returns to
-    /// its default mode after playback. Always safe to call; idempotent.
+    /// its default mode after playback. Idempotent. No-op when the
+    /// controller never wrote criteria during the current session
+    /// (eg. AVKit-sole-writer hosts that pass `LoadOptions.
+    /// suppressDisplayCriteria = true`); writing `nil` in that case
+    /// races AVKit's own in-flight criteria management and shows up
+    /// as a mid-session panel-mode regression.
     func reset() {
         #if os(tvOS)
-        guard let window = resolveWindow() else { return }
+        guard didApply else { return }
+        guard let window = resolveWindow() else {
+            didApply = false
+            return
+        }
         window.avDisplayManager.preferredDisplayCriteria = nil
+        didApply = false
         EngineLog.emit("[DisplayCriteria] RESET", category: .engine)
         #endif
     }

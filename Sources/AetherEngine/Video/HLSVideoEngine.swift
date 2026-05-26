@@ -686,20 +686,42 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 primaryCodecs = "dvh1.05.\(dvLevelStr)"
                 supplementalCodecs = nil
             case .profile81:
-                // P8.1 (HDR10-compat base layer). `dvh1` on a DV-
-                // capable display so AVKit reads the sample-entry
-                // FourCC and asks the panel for DV; `hvc1` on a
-                // non-DV display so AVPlayer plays the HDR10 base
-                // layer as plain HEVC HDR10 (DrHurt #4 #7).
-                if effectiveDvMode {
-                    codecTagOverride = "dvh1"
-                    primaryCodecs = "dvh1.08.\(dvLevelStr)"
-                } else {
-                    codecTagOverride = "hvc1"
-                    primaryCodecs = "hvc1.2.4.L\(hevcLevel)"
-                }
+                // P8.1 (HDR10-compat base layer). Per Apple's HLS
+                // Authoring Spec post-WWDC22, backward-compatible
+                // DV ships with `hvc1` sample entry + `hvcC` + `dvvC`
+                // boxes, primary CODECS `hvc1.2.4.LXX`, and
+                // SUPPLEMENTAL-CODECS `dvh1.08.XX/db1p`. The `/db1p`
+                // brand identifier marks the supplemental as DV with
+                // HDR10 base for AVPlayer's profile-matching logic;
+                // without it the variant is treated as plain HDR10
+                // and the DV pipeline never engages on Apple TV.
+                //
+                // The mp4 muxer with `strict=-2` automatically writes
+                // a `dvvC` box alongside `hvcC` when the source's
+                // `AV_PKT_DATA_DOVI_CONF` side data is preserved (we
+                // do NOT call `stripDolbyVisionSideData` here), so
+                // AVKit's auto-criteria parser reads the DV profile
+                // from the live AVPlayerItem.formatDescription via
+                // the private CoreMedia dvvC hook and writes the
+                // right DV criteria the panel honours.
+                //
+                // On DV-capable panels with master routing the
+                // SUPPLEMENTAL-CODECS hint upgrades the HDR10 master
+                // variant to DV; on DV-locked panels with match OFF
+                // (media-playlist path) the `hvc1` sample entry's
+                // dvvC box engages DV directly via the formatDescription
+                // path. On non-DV panels the supplemental is ignored
+                // and the HDR10 base layer plays via the hvcC box.
+                //
+                // Mirrors P8.4's working pattern. Replaces the prior
+                // branched emission (bare `dvh1` on DV panels, `hvc1`
+                // with no supplemental otherwise) which was missing
+                // the `/db1p` brand identifier and unreliable on
+                // DV-panel first-attempt per DrHurt#4 Build 176.
+                codecTagOverride = "hvc1"
                 videoRange = .pq
-                supplementalCodecs = nil
+                primaryCodecs = "hvc1.2.4.L\(hevcLevel)"
+                supplementalCodecs = "dvh1.08.\(dvLevelStr)/db1p"
             case .profile84:
                 // P8.4 (HLG-compat base layer). Bare `dvh1` empirically
                 // does NOT play on either an HDR-mode or SDR-locked
