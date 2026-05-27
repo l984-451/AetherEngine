@@ -118,7 +118,10 @@ Install via Swift Package Manager:
 .package(url: "https://github.com/superuser404notfound/AetherEngine", from: "2.0.0")
 ```
 
-See [`Examples/MinimalPlayer/`](Examples/MinimalPlayer/MinimalPlayerApp.swift) for a complete drop-in SwiftUI app that loads, plays, and reports state for a single source URL. About 90 lines of host code — copy the file into a new Xcode tvOS / iOS / macOS app, point at a real URL, run.
+Two complementary samples ship in `Examples/`:
+
+- [`MinimalPlayer/`](Examples/MinimalPlayer/MinimalPlayerApp.swift) — 90-line SwiftUI drop-in for developers integrating the engine. Copy the file into a new Xcode tvOS / iOS / macOS app, point at a URL, run.
+- [`DemoPlayerMac/`](Examples/DemoPlayerMac/README.md) — standalone macOS app for testers wanting to exercise the engine against their own media without writing host code. Drop a file onto the window, it plays. Pre-built universal `.dmg` is attached to every [GitHub Release](https://github.com/superuser404notfound/AetherEngine/releases/latest) (notarized, runs cleanly through Gatekeeper).
 
 ## Host setup on tvOS
 
