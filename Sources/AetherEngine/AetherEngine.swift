@@ -1048,6 +1048,31 @@ public final class AetherEngine: ObservableObject {
                 self?.state = .idle
             }
             .store(in: &nativeCancellables)
+        host.$timeControlStatus
+            .sink { [weak self] status in
+                guard let self = self else { return }
+                // Reconcile `state` when something other than the engine's
+                // own play()/pause() drives the AVPlayer: AVKit's transport
+                // bar (kept active for Control Center skip routing), CC's
+                // play/pause, or the hardware play/pause button AVKit handles
+                // internally. Without this `state` goes stale and the host's
+                // togglePlayPause() resolves to a no-op (swallowed press).
+                // Only reconcile between the two steady transport states;
+                // never clobber loading/seeking/error/idle.
+                // `.waitingToPlayAtSpecifiedRate` is a buffer stall while the
+                // user still intends to play, so it maps to .playing and the
+                // play/pause icon doesn't flicker on a rebuffer.
+                guard self.state == .playing || self.state == .paused else { return }
+                switch status {
+                case .paused:
+                    if self.state != .paused { self.state = .paused }
+                case .playing, .waitingToPlayAtSpecifiedRate:
+                    if self.state != .playing { self.state = .playing }
+                @unknown default:
+                    break
+                }
+            }
+            .store(in: &nativeCancellables)
 
         // appliesPerFrameHDRDisplayMetadata = true unconditionally.
         // The earlier `session.servingMasterPlaylist` gating was a
@@ -1160,11 +1185,31 @@ public final class AetherEngine: ObservableObject {
     }
 
     public func togglePlayPause() {
+        // Only togglable from the steady transport states (and from
+        // .loading, where the press means "start"). Ignore in
+        // .seeking / .error / .idle, matching the prior behaviour.
         switch state {
-        case .playing: pause()
-        case .paused, .loading: play()
-        default: break
+        case .playing, .paused, .loading: break
+        default: return
         }
+        // Decide from the LIVE transport state, not the published `state`.
+        // On the native path AVKit's transport / Control Center / the
+        // hardware play/pause button can toggle the AVPlayer directly, and
+        // the `$timeControlStatus` reconciliation that mirrors those toggles
+        // into `state` is async. Reading the AVPlayer synchronously here
+        // closes that gap so a fast press can't act on a stale value and
+        // resolve to a no-op (the "swallowed press" symptom). The SW host
+        // has no AVPlayer and no competing transport owner, so its `state`
+        // is authoritative.
+        let isPlaying: Bool
+        if softwareHost != nil {
+            isPlaying = (state == .playing)
+        } else if let nativeHost {
+            isPlaying = nativeHost.isEffectivelyPlaying
+        } else {
+            isPlaying = (state == .playing)
+        }
+        if isPlaying { pause() } else { play() }
     }
 
     /// Tear down and reload from the current position. Call after

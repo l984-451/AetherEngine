@@ -32,6 +32,15 @@ final class NativeAVPlayerHost {
     /// Engine flips state to .idle so host end-of-content flows
     /// (auto-dismiss, next-episode countdown if no marker) fire.
     @Published private(set) var didReachEnd: Bool = false
+    /// Mirrors `avPlayer.timeControlStatus`. The engine subscribes so it
+    /// can reconcile its own `state` when an external agent toggles the
+    /// AVPlayer directly, bypassing `engine.play()` / `pause()`: AVKit's
+    /// transport bar (kept active for Control Center skip routing), iPhone
+    /// Control Center, or the hardware play/pause button that AVKit handles
+    /// internally. Without this the engine's `state` goes stale and the
+    /// host's `togglePlayPause()` resolves to a no-op (the "swallowed
+    /// play/pause press" symptom).
+    @Published private(set) var timeControlStatus: AVPlayer.TimeControlStatus = .paused
 
     // MARK: - Output
 
@@ -303,9 +312,10 @@ final class NativeAVPlayerHost {
         // playing. Critical for diagnosing "spinner forever" symptoms
         // because reasonForWaitingToPlay surfaces the exact stall cause
         // (.evaluatingBufferingRate / .toMinimizeStalls / etc.).
-        timeControlObservation = avPlayer.observe(\.timeControlStatus, options: [.new]) { player, _ in
+        timeControlObservation = avPlayer.observe(\.timeControlStatus, options: [.new]) { [weak self] player, _ in
+            let status = player.timeControlStatus
             let statusStr: String
-            switch player.timeControlStatus {
+            switch status {
             case .paused:                          statusStr = "paused"
             case .waitingToPlayAtSpecifiedRate:    statusStr = "waitingToPlay"
             case .playing:                         statusStr = "playing"
@@ -313,6 +323,9 @@ final class NativeAVPlayerHost {
             }
             let reason = player.reasonForWaitingToPlay?.rawValue ?? "-"
             EngineLog.emit("[NativeAVPlayerHost] #\(sid) timeControlStatus=\(statusStr) reason=\(reason)", category: .engine)
+            Task { @MainActor in
+                self?.timeControlStatus = status
+            }
         }
 
         // Error log: AVPlayer surfaces transient HLS-level errors
@@ -471,6 +484,12 @@ final class NativeAVPlayerHost {
     }
 
     // MARK: - Playback control
+
+    /// Live, synchronous read of whether the player intends to be playing
+    /// (`.playing`, or the transient `.waitingToPlayAtSpecifiedRate` buffer
+    /// stall). Read at the moment of a toggle so a rapid press can't act on
+    /// the async `timeControlStatus` mirror before it has caught up.
+    var isEffectivelyPlaying: Bool { avPlayer.timeControlStatus != .paused }
 
     func play() {
         // AVPlayer with `automaticallyWaitsToMinimizeStalling=true`
