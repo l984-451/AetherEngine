@@ -26,6 +26,8 @@ jobs:
       - name: Parse issue form
         id: parse
         uses: stefanbuck/github-issue-parser@v3
+        with:
+          template-path: .github/ISSUE_TEMPLATE/used-by-submission.yml
 
       - name: Build entry and insert into README
         id: build
