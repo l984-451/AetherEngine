@@ -288,7 +288,9 @@ final class AVIOReader: @unchecked Sendable {
     /// (16 MB) because the whole point of the persistent connection is that
     /// it never re-requests during steady-state playback, so a deep read-
     /// ahead buys nothing and only costs heap. Peak resident window ≈
-    /// highWater + lookback + trim slack ≈ 22 MB, bounded.
+    /// highWater + one URLSession delivery + lookback + trim slack; with
+    /// incremental deliveries that lands around 22 MB and can never run
+    /// away (the next delivery blocks on backpressure).
     private static let winHighWater = 16 * 1024 * 1024
     /// Bytes kept BEHIND the read cursor for small backward seeks (the
     /// matroska demuxer routinely re-reads a few KB). Anything older is
@@ -306,13 +308,26 @@ final class AVIOReader: @unchecked Sendable {
     /// No bytes delivered for this long on a live connection means the CDN
     /// stalled the socket; treat it as a drop and reconnect.
     private static let connStallTimeout: TimeInterval = 20
-    /// Give up after this many consecutive reconnect attempts at the same
-    /// offset (a permanent 403/410/410 or a dead origin). VLC retries
-    /// forever; we cap so a genuinely gone source doesn't hang the demux
-    /// thread indefinitely.
-    private static let reconnectMaxAttempts = 8
+    /// A reconnect that delivers at least this much before failing again
+    /// counts as progress and clears the unproductive streak. Sized so a
+    /// healthy stream (which delivers MB between real drops) always clears
+    /// it and only a flapping origin accumulates.
+    private static let minReconnectProgress: Int64 = 512 * 1024
+    /// Give up after this many CONSECUTIVE unproductive reconnects (a
+    /// permanent 403/410, a dead origin, or an origin that flaps without
+    /// making progress). VLC retries forever; we cap so a genuinely gone or
+    /// pathological source neither hangs the demux thread nor hammers the
+    /// CDN indefinitely. Counts unproductive reconnects, not total ones, so
+    /// a long playback over a flaky link is not penalised.
+    private static let reconnectMaxUnproductive = 12
 
-    private let winLock = NSLock()
+    /// Guards every persistent-mode field below AND serves as the
+    /// condition variable the demux thread and the delivery callback wait
+    /// on. NSCondition (not a counting semaphore) because waiting here is
+    /// edge-triggered on "window/connection state changed", re-checked
+    /// against a predicate under the lock: that makes wakeups exact (no
+    /// accumulated-signal busy-spin) and the stall timeout meaningful.
+    private let winCond = NSCondition()
     /// Contiguous bytes buffered from the live connection, starting at
     /// `winStart`. `position` (the FFmpeg read cursor) indexes into the
     /// source; `position - winStart` is the offset within `window`.
@@ -332,12 +347,17 @@ final class AVIOReader: @unchecked Sendable {
     private var connGeneration = 0
     private var activeSession: URLSession?
     private var activeTask: URLSessionDataTask?
-    /// Signaled when the window grows or the connection state changes
-    /// (wakes a read blocked waiting for forward data).
-    private let winDataReady = DispatchSemaphore(value: 0)
-    /// Signaled when a read trims the window (releases a delivery callback
-    /// blocked on backpressure).
-    private let winDrained = DispatchSemaphore(value: 0)
+    /// Consecutive UNPRODUCTIVE reconnects (each delivered less than
+    /// `minReconnectProgress` before failing again). Reset to 0 on any real
+    /// progress. A genuinely flaky link that still streams MB between drops
+    /// never trips this; a flapping origin that hands out a few KB then RSTs
+    /// every time does, so we stop hammering the CDN (the request storm
+    /// AetherEngine#25 also reports) instead of reconnecting forever.
+    /// Demux-thread-only; no lock needed.
+    private var unproductiveReconnects = 0
+    /// `cumulativeBytesFetched` snapshot at the last reconnect, to measure
+    /// progress since. Demux-thread-only.
+    private var bytesAtLastReconnect: Int64 = 0
 
     /// True for the playback path: known file size + sequential read-ahead.
     /// Selects the persistent forward-streaming reader over the chunked
@@ -398,7 +418,19 @@ final class AVIOReader: @unchecked Sendable {
             // connection at offset 0 and wait for the first bytes before
             // returning so avformat_open_input has data to probe.
             startPersistentConnection(at: 0)
-            _ = winDataReady.wait(timeout: .now() + .seconds(15))
+            winCond.lock()
+            let deadline = Date(timeIntervalSinceNow: 15)
+            while window.isEmpty && !connEnded && !isClosed {
+                if !winCond.wait(until: deadline) { break }
+            }
+            let gotData = !window.isEmpty
+            winCond.unlock()
+            if !gotData {
+                // No first byte within 15s (slow or dead origin). Proceed
+                // anyway; the read loop's stall/reconnect machinery takes
+                // over once avformat_open_input starts pulling.
+                EngineLog.emit("[AVIOReader] Persistent open: no data within 15s, proceeding to read-loop reconnect", category: .demux)
+            }
         } else {
             // Seekable chunked mode (still extraction / random access):
             // pre-fill the first chunk with a Range request.
@@ -424,12 +456,13 @@ final class AVIOReader: @unchecked Sendable {
         streamDataReady.signal()
         // Persistent mode: wake a read blocked waiting for forward data and
         // release a delivery callback blocked on backpressure. Bumping the
-        // generation makes any in-flight delegate callback go stale.
-        winLock.lock()
+        // generation makes any in-flight delegate callback go stale, and the
+        // broadcast wakes both the demux-thread wait and the delegate's
+        // backpressure wait so they re-check and exit.
+        winCond.lock()
         connGeneration &+= 1
-        winLock.unlock()
-        winDataReady.signal()
-        winDrained.signal()
+        winCond.broadcast()
+        winCond.unlock()
     }
 
     /// Fully release the AVIOContext, internal AVIO buffer, prefetch /
@@ -471,17 +504,16 @@ final class AVIOReader: @unchecked Sendable {
 
         // Persistent mode: invalidate the live connection (stale generation
         // drops any late delivery), drop the window, and release waiters.
-        winLock.lock()
+        winCond.lock()
         connGeneration &+= 1
         connEnded = true
         let session = activeSession
         activeSession = nil
         activeTask = nil
         window = Data()
-        winLock.unlock()
+        winCond.broadcast()
+        winCond.unlock()
         session?.invalidateAndCancel()
-        winDataReady.signal()
-        winDrained.signal()
     }
 
     // MARK: - Read (called by FFmpeg on demux thread)
@@ -646,108 +678,99 @@ final class AVIOReader: @unchecked Sendable {
     private func readPersistent(into buf: UnsafeMutablePointer<UInt8>, size: Int32) -> Int32 {
         let requestSize = Int(size)
         var totalRead = 0
-        var attempts = 0
 
         while totalRead < requestSize {
             if isClosed { return totalRead > 0 ? Int32(totalRead) : -1 }
 
-            winLock.lock()
-            let haveConnection = activeTask != nil
-            let curWinStart = winStart
-            let curWinCount = window.count
+            // Evaluate the whole decision under one lock acquisition so the
+            // window can't shift between snapshot and use, and so the
+            // forward-wait can release-and-reacquire atomically.
+            winCond.lock()
+
+            // No live connection (initial entry or post-give-up): open one.
+            if activeTask == nil {
+                let target = position
+                winCond.unlock()
+                seekReconnect(at: target)
+                continue
+            }
+
             let curPosition = position
+
+            // Backward seek before the buffered window: reconnect at cursor.
+            if curPosition < winStart {
+                winCond.unlock()
+                seekReconnect(at: curPosition)
+                continue
+            }
+
+            let posInWindow = Int(curPosition - winStart)
+            let available = window.count - posInWindow
+            if available > 0 {
+                let copyNow = min(available, requestSize - totalRead)
+                window.withUnsafeBytes { raw in
+                    let src = raw.baseAddress!.advanced(by: posInWindow)
+                        .assumingMemoryBound(to: UInt8.self)
+                    buf.advanced(by: totalRead).update(from: src, count: copyNow)
+                }
+                position = curPosition + Int64(copyNow)
+                totalRead += copyNow
+                trimWindowLocked()
+                unproductiveReconnects = 0      // real progress
+                winCond.broadcast()              // window may have shrunk: wake backpressure
+                winCond.unlock()
+                continue
+            }
+
+            // Nothing buffered at the cursor. Decide why (still under lock).
+            let frontier = winStart + Int64(window.count)
             let ended = connEnded
             let status = connStatus
             let retryAfter = connRetryAfter
-            winLock.unlock()
 
-            // No connection yet (or torn down): (re)establish at the cursor.
-            if !haveConnection {
-                startPersistentConnection(at: curPosition)
-                continue
-            }
-
-            // Backward seek to before the buffered window: reconnect there.
-            if curPosition < curWinStart {
-                startPersistentConnection(at: curPosition)
-                attempts = 0
-                continue
-            }
-
-            let posInWindow = Int(curPosition - curWinStart)
-            let available = curWinCount - posInWindow
-            if available > 0 {
-                let toCopy = min(available, requestSize - totalRead)
-                winLock.lock()
-                // Re-validate under lock: a reconnect on another path could
-                // have replaced the window between the snapshot and here.
-                let liveStart = winStart
-                let liveCount = window.count
-                let liveOffset = Int(curPosition - liveStart)
-                if liveOffset >= 0 && liveOffset < liveCount {
-                    let copyNow = min(min(toCopy, liveCount - liveOffset),
-                                      requestSize - totalRead)
-                    window.withUnsafeBytes { raw in
-                        let src = raw.baseAddress!.advanced(by: liveOffset)
-                            .assumingMemoryBound(to: UInt8.self)
-                        buf.advanced(by: totalRead).update(from: src, count: copyNow)
-                    }
-                    position = curPosition + Int64(copyNow)
-                    totalRead += copyNow
-                    trimWindowLocked()
-                    winLock.unlock()
-                    winDrained.signal()
-                    attempts = 0
-                    continue
-                }
-                winLock.unlock()
-                continue
-            }
-
-            // Nothing buffered at the cursor. Decide why.
-            let frontier = curWinStart + Int64(curWinCount)
-
-            // Genuine end of file — the only path that reports EOF.
+            // Genuine end of file — the ONLY path that reports EOF.
             if fileSize > 0 && curPosition >= fileSize {
+                winCond.unlock()
                 return totalRead > 0 ? Int32(totalRead) : AVERROR_EOF_VALUE
             }
 
-            // Forward seek beyond what the live stream will reach soon:
-            // reconnecting at the target beats streaming the whole gap.
+            // Forward seek beyond the live stream's reach: reconnect at target.
             if curPosition > frontier + Int64(Self.seekKeepForwardLimit) {
-                startPersistentConnection(at: curPosition)
-                attempts = 0
+                winCond.unlock()
+                seekReconnect(at: curPosition)
                 continue
             }
 
             if !ended {
-                // Connection alive and streaming toward the cursor: wait for
-                // it to fill forward. A stall (no data for connStallTimeout)
-                // is treated as a drop and reconnected at the frontier.
-                let waited = winDataReady.wait(timeout: .now() + Self.connStallTimeout)
-                if waited == .timedOut {
-                    attempts += 1
-                    if attempts > Self.reconnectMaxAttempts {
-                        EngineLog.emit("[AVIOReader] Persistent stalled, gave up after \(attempts) attempts at offset \(frontier)", category: .demux)
+                // Live connection streaming toward the cursor: wait for it to
+                // fill forward. NSCondition.wait releases the lock while
+                // blocked and re-acquires before returning; a false return
+                // means the connStallTimeout elapsed with no state change,
+                // i.e. a socket stall — treat it as a drop and reconnect.
+                let signaled = winCond.wait(until: Date(timeIntervalSinceNow: Self.connStallTimeout))
+                winCond.unlock()
+                if !signaled {
+                    if recordReconnectAndShouldGiveUp() {
+                        EngineLog.emit("[AVIOReader] Persistent stall gave up at offset \(frontier) (\(unproductiveReconnects) unproductive)", category: .demux)
                         return totalRead > 0 ? Int32(totalRead) : -1
                     }
-                    EngineLog.emit("[AVIOReader] Persistent stall at offset \(frontier), reconnecting (attempt \(attempts))", category: .demux)
-                    backoffBeforeReconnect(attempt: attempts, retryAfter: 0)
+                    EngineLog.emit("[AVIOReader] Persistent stall at offset \(frontier), reconnecting", category: .demux)
+                    backoffBeforeReconnect(streak: unproductiveReconnects, retryAfter: 0)
                     startPersistentConnection(at: frontier)
                 }
                 continue
             }
 
             // Connection ended before EOF (drop, early close, or a non-2xx
-            // status that the response handler cancelled). Reconnect at the
-            // frontier with backoff; honour Retry-After for 429/503.
-            attempts += 1
-            if attempts > Self.reconnectMaxAttempts {
-                EngineLog.emit("[AVIOReader] Persistent reconnect exhausted (\(attempts)) at offset \(frontier) status=\(status)", category: .demux)
+            // the response handler cancelled). Reconnect at the frontier with
+            // backoff; honour Retry-After for 429/503.
+            winCond.unlock()
+            if recordReconnectAndShouldGiveUp() {
+                EngineLog.emit("[AVIOReader] Persistent reconnect exhausted at offset \(frontier) status=\(status) (\(unproductiveReconnects) unproductive)", category: .demux)
                 return totalRead > 0 ? Int32(totalRead) : -1
             }
-            EngineLog.emit("[AVIOReader] Persistent conn ended at offset \(frontier) status=\(status), reconnecting (attempt \(attempts), retryAfter=\(retryAfter)s)", category: .demux)
-            backoffBeforeReconnect(attempt: attempts, retryAfter: retryAfter)
+            EngineLog.emit("[AVIOReader] Persistent conn ended at offset \(frontier) status=\(status), reconnecting (retryAfter=\(retryAfter)s)", category: .demux)
+            backoffBeforeReconnect(streak: unproductiveReconnects, retryAfter: retryAfter)
             startPersistentConnection(at: frontier)
         }
 
@@ -757,7 +780,7 @@ final class AVIOReader: @unchecked Sendable {
     /// Trim consumed bytes off the front of the window once the slack behind
     /// the cursor exceeds the lookback by a full batch, so the front-drop
     /// runs in ~`winTrimBatch` steps instead of on every read. Caller holds
-    /// `winLock`.
+    /// `winCond`.
     private func trimWindowLocked() {
         let behind = Int(position - winStart)
         let dropThreshold = Self.winLookback + Self.winTrimBatch
@@ -768,12 +791,41 @@ final class AVIOReader: @unchecked Sendable {
         }
     }
 
-    /// Sleep before a reconnect: exponential backoff (0.5s → 8s) overridden
-    /// by a server-supplied Retry-After. Sleeps in short slices so a close
-    /// during the wait is honoured promptly.
-    private func backoffBeforeReconnect(attempt: Int, retryAfter: TimeInterval) {
-        let expo = min(Double(1 << min(attempt, 4)) * 0.5, 8.0)
+    /// Intentional reconnect for a seek (backward, far-forward, or initial
+    /// open). Not a failure, so it clears the unproductive streak and
+    /// rebases the progress counter before opening the new connection.
+    private func seekReconnect(at offset: Int64) {
+        unproductiveReconnects = 0
+        bytesAtLastReconnect = cumulativeBytesFetched
+        startPersistentConnection(at: offset)
+    }
+
+    /// Account a failure-driven reconnect against the progress-aware cap.
+    /// If at least `minReconnectProgress` bytes were delivered since the
+    /// last reconnect the streak resets (the link is flaky but alive);
+    /// otherwise it grows. Returns true once the streak exceeds the cap, so
+    /// a dead or flapping origin neither hangs the demux thread nor hammers
+    /// the CDN forever. Demux-thread-only.
+    private func recordReconnectAndShouldGiveUp() -> Bool {
+        let now = cumulativeBytesFetched
+        if now - bytesAtLastReconnect >= Self.minReconnectProgress {
+            unproductiveReconnects = 0
+        } else {
+            unproductiveReconnects += 1
+        }
+        bytesAtLastReconnect = now
+        return unproductiveReconnects > Self.reconnectMaxUnproductive
+    }
+
+    /// Sleep before a reconnect. A productive reconnect (streak 0) retries
+    /// immediately so a single clean drop doesn't stall playback; the delay
+    /// grows (0.5s → 8s) only as the unproductive streak rises. A
+    /// server-supplied Retry-After always wins if larger. Sleeps in short
+    /// slices so a close during the wait is honoured promptly.
+    private func backoffBeforeReconnect(streak: Int, retryAfter: TimeInterval) {
+        let expo = streak <= 0 ? 0.0 : min(Double(1 << min(streak, 4)) * 0.5, 8.0)
         let total = min(max(expo, retryAfter), 15.0)
+        if total <= 0 { return }
         var slept = 0.0
         while slept < total {
             if isClosed { return }
@@ -788,7 +840,7 @@ final class AVIOReader: @unchecked Sendable {
     /// at `offset`. Bumps the generation so late callbacks from the old
     /// connection are ignored. Safe to call from the demux thread.
     private func startPersistentConnection(at offset: Int64) {
-        winLock.lock()
+        winCond.lock()
         connGeneration &+= 1
         let generation = connGeneration
         winStart = offset
@@ -799,7 +851,11 @@ final class AVIOReader: @unchecked Sendable {
         let oldSession = activeSession
         activeSession = nil
         activeTask = nil
-        winLock.unlock()
+        // Wake a backpressure-blocked delegate from the OLD generation so it
+        // re-checks, sees it is stale, and returns instead of sitting on the
+        // 0.2s safety timeout.
+        winCond.broadcast()
+        winCond.unlock()
 
         // Invalidate outside the lock; releases the old delegate + any bytes.
         oldSession?.invalidateAndCancel()
@@ -823,17 +879,17 @@ final class AVIOReader: @unchecked Sendable {
         )
         let task = session.dataTask(with: request)
 
-        winLock.lock()
+        winCond.lock()
         // A close() that raced in while we were building the session wins:
         // it bumped the generation, so don't install a stale connection.
         guard generation == connGeneration, !isClosed else {
-            winLock.unlock()
+            winCond.unlock()
             session.invalidateAndCancel()
             return
         }
         activeSession = session
         activeTask = task
-        winLock.unlock()
+        winCond.unlock()
 
         task.resume()
         #if DEBUG
@@ -843,12 +899,19 @@ final class AVIOReader: @unchecked Sendable {
 
     /// Delegate callback: a chunk arrived. Force-copies into the window so
     /// the source dispatch_data is released per delivery (same leak control
-    /// as the chunk path), then applies backpressure by blocking here until
-    /// the consumer has drained the window below the high-water mark.
+    /// as the chunk path), wakes a reader waiting for forward data, then
+    /// applies backpressure by blocking on the condition until the consumer
+    /// has drained the window below the high-water mark.
+    ///
+    /// Window peak ≈ winHighWater + one URLSession delivery (deliveries are
+    /// incremental, typically well under a MB) + lookback + trim slack. The
+    /// high-water check is per-delivery, so a single very large delivery can
+    /// briefly overshoot, but it can never run away: the next delivery
+    /// blocks here until the reader drains.
     fileprivate func appendPersistentData(_ data: Data, generation: Int) {
-        winLock.lock()
+        winCond.lock()
         guard generation == connGeneration, !isFullyClosed else {
-            winLock.unlock()
+            winCond.unlock()
             return
         }
         let count = data.count
@@ -861,20 +924,20 @@ final class AVIOReader: @unchecked Sendable {
                 }
             }
         }
-        winLock.unlock()
         addBytesFetched(count)
-        winDataReady.signal()
+        winCond.broadcast()   // wake a reader waiting for forward data
 
-        // Backpressure: block the delegate queue (→ TCP flow control) while
-        // the window holds more than winHighWater bytes ahead of the cursor.
-        while true {
-            winLock.lock()
-            let stillCurrent = generation == connGeneration && !isClosed
+        // Backpressure: wait on the condition (which releases the lock while
+        // blocked, so the reader can copy + trim + broadcast) until the
+        // window drains below the high-water mark, this connection goes
+        // stale, or we close. The 0.2s timeout is a belt-and-suspenders
+        // re-check; correctness comes from the broadcasts, not the poll.
+        while generation == connGeneration && !isClosed {
             let ahead = window.count - max(0, Int(position - winStart))
-            winLock.unlock()
-            if !stillCurrent || ahead <= Self.winHighWater { return }
-            _ = winDrained.wait(timeout: .now() + .milliseconds(200))
+            if ahead <= Self.winHighWater { break }
+            _ = winCond.wait(until: Date(timeIntervalSinceNow: 0.2))
         }
+        winCond.unlock()
     }
 
     /// Delegate callback: response headers arrived. Captures the status,
@@ -892,12 +955,12 @@ final class AVIOReader: @unchecked Sendable {
         if status == 429 || status == 503 {
             retryAfter = Self.parseRetryAfter(http)
         }
-        winLock.lock()
+        winCond.lock()
         if generation == connGeneration {
             connStatus = status
             connRetryAfter = retryAfter
         }
-        winLock.unlock()
+        winCond.unlock()
 
         if isOK {
             if let resolvedURL { recordResolvedURL(resolvedURL) }
@@ -912,12 +975,12 @@ final class AVIOReader: @unchecked Sendable {
     /// Delegate callback: the connection finished (graceful or error). Marks
     /// it ended so the reader's wait loop reconnects if more bytes are owed.
     fileprivate func persistentConnectionEnded(error: Error?, generation: Int) {
-        winLock.lock()
+        winCond.lock()
         if generation == connGeneration {
             connEnded = true
         }
-        winLock.unlock()
-        winDataReady.signal()
+        winCond.broadcast()
+        winCond.unlock()
         #if DEBUG
         if let error {
             EngineLog.emit("[AVIOReader] Persistent conn gen=\(generation) error: \(error.localizedDescription)", category: .demux)
@@ -1059,7 +1122,7 @@ final class AVIOReader: @unchecked Sendable {
             newPosition = offset
         case SEEK_CUR:
             if usePersistentReader {
-                winLock.lock(); let cur = position; winLock.unlock()
+                winCond.lock(); let cur = position; winCond.unlock()
                 newPosition = cur + offset
             } else {
                 newPosition = position + offset
@@ -1078,10 +1141,10 @@ final class AVIOReader: @unchecked Sendable {
             // before the window, or far forward). This coalesces the
             // seek-storm the matroska demuxer fires on open into the minimum
             // number of reconnects.
-            winLock.lock()
+            winCond.lock()
             position = newPosition
-            winLock.unlock()
-            winDataReady.signal()
+            winCond.broadcast()
+            winCond.unlock()
         } else if !isStreaming {
             // Seekable chunked mode: invalidate buffers if outside range
             position = newPosition
@@ -1331,7 +1394,7 @@ final class AVIOReader: @unchecked Sendable {
 /// reader ignores a stale connection's late events.
 ///
 /// `@unchecked Sendable`: the only mutable coupling is the `weak reader`,
-/// and every callback hops into the reader under its `winLock`. The
+/// and every callback hops into the reader under its `winCond`. The
 /// generation guard there makes stale-connection callbacks no-ops.
 private final class PersistentReadDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
     weak var reader: AVIOReader?
