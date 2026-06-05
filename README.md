@@ -49,9 +49,9 @@ You provide the transport bar. You provide the dropdowns. You provide the pretty
 | Subtitles   | SubRip / ASS / SSA / WebVTT / mov_text streamed inline; PGS / HDMV PGS / DVB / DVD rendered as `CGImage` with normalised position; sidecar `.srt` / `.ass` / `.vtt` URLs decoded via short-lived context |
 | Frames      | Still-image extraction off-playback via `FrameExtractor`: `thumbnail` (nearest keyframe, downscaled, fast, for scrub previews / Recents) and `snapshot` (frame-accurate, full resolution, for user stills), both as `CGImage`. Isolated FFmpeg decode context, bounded LRU cache, idle-close lifecycle |
 | Seek        | Producer teardown + restart for backward / far-forward scrubs; short-range forward scrubs ride the cached segment window    |
-| Streaming   | HTTP Range + chunked delegate reads via `URLSession`                                                                        |
+| Streaming   | Playback reads the source over one long-lived forward-streaming `URLSession` connection (VLC-style): bytes stream into a sliding window, a new request is issued only on a seek outside that window. Still extraction uses discrete Range chunks for random access; live transcode uses a single sequential GET |
 | Live        | Scaffold-level: `LoadOptions.isLive` opts the session in; engine publishes `@Published var isLive` for hosts, ignores `seek()`. H.264 / HEVC inside MPEG-TS routes through the native AVPlayer pipeline; MPEG-2 / MPEG-4 / VC-1 / VP8 / VP9 inside MPEG-TS routes through the SW pipeline. Sliding-window segment eviction for unbounded sessions is not yet implemented (long native-path sessions will accumulate cached segments) |
-| Resilience  | Exponential backoff on transient network errors, background pause, display-link aware lifecycle                             |
+| Resilience  | Direct-URL playback survives CDN stutters: a dropped connection, socket stall, or early close reconnects at the last byte delivered instead of ending playback (only the real end of file reports EOF). `429` / `503` honour `Retry-After`, expired signed URLs re-resolve against the source, and a progress-aware cap stops a dead or flapping origin from hammering the CDN. Plus background pause and a display-link aware lifecycle |
 
 ## Quick start
 
@@ -318,7 +318,7 @@ Sources/AetherEngine/
 │   ├── SubtitleDecoder.swift                Sidecar URL one-shot decode (text only)
 │   └── VideoDecoderTypes.swift              DecodedFrameHandler typealias + VideoDecoderError
 ├── Demuxer/
-│   ├── AVIOReader.swift                     URLSession-backed avio_alloc_context with 4 MB Range-fetch chunks via delegate-based incremental reads
+│   ├── AVIOReader.swift                     URLSession-backed avio_alloc_context, three modes: persistent forward-streaming connection with reconnect-on-drop (playback), discrete Range chunks (still extraction), single sequential GET (live)
 │   └── Demuxer.swift                        libavformat wrapper
 ├── Diagnostics/
 │   ├── EngineLog.swift                      Gated OSLog emission
