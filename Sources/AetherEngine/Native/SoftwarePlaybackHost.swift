@@ -484,7 +484,7 @@ final class SoftwarePlaybackHost {
         // keyframe). If the ring is empty, there is nothing to replay;
         // fall back to just re-priming the skip threshold at the target.
         let kf: Double
-        if let k = (try? ring.keyframePts(atOrBefore: targetSource)) ?? nil {
+        if let k = try? ring.keyframePts(atOrBefore: targetSource) {
             kf = k
         } else if let oldest = ring.oldestPts {
             kf = oldest
