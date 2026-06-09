@@ -1052,6 +1052,88 @@ final class HLSSegmentProducer: @unchecked Sendable {
                         }
                     }
                 }
+                // Live timeline-discontinuity rebase. A broadcast program
+                // boundary or an MPEG-TS PCR wrap resets the source dts to a
+                // small value, so the incoming packet's dts sits many seconds
+                // BELOW lastValid. The per-frame monotonic gate below is tuned
+                // for +1-tick MKV B-frame reconstruction glitches: for a video
+                // packet it would bump to lastValid+1, find that exceeds the
+                // (also-reset, small) pts, and DROP. Because lastVideoSourceDts
+                // only advances on KEPT packets, every subsequent video packet
+                // would then drop forever — the keyframe cutter stalls, the
+                // live playlist stops growing, and AVPlayer parks on -12888
+                // ("Playlist File unchanged"). For audio the same gate bumps
+                // dts to lastValid+1 while pts stays small, so the muxer emits
+                // pts<dts and audio timing corrupts. Both are exactly the
+                // failure modes seen on Jellyfin live channels at a program
+                // change.
+                //
+                // The correct repair for a multi-second source-clock leap is
+                // not per-packet monotonicity but a timeline REBASE: shift this
+                // stream so its OUTPUT dts continues one frame past the last
+                // output dts. pts and dts move by the same delta, preserving
+                // their skew (no pts<dts), and the next opened segment carries
+                // #EXT-X-DISCONTINUITY so AVPlayer resyncs its clock across the
+                // seam. We set lastValid to dts-1 so the monotonic gate below
+                // sees the rebased packet as already-monotonic and leaves it
+                // alone. Live-only: VOD's B-frame glitch handling is untouched.
+                if isLive, isVideoPkt, lastVideoSourceDts != Int64.min,
+                   videoShiftPts != Int64.min, packet.pointee.dts != Int64.min {
+                    let jumpTicks = packet.pointee.dts - lastVideoSourceDts
+                    let thresholdTicks = sourceVideoTbSeconds > 0
+                        ? Int64(Self.discontinuityThresholdSeconds / sourceVideoTbSeconds)
+                        : Int64.max
+                    if abs(jumpTicks) >= thresholdTicks {
+                        let lastOutputDts = lastVideoSourceDts - videoShiftPts
+                        let continuationDts = lastOutputDts + max(videoFallbackDurationPts, 1)
+                        let newShift = packet.pointee.dts - continuationDts
+                        EngineLog.emit(
+                            "[HLSSegmentProducer] live video timeline rebase: "
+                            + "jumpTicks=\(jumpTicks) srcDts=\(packet.pointee.dts) "
+                            + "lastSrcDts=\(lastVideoSourceDts) oldShift=\(videoShiftPts) "
+                            + "newShift=\(newShift) lastOutDts=\(lastOutputDts)",
+                            category: .session
+                        )
+                        videoShiftPts = newShift
+                        // dts-1 so the monotonic gate below is a no-op for this
+                        // packet; line ~1126 then sets lastValid = dts exactly.
+                        lastVideoSourceDts = packet.pointee.dts - 1
+                        // Re-anchor the leading-B-frame drop to the new program;
+                        // otherwise its `pts < firstActualVideoPts` test (raw
+                        // source space) would drop every reset-timeline packet.
+                        if packet.pointee.pts != Int64.min {
+                            firstActualVideoPts = packet.pointee.pts
+                        }
+                        // Reset the PTS-detector baseline so it doesn't also
+                        // double-flag this same leap one packet later.
+                        lastRawVideoPts = Int64.min
+                        pendingDiscontinuityFlag = true
+                        onVideoShiftKnown?(newShift)
+                    }
+                }
+                if isLive, isAudioPkt, lastAudioSourceDts != Int64.min,
+                   audioShiftPts != Int64.min, packet.pointee.dts != Int64.min,
+                   let audio = audioConfig {
+                    let jumpTicks = packet.pointee.dts - lastAudioSourceDts
+                    let tb = audio.sourceTimeBase
+                    let thresholdTicks = tb.num > 0
+                        ? Int64(Self.discontinuityThresholdSeconds * Double(tb.den) / Double(tb.num))
+                        : Int64.max
+                    if abs(jumpTicks) >= thresholdTicks {
+                        let lastOutputDts = lastAudioSourceDts - audioShiftPts
+                        let continuationDts = lastOutputDts + max(audioFallbackDurationPts, 1)
+                        let newShift = packet.pointee.dts - continuationDts
+                        EngineLog.emit(
+                            "[HLSSegmentProducer] live audio timeline rebase: "
+                            + "jumpTicks=\(jumpTicks) srcDts=\(packet.pointee.dts) "
+                            + "lastSrcDts=\(lastAudioSourceDts) oldShift=\(audioShiftPts) "
+                            + "newShift=\(newShift)",
+                            category: .session
+                        )
+                        audioShiftPts = newShift
+                        lastAudioSourceDts = packet.pointee.dts - 1
+                    }
+                }
                 // Monotonic-dts enforcement at source TB. The matroska
                 // demuxer's reconstructed dts can go non-monotonic
                 // across HEVC open-GOP leading B-frames: after a
