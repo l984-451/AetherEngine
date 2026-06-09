@@ -562,6 +562,28 @@ public final class HLSVideoEngine: @unchecked Sendable {
         let isH264 = codecpar.pointee.codec_id == AV_CODEC_ID_H264
         let isAV1 = codecpar.pointee.codec_id == AV_CODEC_ID_AV1
 
+        // Source video parameter diagnostics. Decisive for AVPlayer -11821
+        // ("decode failed" with both tracks unreadable right after
+        // readyToPlay) on channels that mux cleanly: the two candidate
+        // causes are interlaced source coding (field_order != progressive;
+        // VT via the fMP4 loopback chokes where the working channels are
+        // all progressive) and malformed/Annex-B extradata feeding a broken
+        // avcC/hvcC into init.mp4. One log line names both.
+        let extraSize = Int(codecpar.pointee.extradata_size)
+        var extraHead = "none"
+        if extraSize > 0, let extra = codecpar.pointee.extradata {
+            let n = min(extraSize, 8)
+            extraHead = (0..<n).map { String(format: "%02x", extra[$0]) }.joined()
+        }
+        EngineLog.emit(
+            "[HLSVideoEngine] video codecpar: codec=\(codecpar.pointee.codec_id.rawValue) "
+            + "\(codecpar.pointee.width)x\(codecpar.pointee.height) "
+            + "profile=\(codecpar.pointee.profile) level=\(codecpar.pointee.level) "
+            + "fieldOrder=\(codecpar.pointee.field_order.rawValue) "
+            + "extradata=\(extraSize)B head=\(extraHead)",
+            category: .session
+        )
+
         // Accepted codecs: HEVC, H.264, AV1 (when AVPlayer can decode
         // it on the active platform).
         //
