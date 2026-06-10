@@ -1,0 +1,64 @@
+import Foundation
+import Combine
+
+/// High-frequency playback clock, split out of `AetherEngine`'s own
+/// `ObservableObject` surface (AetherEngine#29).
+///
+/// `currentTime` ticks at ~10 Hz from AVPlayer's periodic time
+/// observer. While these values lived as `@Published` properties on
+/// the engine itself, every tick fired `engine.objectWillChange`, so
+/// ANY SwiftUI view observing the engine (via `@ObservedObject` /
+/// `@EnvironmentObject`) re-rendered its body 10 times a second even
+/// if it only read track lists or playback state. On tvOS that
+/// re-render tears down and rebuilds native `Menu` dropdowns, which
+/// makes the focused item's highlight flicker at the publish rate.
+///
+/// The split mirrors AVFoundation's own shape: AVPlayer exposes time
+/// via `addPeriodicTimeObserver`, not via KVO-observable state, so
+/// time-driven UI opts in explicitly and everything else stays quiet.
+///
+/// Host usage:
+/// - **Polling / one-shot reads** keep working unchanged through the
+///   engine's computed forwarders (`engine.currentTime` etc.).
+/// - **Time-driven UI** (transport bar, time labels) observes the
+///   clock, not the engine: put `@ObservedObject var clock =
+///   engine.clock` in the leaf view that renders time, or subscribe
+///   to `engine.clock.$currentTime` in a view model. Apply
+///   `.throttle` / `.removeDuplicates` downstream for lower rates.
+/// - **Everything else** (menus, track pickers, settings panes)
+///   observes the engine and no longer re-renders on clock ticks.
+@MainActor
+public final class PlaybackClock: ObservableObject {
+
+    /// Current playback position in seconds, ~10 Hz. On the native
+    /// HLS path this is the unified source-PTS clock (AVPlayer time
+    /// folded with `playlistShiftSeconds`).
+    @Published public internal(set) var currentTime: Double = 0
+
+    /// Source PTS of the currently displayed frame. Equal to
+    /// `currentTime` on every path now that the native clock is
+    /// unified onto source time; kept as a stable alias for callers
+    /// that want to express source-timeline intent explicitly
+    /// (subtitle overlay, side-demuxer seek).
+    @Published public internal(set) var sourceTime: Double = 0
+
+    /// Fractional progress through the loaded item. Reset to 0 on
+    /// load/stop; hosts typically derive their own from
+    /// `currentTime / duration`.
+    @Published public internal(set) var progress: Float = 0
+
+    /// Largest session-relative time reached on a live source
+    /// (seconds since first frame). Meaningful only while
+    /// `engine.isLive`. 0 otherwise.
+    @Published public internal(set) var liveEdgeTime: Double = 0
+
+    /// DVR-seekable span on the session timeline, or nil when DVR is
+    /// disabled or the source is not live.
+    @Published public internal(set) var seekableLiveRange: ClosedRange<Double>? = nil
+
+    /// True when playback is at / near the live edge.
+    @Published public internal(set) var isAtLiveEdge: Bool = false
+
+    /// Seconds the playhead trails the live edge. 0 at the edge.
+    @Published public internal(set) var behindLiveSeconds: Double = 0
+}

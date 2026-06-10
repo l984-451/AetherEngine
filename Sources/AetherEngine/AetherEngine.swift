@@ -55,9 +55,27 @@ public final class AetherEngine: ObservableObject {
     // MARK: - Public State
 
     @Published public private(set) var state: PlaybackState = .idle
-    @Published public private(set) var currentTime: Double = 0
+
+    /// High-frequency playback clock (`currentTime`, `sourceTime`,
+    /// live-edge fields). Deliberately a SEPARATE ObservableObject:
+    /// its ~10 Hz ticks must not fire `objectWillChange` on the
+    /// engine itself, or every engine-observing SwiftUI view
+    /// re-renders per tick (tvOS native `Menu` dropdowns flicker,
+    /// AetherEngine#29). Observe `clock` only in the leaf views that
+    /// render time; see `PlaybackClock` for the usage guide.
+    public let clock = PlaybackClock()
+
+    /// Current playback position in seconds. Read-only convenience
+    /// forwarder for polling; for push updates subscribe to
+    /// `clock.$currentTime` (the engine's `objectWillChange` does NOT
+    /// fire on clock ticks).
+    public var currentTime: Double { clock.currentTime }
+
     @Published public private(set) var duration: Double = 0
-    @Published public private(set) var progress: Float = 0
+
+    /// Forwarder; see `clock.progress`.
+    public var progress: Float { clock.progress }
+
     @Published public private(set) var audioTracks: [TrackInfo] = []
     @Published public private(set) var subtitleTracks: [TrackInfo] = []
     /// Container metadata (tags + embedded cover) for the loaded source.
@@ -154,14 +172,19 @@ public final class AetherEngine: ObservableObject {
 
     /// Largest session-relative time reached on a live source (seconds since
     /// first frame). Meaningful only while `isLive`. 0 otherwise.
-    @Published public private(set) var liveEdgeTime: Double = 0
+    /// Forwarder; for push updates subscribe to `clock.$liveEdgeTime`
+    /// (live-edge fields tick ~1 Hz and live on the clock so they
+    /// don't fire the engine's `objectWillChange`).
+    public var liveEdgeTime: Double { clock.liveEdgeTime }
     /// DVR-seekable span on the session timeline, or nil when DVR is disabled
-    /// or the source is not live.
-    @Published public private(set) var seekableLiveRange: ClosedRange<Double>? = nil
-    /// True when playback is at / near the live edge.
-    @Published public private(set) var isAtLiveEdge: Bool = false
+    /// or the source is not live. Forwarder; see `clock.seekableLiveRange`.
+    public var seekableLiveRange: ClosedRange<Double>? { clock.seekableLiveRange }
+    /// True when playback is at / near the live edge. Forwarder; see
+    /// `clock.isAtLiveEdge`.
+    public var isAtLiveEdge: Bool { clock.isAtLiveEdge }
     /// Seconds the playhead trails the live edge. 0 at the edge.
-    @Published public private(set) var behindLiveSeconds: Double = 0
+    /// Forwarder; see `clock.behindLiveSeconds`.
+    public var behindLiveSeconds: Double { clock.behindLiveSeconds }
 
     /// Fires when the live source server restarted its stream from the
     /// beginning after a connection drop (e.g. a Jellyfin transcode
@@ -544,7 +567,8 @@ public final class AetherEngine: ObservableObject {
     /// on every path now that the native clock is unified onto source time;
     /// kept as a stable alias for callers that want to express source-
     /// timeline intent explicitly (subtitle overlay, side-demuxer seek).
-    @Published public private(set) var sourceTime: Double = 0
+    /// Forwarder; for push updates subscribe to `clock.$sourceTime`.
+    public var sourceTime: Double { clock.sourceTime }
 
     /// The `LoadOptions` the host passed for the current session.
     /// Replayed on every internal reopen of the source URL
@@ -1007,10 +1031,10 @@ public final class AetherEngine: ObservableObject {
             ? LiveWindow(windowSeconds: options.nativeRemoteHLS ? .greatestFiniteMagnitude : options.dvrWindowSeconds)
             : nil
         state = .loading
-        currentTime = 0
+        clock.currentTime = 0
         nativeClockSeconds = 0
         duration = 0
-        progress = 0
+        clock.progress = 0
         audioTracks = []
         subtitleTracks = []
         metadata = nil
@@ -1502,8 +1526,8 @@ public final class AetherEngine: ObservableObject {
             .sink { [weak self] value in
                 guard let self = self else { return }
                 self.nativeClockSeconds = value
-                self.currentTime = value
-                self.sourceTime = value
+                self.clock.currentTime = value
+                self.clock.sourceTime = value
                 if self.isLive {
                     self.publishLiveWindow(edgeSessionTime: host.seekableEnd)
                 }
@@ -1641,8 +1665,8 @@ public final class AetherEngine: ObservableObject {
                 // currentTime tracks the new shift immediately (e.g. after a
                 // restart that landed past the planned keyframe), rather than
                 // lagging until the next periodic time tick.
-                self.currentTime = self.nativeClockSeconds + seconds
-                self.sourceTime = self.currentTime
+                self.clock.currentTime = self.nativeClockSeconds + seconds
+                self.clock.sourceTime = self.currentTime
             }
         }
         session.onPlaylistShiftRebased = { [weak self] seconds, seamOutputSeconds in
@@ -1747,8 +1771,8 @@ public final class AetherEngine: ObservableObject {
                 if let active = self.liveShiftSeams.last(where: { value >= $0.activateAt }) {
                     self.playlistShiftSeconds = active.shift
                 }
-                self.currentTime = value + self.playlistShiftSeconds
-                self.sourceTime = self.currentTime
+                self.clock.currentTime = value + self.playlistShiftSeconds
+                self.clock.sourceTime = self.currentTime
                 // Live: publish the DVR window surfaces on every tick. The
                 // edge must sit on the SAME session axis as the playhead. The
                 // playhead is folded as host.currentTime + playlistShiftSeconds
@@ -1901,8 +1925,8 @@ public final class AetherEngine: ObservableObject {
         host.$currentTime
             .sink { [weak self] value in
                 guard let self = self else { return }
-                self.currentTime = value
-                self.sourceTime = value
+                self.clock.currentTime = value
+                self.clock.sourceTime = value
             }
             .store(in: &softwareCancellables)
         host.$duration
@@ -1984,8 +2008,8 @@ public final class AetherEngine: ObservableObject {
         host.$currentTime
             .sink { [weak self] value in
                 guard let self = self else { return }
-                self.currentTime = value
-                self.sourceTime = value
+                self.clock.currentTime = value
+                self.clock.sourceTime = value
             }
             .store(in: &audioCancellables)
         host.$duration
@@ -2069,8 +2093,8 @@ public final class AetherEngine: ObservableObject {
         host.$currentTime
             .sink { [weak self] value in
                 guard let self = self else { return }
-                self.currentTime = value
-                self.sourceTime = value
+                self.clock.currentTime = value
+                self.clock.sourceTime = value
             }
             .store(in: &audioNativeCancellables)
         host.$duration
@@ -2287,8 +2311,8 @@ public final class AetherEngine: ObservableObject {
             if softwareHost != nil, nativeHost == nil {
                 EngineLog.emit("[AetherEngine] SW live seek target=\(target)", category: .engine)
                 await softwareHost?.seek(to: target)
-                currentTime = target
-                sourceTime = target
+                clock.currentTime = target
+                clock.sourceTime = target
                 state = .playing
                 return
             }
@@ -2299,8 +2323,8 @@ public final class AetherEngine: ObservableObject {
             // The live playlist already exposes its window of segments.
             nativeHost?.seek(to: clockTarget)
             nativeClockSeconds = clockTarget
-            currentTime = target
-            sourceTime = target
+            clock.currentTime = target
+            clock.sourceTime = target
             // publishLiveWindow on the next tick recomputes behindLiveSeconds
             // against the new playhead.
             state = .playing
@@ -2328,8 +2352,8 @@ public final class AetherEngine: ObservableObject {
             nativeHost?.seek(to: clockTarget)
         }
         nativeClockSeconds = clockTarget
-        currentTime = target
-        sourceTime = target
+        clock.currentTime = target
+        clock.sourceTime = target
 
         // Re-arm the side subtitle demuxer at the new playhead so cues
         // for the post-scrub content surface immediately. Skip when
@@ -2378,10 +2402,10 @@ public final class AetherEngine: ObservableObject {
         w.noteEdge(edgeSessionTime)
         w.notePlayhead(currentTime)
         liveWindow = w
-        liveEdgeTime = w.edgeTime
-        seekableLiveRange = w.seekableRange
-        isAtLiveEdge = w.isAtEdge
-        behindLiveSeconds = w.behindLiveSeconds
+        clock.liveEdgeTime = w.edgeTime
+        clock.seekableLiveRange = w.seekableRange
+        clock.isAtLiveEdge = w.isAtEdge
+        clock.behindLiveSeconds = w.behindLiveSeconds
     }
 
     /// Seek to the current live edge. No-op when not live. With DVR enabled this
@@ -2403,8 +2427,8 @@ public final class AetherEngine: ObservableObject {
                 )
                 host.seek(to: clockTarget)
                 nativeClockSeconds = clockTarget
-                currentTime = clockTarget + playlistShiftSeconds
-                sourceTime = currentTime
+                clock.currentTime = clockTarget + playlistShiftSeconds
+                clock.sourceTime = currentTime
             }
             return
         }
@@ -2414,8 +2438,8 @@ public final class AetherEngine: ObservableObject {
     public func stop() {
         stopInternal()
         state = .idle
-        currentTime = 0
-        progress = 0
+        clock.currentTime = 0
+        clock.progress = 0
         // Published-surface hygiene: without these, the PREVIOUS
         // session's metadata/track lists/duration/format survive until
         // the next load() and hosts reading between stop and load see
@@ -3381,7 +3405,7 @@ public final class AetherEngine: ObservableObject {
         playlistShiftSeconds = 0
         liveShiftSeams.removeAll()
         nativeClockSeconds = 0
-        sourceTime = 0
+        clock.sourceTime = 0
 
         liveWindowTimerTask?.cancel()
         liveWindowTimerTask = nil
@@ -3405,10 +3429,10 @@ public final class AetherEngine: ObservableObject {
         activeAudioTrackIndex = nil
         isLive = false
         liveWindow = nil
-        liveEdgeTime = 0
-        seekableLiveRange = nil
-        isAtLiveEdge = false
-        behindLiveSeconds = 0
+        clock.liveEdgeTime = 0
+        clock.seekableLiveRange = nil
+        clock.isAtLiveEdge = false
+        clock.behindLiveSeconds = 0
     }
 
     // MARK: - Memory diagnostic

@@ -95,11 +95,18 @@ player.stop()
 
 // Observe (Combine @Published)
 player.$state         // .idle, .loading, .playing, .paused, .seeking, .error
-player.$currentTime   // AVPlayer's HLS clock (use for transport / scrub / resume)
-player.$sourceTime    // source PTS of the displayed frame (use for subtitle alignment)
 player.$duration
 player.$videoFormat   // .sdr, .hdr10, .hdr10Plus, .dolbyVision, .hlg
 player.$currentAVPlayer  // active AVPlayer, re-emitted on every reload (MPNowPlayingSession)
+
+// Time observation lives on `player.clock`, a SEPARATE ObservableObject,
+// so the ~10 Hz ticks never fire `objectWillChange` on the engine itself
+// (a SwiftUI view observing the engine for track lists / state does not
+// re-render per tick; native tvOS Menu dropdowns stay stable). Observe
+// the clock only in the leaf views that render time.
+player.clock.$currentTime   // ~10 Hz playback clock (transport / scrub / resume)
+player.clock.$sourceTime    // source PTS of the displayed frame (subtitle alignment)
+player.currentTime          // read-only polling access stays on the engine
 
 player.audioTracks    // [TrackInfo]
 player.selectAudioTrack(index: trackID)
@@ -169,10 +176,12 @@ try await player.load(
     options: LoadOptions(isLive: true, dvrWindowSeconds: 1800)
 )
 
-// Drive a scrubber from the DVR range and lag indicator.
-player.$seekableLiveRange     // ClosedRange<Double>?, session-relative seconds; nil when DVR off
-player.$behindLiveSeconds     // seconds behind the live edge; 0 when at the edge
-player.$liveEdgeTime          // current live edge in session-relative seconds
+// Drive a scrubber from the DVR range and lag indicator. The live-edge
+// fields tick continuously, so they live on `player.clock` (see the
+// time-observation note above).
+player.clock.$seekableLiveRange   // ClosedRange<Double>?, session-relative seconds; nil when DVR off
+player.clock.$behindLiveSeconds   // seconds behind the live edge; 0 when at the edge
+player.clock.$liveEdgeTime        // current live edge in session-relative seconds
 
 // Snap back to live.
 await player.seekToLiveEdge()
@@ -183,7 +192,7 @@ await player.seek(to: player.liveEdgeTime - 300)    // 5 minutes back
 // isAtLiveEdge is anchored on the buffered edge and is generally false during
 // normal playback. Use seekToLiveEdge() to snap rather than waiting for this
 // flag to flip true.
-player.$isAtLiveEdge
+player.clock.$isAtLiveEdge
 ```
 
 Format coverage follows the engine's native-first / software-fallback split. H.264 / HEVC / AV1-with-HW route through the native AVPlayer pipeline; AV1-without-HW / VP9 / MPEG-2 / VC-1 route through the software pipeline with a disk-spooled `PacketRingBuffer` backing the rewind. Both paths present the same session-relative timeline to the host.
