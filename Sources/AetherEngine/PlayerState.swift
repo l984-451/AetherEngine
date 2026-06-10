@@ -206,6 +206,17 @@ public struct LoadOptions: Sendable, Equatable {
     /// `isLive: true` for the live UI surfaces. Default `false`.
     public var nativeRemoteHLS: Bool
 
+    /// Emit ASS / SSA subtitle cues as the RAW event line (the full
+    /// `ReadOrder,Layer,Style,...,Text` payload including override
+    /// tags like `{\pos(...)}` and `\N` escapes) instead of the
+    /// engine's default plain-text extraction, which strips all
+    /// styling. Opt-in for hosts that render ASS styling themselves;
+    /// pair with `TrackInfo.assHeader` (the track's `[Script Info]` +
+    /// `[V4+ Styles]` header) to resolve style references. Only
+    /// affects tracks whose codec is ASS / SSA; SubRip / WebVTT /
+    /// bitmap tracks are untouched. Default `false` (AetherEngine#30).
+    public var preserveASSMarkup: Bool
+
     public init(
         omitCriteriaColorExtensions: Bool = false,
         suppressDisplayCriteria: Bool = false,
@@ -217,7 +228,8 @@ public struct LoadOptions: Sendable, Equatable {
         isLive: Bool = false,
         audioOnly: Bool = false,
         dvrWindowSeconds: Double? = nil,
-        nativeRemoteHLS: Bool = false
+        nativeRemoteHLS: Bool = false,
+        preserveASSMarkup: Bool = false
     ) {
         self.omitCriteriaColorExtensions = omitCriteriaColorExtensions
         self.suppressDisplayCriteria = suppressDisplayCriteria
@@ -230,6 +242,7 @@ public struct LoadOptions: Sendable, Equatable {
         self.audioOnly = audioOnly
         self.dvrWindowSeconds = dvrWindowSeconds
         self.nativeRemoteHLS = nativeRemoteHLS
+        self.preserveASSMarkup = preserveASSMarkup
     }
 }
 
@@ -400,7 +413,15 @@ public struct TrackInfo: Identifiable, Sendable, Equatable {
     /// count of the bed (typically 5.1).
     public let isAtmos: Bool
 
-    public init(id: Int, name: String, codec: String, language: String?, channels: Int = 0, isDefault: Bool, isAtmos: Bool = false) {
+    /// For ASS / SSA subtitle tracks: the script header from the
+    /// container's codec extradata (`[Script Info]`, `[V4+ Styles]`,
+    /// and the `[Events]` format line). Hosts rendering ASS styling
+    /// themselves (see `LoadOptions.preserveASSMarkup`) need it to
+    /// resolve the style names referenced by each event line. nil for
+    /// every other track kind.
+    public let assHeader: String?
+
+    public init(id: Int, name: String, codec: String, language: String?, channels: Int = 0, isDefault: Bool, isAtmos: Bool = false, assHeader: String? = nil) {
         self.id = id
         self.name = name
         self.codec = codec
@@ -408,6 +429,7 @@ public struct TrackInfo: Identifiable, Sendable, Equatable {
         self.channels = channels
         self.isDefault = isDefault
         self.isAtmos = isAtmos
+        self.assHeader = assHeader
     }
 }
 

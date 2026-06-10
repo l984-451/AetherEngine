@@ -425,6 +425,19 @@ public final class Demuxer: @unchecked Sendable {
         let isAtmos = (codecpar.pointee.codec_id == AV_CODEC_ID_EAC3)
             && codecpar.pointee.profile == 30
 
+        // ASS / SSA tracks carry their script header ([Script Info] +
+        // [V4+ Styles] + the [Events] format line) as codec extradata.
+        // Surface it so hosts that opt into raw ASS event lines
+        // (LoadOptions.preserveASSMarkup) can resolve style references.
+        var assHeader: String? = nil
+        let codecID = codecpar.pointee.codec_id
+        if codecID == AV_CODEC_ID_ASS || codecID == AV_CODEC_ID_SSA,
+           let extradata = codecpar.pointee.extradata,
+           codecpar.pointee.extradata_size > 0 {
+            let bytes = Data(bytes: extradata, count: Int(codecpar.pointee.extradata_size))
+            assHeader = String(data: bytes, encoding: .utf8)
+        }
+
         return TrackInfo(
             id: index,
             name: name,
@@ -432,7 +445,8 @@ public final class Demuxer: @unchecked Sendable {
             language: language,
             channels: channels,
             isDefault: isDefault,
-            isAtmos: isAtmos
+            isAtmos: isAtmos,
+            assHeader: assHeader
         )
     }
 

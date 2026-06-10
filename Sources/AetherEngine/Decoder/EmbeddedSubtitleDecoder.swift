@@ -53,10 +53,17 @@ final class EmbeddedSubtitleDecoder {
     private let sourceVideoWidth: Int32
     private let sourceVideoHeight: Int32
 
+    /// When true and the track codec is ASS / SSA, cues carry the raw
+    /// event line (override tags, style references, escapes intact)
+    /// instead of the stripped plain text. Hosts opt in via
+    /// `LoadOptions.preserveASSMarkup` and render the styling
+    /// themselves (AetherEngine#30). Non-ASS codecs ignore the flag.
+    private let preserveASSMarkup: Bool
+
     /// Open the subtitle decoder for `stream`. Returns `nil` if the
     /// codec couldn't be opened (no decoder for codec_id, or
     /// avcodec_open2 fails).
-    init?(stream: UnsafeMutablePointer<AVStream>, sourceVideoWidth: Int32, sourceVideoHeight: Int32) {
+    init?(stream: UnsafeMutablePointer<AVStream>, sourceVideoWidth: Int32, sourceVideoHeight: Int32, preserveASSMarkup: Bool = false) {
         guard let codecpar = stream.pointee.codecpar,
               codecpar.pointee.codec_type == AVMEDIA_TYPE_SUBTITLE
         else { return nil }
@@ -92,6 +99,8 @@ final class EmbeddedSubtitleDecoder {
         self.codecContext = ctx
         self.sourceVideoWidth = sourceVideoWidth
         self.sourceVideoHeight = sourceVideoHeight
+        self.preserveASSMarkup = preserveASSMarkup
+            && (id == AV_CODEC_ID_ASS || id == AV_CODEC_ID_SSA)
 
         // Some demuxers default subtitle streams to AVDISCARD_DEFAULT
         // which can swallow packets the parser thinks are useless.
@@ -197,7 +206,9 @@ final class EmbeddedSubtitleDecoder {
         if sub.num_rects > 0, let rects = sub.rects {
             for i in 0..<Int(sub.num_rects) {
                 guard let rect = rects[i] else { continue }
-                if let text = Self.textForSubtitleRect(rect) {
+                if preserveASSMarkup, let raw = Self.rawASSLine(rect) {
+                    textLines.append(raw)
+                } else if let text = Self.textForSubtitleRect(rect) {
                     textLines.append(text)
                 } else if let image = Self.imageForSubtitleRect(
                     rect,
@@ -432,6 +443,17 @@ final class EmbeddedSubtitleDecoder {
     }
 
     // MARK: - Rect → text / image
+
+    /// Raw ASS event line for the rect, exactly as libavcodec hands
+    /// it over (the `ReadOrder,Layer,Style,...,Text` payload with all
+    /// override tags and escapes intact). Used by the
+    /// `preserveASSMarkup` opt-in path; nil when the rect carries no
+    /// ASS payload (bitmap rects, plain-text-only rects).
+    private static func rawASSLine(_ rect: UnsafeMutablePointer<AVSubtitleRect>) -> String? {
+        guard let assPtr = rect.pointee.ass else { return nil }
+        let line = String(cString: assPtr)
+        return line.isEmpty ? nil : line
+    }
 
     private static func textForSubtitleRect(_ rect: UnsafeMutablePointer<AVSubtitleRect>) -> String? {
         if let textPtr = rect.pointee.text {

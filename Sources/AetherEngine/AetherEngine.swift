@@ -2844,11 +2844,12 @@ public final class AetherEngine: ObservableObject {
         let w = sourceVideoWidth > 0 ? sourceVideoWidth : 1920
         let h = sourceVideoHeight > 0 ? sourceVideoHeight : 1080
         let headers = loadedOptions.httpHeaders
+        let preserveASS = loadedOptions.preserveASSMarkup
         embeddedSubtitleTask = Task.detached(priority: .userInitiated) { [weak self] in
             await self?.runEmbeddedSubtitleReader(
                 url: url, reader: reader, formatHint: formatHint,
                 headers: headers, streamIndex: streamIndex, startAt: startAt,
-                videoWidth: w, videoHeight: h
+                videoWidth: w, videoHeight: h, preserveASSMarkup: preserveASS
             )
         }
     }
@@ -2864,7 +2865,7 @@ public final class AetherEngine: ObservableObject {
     nonisolated private func runEmbeddedSubtitleReader(
         url: URL, reader: IOReader?, formatHint: String?,
         headers: [String: String], streamIndex: Int32, startAt: Double,
-        videoWidth: Int32, videoHeight: Int32
+        videoWidth: Int32, videoHeight: Int32, preserveASSMarkup: Bool = false
     ) async {
         let demuxer = Demuxer()
         // Register for abort: Task.cancel() is only observed BETWEEN
@@ -2930,7 +2931,8 @@ public final class AetherEngine: ObservableObject {
               let decoder = EmbeddedSubtitleDecoder(
                   stream: stream,
                   sourceVideoWidth: videoWidth,
-                  sourceVideoHeight: videoHeight
+                  sourceVideoHeight: videoHeight,
+                  preserveASSMarkup: preserveASSMarkup
               )
         else {
             EngineLog.emit("[AetherEngine] embedded subtitle decoder open failed for stream=\(streamIndex)", category: .engine)

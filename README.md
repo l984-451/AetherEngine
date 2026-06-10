@@ -125,6 +125,12 @@ player.$subtitleCues                           // [SubtitleCue], body is .text(S
 player.$isSubtitleActive                       // host mirror gate
 player.$isLoadingSubtitles                     // sidecar fetch + decode in progress
 
+// ASS / SSA styling: by default the engine strips override tags and
+// emits plain text. Hosts that render ASS styling themselves opt into
+// raw event lines via LoadOptions(preserveASSMarkup: true) and read
+// the track's script header ([Script Info] + [V4+ Styles]) from
+// TrackInfo.assHeader to resolve style references.
+
 // Still frames, off-playback (scrub preview, snapshot, Recents thumbnail)
 let frames = player.makeFrameExtractor()           // for the currently loaded URL, or nil
 // or, for an arbitrary item: FrameExtractor(url:httpHeaders:)
