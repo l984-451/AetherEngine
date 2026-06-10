@@ -60,13 +60,19 @@ public final class ASSScriptBuilder {
     /// ReadOrder.
     public func script() -> String {
         var lines = [header]
-        for key in events.keys.sorted() {
-            lines.append(events[key]!)
+        lines.reserveCapacity(events.count + 1)
+        for (_, line) in events.sorted(by: { $0.key < $1.key }) {
+            lines.append(line)
         }
         return lines.joined(separator: "\n")
     }
 
-    /// Drop all accumulated events (track switch; the header stays).
+    /// Drop all accumulated events. The header is PER-TRACK
+    /// (`TrackInfo.assHeader` carries that track's `[V4+ Styles]`):
+    /// on a subtitle track switch build a NEW instance with the new
+    /// track's header instead of resetting this one, or the new
+    /// track's events render against the old track's styles. reset()
+    /// is for same-track re-feeds only.
     public func reset() {
         events.removeAll(keepingCapacity: true)
     }

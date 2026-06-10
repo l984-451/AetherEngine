@@ -65,4 +65,26 @@ struct ASSScriptBuilderTests {
         #expect(b.eventCount == 0)
         #expect(b.add(rawEventText: "3,0,Default,,0,0,0,,Ok", start: 0, end: 1))
     }
+
+    @Test("Out-of-order arrival renders sorted by ReadOrder")
+    func outOfOrderArrival() {
+        let b = ASSScriptBuilder(header: header)
+        b.add(rawEventText: "4,0,Default,,0,0,0,,Later", start: 10, end: 11)
+        b.add(rawEventText: "2,0,Default,,0,0,0,,Earlier", start: 5, end: 6)
+        let script = b.script()
+        let earlier = script.range(of: ",Earlier")!.lowerBound
+        let later = script.range(of: ",Later")!.lowerBound
+        #expect(earlier < later)
+    }
+
+    @Test("Empty builder renders just the header; first emission wins on duplicate ReadOrder")
+    func emptyAndFirstWins() {
+        let b = ASSScriptBuilder(header: header)
+        #expect(b.script() == header)
+        b.add(rawEventText: "6,0,Default,,0,0,0,,Original", start: 1, end: 2)
+        b.add(rawEventText: "6,0,Default,,0,0,0,,Changed", start: 9, end: 10)
+        let script = b.script()
+        #expect(script.contains(",Original"))
+        #expect(!script.contains(",Changed"))
+    }
 }
