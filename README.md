@@ -132,8 +132,9 @@ player.$isLoadingSubtitles                     // sidecar fetch + decode in prog
 // TrackInfo.assHeader to resolve style references.
 // ASSScriptBuilder reassembles those raw event lines + assHeader into a
 // complete script for whole-file renderers (e.g. swift-ass-renderer's
-// loadTrack(content:)), deduped by ReadOrder; engine.fontAttachments
-// carries the container's embedded fonts for the renderer's font dir.
+// loadTrack(content:)), deduped by event content (real files hardcode
+// ReadOrder 0); engine.fontAttachments carries the container's embedded
+// fonts for the renderer's font dir.
 
 // Still frames, off-playback (scrub preview, snapshot, Recents thumbnail)
 let frames = player.makeFrameExtractor()           // for the currently loaded URL, or nil
@@ -221,7 +222,7 @@ Format coverage follows the engine's native-first / software-fallback split. H.2
 Install via Swift Package Manager:
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "3.0.0")
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "3.1.0")
 ```
 
 Two complementary samples ship in `Examples/`:
@@ -564,13 +565,13 @@ AetherEngine uses [Semantic Versioning](https://semver.org). The public API surf
 
 `internal` types and properties are not part of the contract and may change in any release. `@testable import AetherEngine` reaches them for the package's own tests, not for production use.
 
-Pin `from: "3.0.0"` in your `Package.swift` to allow patch + minor updates while excluding breaking changes:
+Pin `from: "3.1.0"` in your `Package.swift` to allow patch + minor updates while excluding breaking changes:
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "3.0.0")
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "3.1.0")
 ```
 
-Pin to `.upToNextMinor(from: "3.0.0")` for stricter teams that prefer to opt into minor bumps explicitly. See [CHANGELOG.md](CHANGELOG.md) for the per-release index.
+Pin to `.upToNextMinor(from: "3.1.0")` for stricter teams that prefer to opt into minor bumps explicitly. See [CHANGELOG.md](CHANGELOG.md) for the per-release index.
 
 ## Requirements
 
