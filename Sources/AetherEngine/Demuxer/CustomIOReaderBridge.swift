@@ -68,10 +68,13 @@ final class CustomIOReaderBridge: AVIOProvider, @unchecked Sendable {
         guard !isFullyClosed else { return }
         isFullyClosed = true
         isClosed = true
-        if context != nil {
-            // Mirrors AVIOReader.close(): free the context, drop our buffer
-            // reference. (FFmpeg may have swapped avio->buffer internally;
-            // we follow the established AVIOReader pattern verbatim.)
+        if let ctx = context {
+            // avio_context_free releases the struct but NOT ctx->buffer
+            // (verified against aviobuf.c); the canonical pattern frees the
+            // buffer first. Must free ctx.pointee.buffer, not our original
+            // av_malloc pointer: FFmpeg can realloc the buffer internally
+            // (ffio_set_buf_size), making the original pointer stale.
+            av_free(ctx.pointee.buffer)
             avio_context_free(&context)
         }
         context = nil

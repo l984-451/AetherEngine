@@ -502,6 +502,16 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private var isClosed = false
     private var isFullyClosed = false
 
+    /// Streaming-mode session/task, held as fields so `markClosed()` /
+    /// `close()` can cancel the in-flight download. Without this the GET
+    /// kept streaming after teardown (endless for chunked responses with
+    /// no Content-Length) and the semaphore wait in `streamDownloadSync`
+    /// parked a prefetchQueue thread forever: one leaked connection,
+    /// URLSession, and thread per closed streaming session. Guarded by
+    /// `streamLock` (set on the prefetch queue, read from teardown threads).
+    private var streamingSession: URLSession?
+    private var streamingTask: URLSessionDataTask?
+
     /// Mark as closed without freeing resources. The AVIO read callback
     /// checks this flag and returns -1 immediately, which causes
     /// av_read_frame to return an error and unblock the demux thread.
@@ -512,6 +522,13 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // Wake any semaphore waits so the read callbacks can exit
         prefetchReady.signal()
         streamDataReady.signal()
+        // Streaming mode: cancel the in-flight download so the origin
+        // stops sending and the completion delegate fires, which releases
+        // the semaphore wait in streamDownloadSync.
+        streamLock.lock()
+        let sTask = streamingTask
+        streamLock.unlock()
+        sTask?.cancel()
         // Persistent mode: wake a read blocked waiting for forward data and
         // release a delivery callback blocked on backpressure. Bumping the
         // generation makes any in-flight delegate callback go stale, and the
@@ -543,7 +560,13 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         guard !isFullyClosed else { return }
         isFullyClosed = true
         isClosed = true
-        if context != nil {
+        if let ctx = context {
+            // avio_context_free releases the struct but NOT ctx->buffer
+            // (verified against aviobuf.c); without this av_free every
+            // demuxer open leaked the 256 KB AVIO buffer. Must free
+            // ctx.pointee.buffer, not our original av_malloc pointer:
+            // FFmpeg can realloc the buffer internally (ffio_set_buf_size).
+            av_free(ctx.pointee.buffer)
             avio_context_free(&context)
         }
         context = nil
@@ -557,8 +580,16 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         streamLock.lock()
         streamEnded = true
         streamBuffer = Data()
+        let sTask = streamingTask
+        let sSession = streamingSession
+        streamingTask = nil
+        streamingSession = nil
         streamLock.unlock()
         streamDataReady.signal()
+        // Cancel a still-running streaming download (markClosed normally
+        // already did; this covers a close() without prior markClosed).
+        sTask?.cancel()
+        sSession?.invalidateAndCancel()
 
         // Persistent mode: invalidate the live connection (stale generation
         // drops any late delivery), drop the window, and release waiters.
@@ -1183,18 +1214,33 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             delegateQueue: nil
         )
         let task = streamSession.dataTask(with: request)
+
+        // Register BEFORE resume so a racing markClosed()/close() can
+        // cancel the task; re-check the close flag afterwards to cover a
+        // teardown that ran between the registration and the resume.
+        streamLock.lock()
+        streamingSession = streamSession
+        streamingTask = task
+        streamLock.unlock()
+
         task.resume()
+        if isClosed { task.cancel() }
 
         #if DEBUG
         EngineLog.emit("[AVIOReader] Streaming started: \(url.lastPathComponent)", category: .demux)
         #endif
 
-        // Wait until stream ends or reader is closed
+        // Wait until stream ends, errors out, or a teardown cancels the
+        // task (markClosed/close): all three fire the completion delegate.
         semaphore.wait()
 
         #if DEBUG
         EngineLog.emit("[AVIOReader] Streaming ended", category: .demux)
         #endif
+        streamLock.lock()
+        streamingSession = nil
+        streamingTask = nil
+        streamLock.unlock()
         streamSession.invalidateAndCancel()
     }
 
