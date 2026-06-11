@@ -186,7 +186,10 @@ let info = try AetherEngine.probe(source: .custom(MyArchiveReader(), formatHint:
 > unblock the in-flight read, never invalidate the reader). Embedded subtitles
 > and scrub-preview thumbnails require the reader to implement
 > `makeIndependentReader()` (a second independent cursor); they are skipped when
-> it returns nil. Forward-only readers support plain playback and seeking only.
+> it returns nil. Forward-only readers support plain playback and seeking only;
+> for VOD they run on the software path, while live sessions
+> (`LoadOptions.isLive`) keep them eligible for the native loopback path (the
+> live producer never seeks the source backward).
 
 ### Live TV / DVR
 
@@ -508,7 +511,8 @@ Sources/AetherEngine/
 │       ├── HLSPlaylist.swift                Line-oriented RFC 8216 subset parser (master / media playlists)
 │       ├── HLSPlaylistTracker.swift         Pure segment cursor: duration-capped edge join, window-slide rejoin, stall budget
 │       ├── ByteFIFO.swift                   Bounded blocking byte queue between the fetch loop and the demux thread
-│       └── HLSIngestError.swift             Typed terminal errors (encrypted, fMP4, unreachable, invalid, stalled)
+│       ├── HLSIngestError.swift             Typed terminal errors (encrypted, fMP4, unreachable, invalid, stalled)
+│       └── LiveIngestSourceInfo.swift       Internal seam: the reader reports the upstream segment cadence so the loopback playlist can shape TARGETDURATION + blocking-reload eligibility
 ├── Native/
 │   ├── NativeAVPlayerHost.swift             Native path: AVPlayer host bound to the loopback HLS-fMP4 URL
 │   └── SoftwarePlaybackHost.swift           SW path: demux loop + decoders + renderer + synchronizer orchestration
@@ -543,7 +547,7 @@ Sources/AetherEngine/
 ## aetherctl
 
 A standalone macOS CLI is shipped alongside the library for repro
-work without going through TestFlight + Apple TV. Nine subcommands;
+work without going through TestFlight + Apple TV. Ten subcommands;
 most operate on a media source URL (`file://` or `http(s)://`),
 `live` and `dvr` run against a built-in synthetic broadcast fixture:
 
