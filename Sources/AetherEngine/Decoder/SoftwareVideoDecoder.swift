@@ -57,6 +57,15 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     private var _skipUntilPTS: CMTime?
     private let skipLock = NSLock()
 
+    /// Clear the skip threshold only if it is still the one we acted on.
+    private func clearSkip(ifStillAt threshold: CMTime) {
+        skipLock.lock()
+        if let current = _skipUntilPTS, CMTimeCompare(current, threshold) == 0 {
+            _skipUntilPTS = nil
+        }
+        skipLock.unlock()
+    }
+
     /// Protects codecContext from concurrent access between the demux
     /// thread (decode) and the main thread (close/flush).
     private let lock = NSLock()
@@ -204,7 +213,10 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             if CMTimeCompare(framePTS, threshold) < 0 {
                 return
             }
-            skipUntilPTS = nil
+            // Compare-and-clear: a host seek can install a NEW threshold
+            // between the read above and this clear; blindly nil-ing
+            // would discard it and flash pre-seek frames.
+            clearSkip(ifStillAt: threshold)
         }
 
         guard let pixelBuffer = convertFrameToPixelBuffer(f) else { return }

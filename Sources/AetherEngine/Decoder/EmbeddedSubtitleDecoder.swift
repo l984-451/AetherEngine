@@ -234,6 +234,15 @@ final class EmbeddedSubtitleDecoder {
         guard endTime > startTime else { return nil }
         guard !isClearEvent || isPGS else { return nil }
 
+        // Bound the dedupe set: a long zero-seek live session with
+        // DVB/PGS subs would otherwise accumulate one key per event
+        // forever. The reset only weakens dedupe (a re-emitted duplicate
+        // renders as an identical overlay at identical times, invisible),
+        // never correctness.
+        if seenKeys.count > 4096 {
+            seenKeys.removeAll(keepingCapacity: true)
+        }
+
         // Dedupe full duplicate non-empty events; keep clear events
         // distinct since each one trims a different previous cue. The key
         // includes the CONTENT, not just times + body count: two
@@ -494,6 +503,9 @@ final class EmbeddedSubtitleDecoder {
         let width = Int(r.w)
         let height = Int(r.h)
         let stride = Int(r.linesize.0)
+        // Corrupt-input hardening: a malformed rect reporting a stride
+        // smaller than its width would read past the plane allocation.
+        guard stride >= width else { return nil }
 
         // Walk once to find the bounding box of non-zero-alpha pixels.
         // Some Blu-ray-to-MKV conversions emit PGS events as full

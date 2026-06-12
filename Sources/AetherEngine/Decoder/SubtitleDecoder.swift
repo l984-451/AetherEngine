@@ -87,9 +87,14 @@ enum SubtitleDecoder {
             // Auth headers (WebDAV-hosted sidecars and friends, #32)
             // ride the same AVIO reader path as the media source.
             let reader = AVIOReader(url: url, extraHeaders: httpHeaders)
+            // Register BEFORE open(): open does a synchronous network
+            // probe (up to ~60 s against a stalled origin), and a
+            // superseded load cancelled during it must be able to abort
+            // via markClosed instead of holding the connection + the
+            // detached task until the probe times out.
+            cancel.register(reader)
             try reader.open()
             avioReader = reader
-            cancel.register(reader)
             guard let ctx = avformat_alloc_context() else {
                 reader.close()
                 throw SubtitleDecoderError.openFailed(code: -1)

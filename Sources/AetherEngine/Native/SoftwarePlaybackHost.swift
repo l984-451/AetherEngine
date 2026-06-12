@@ -506,6 +506,20 @@ final class SoftwarePlaybackHost {
         // view's CALayer hierarchy via presentCurrentLayer) and kick
         // off the demux loop. Idempotent across repeated play() calls;
         // the layer-attach + loop-spin-up only fire on the first one.
+        // Resume the synchronizer after a pause(). Handled BEFORE the
+        // demuxLoopStarted flip below: the guard distinguishes a real
+        // resume (loop already ran, clock armed by its first decoded
+        // sample) from a pause()-before-first-play(), where an eager
+        // setRate would tick the un-anchored clock forward through the
+        // spin-up and drop the first samples as "in the past". With the
+        // flip first, the guard was always true and the cold case
+        // eager-started anyway (mirrors AudioPlaybackHost's ordering).
+        if pausedByHost {
+            pausedByHost = false
+            if demuxLoopStarted {
+                audioOutput?.setRate(lastRate)
+            }
+        }
         if !demuxLoopStarted, let aOut = audioOutput {
             aOut.attachVideoLayer(renderer.displayLayer)
         }
@@ -513,29 +527,10 @@ final class SoftwarePlaybackHost {
             demuxLoopStarted = true
             startDemuxLoop()
         }
-
-        // Don't eager-start the audio synchronizer: the demux loop arms
-        // the master clock via `seekClock` on the first decoded audio
-        // sample, so the clock's time-zero aligns with that sample's
-        // PTS. Eager-starting here with an empty renderer queue means
-        // the clock ticks forward through the demux loop's spin-up and
-        // the first sample lands "in the past" — dropped, with a
-        // visible initial flicker or audio gap.
-        // Resume the synchronizer after a pause(). Guarded so a cold
-        // start stays lazy (the clock is armed off the first decoded
-        // sample, see the comment above); an unguarded setRate here
-        // would tick the clock forward through the spin-up and drop the
-        // first samples as "in the past".
-        if pausedByHost {
-            pausedByHost = false
-            // Only when the loop already ran: a pause() before the first
-            // play() must not eager-start the un-anchored synchronizer
-            // (the lazy first-sample arming would be defeated and early
-            // samples dropped).
-            if demuxLoopStarted {
-                audioOutput?.setRate(lastRate)
-            }
-        }
+        // Don't eager-start the audio synchronizer on a cold start: the
+        // demux loop arms the master clock via `seekClock` on the first
+        // decoded audio sample, so the clock's time-zero aligns with
+        // that sample's PTS.
         rate = lastRate
         isPlaying = true
     }
@@ -1265,6 +1260,12 @@ final class SoftwarePlaybackHost {
         var discontinuityOffsetSec = 0.0
         var loggedSWDiscontinuity = false
 
+        // Clock-arming fallback bookkeeping: a declared audio track whose
+        // decoder never produces buffers (corrupt stream) must not leave
+        // the session unarmed forever. See the video-branch arming below.
+        var audioPacketsSeen = 0
+        var audioBuffersProduced = false
+
         while !stopRequested() {
             if !isPlaying() {
                 condition.lock()
@@ -1424,18 +1425,40 @@ final class SoftwarePlaybackHost {
                     av_packet_free_safe(packet)
                     break
                 }
+                // Re-check the seek generation AFTER the back-pressure
+                // wait: that wait is where the loop spends most of its
+                // time during playback, and a seek landing there flushes
+                // the renderer (freeing the queue and ending the wait)
+                // with this pre-seek packet still in hand. Decoding it
+                // would clear the decoder/renderer skip thresholds ahead
+                // of the real post-seek frames, the exact fast-forward
+                // burst the gen check at the read site exists to prevent.
+                if seekGeneration() != genBeforeRead {
+                    av_packet_unref(packet)
+                    av_packet_free_safe(packet)
+                    continue
+                }
                 videoDecoder.decode(packet: packet)
                 // Video-only source (no audio stream, or the audio
                 // decoder failed open and load() continued video-only):
                 // nothing below would ever arm the master clock, so the
                 // session rendered one frozen frame with currentTime
                 // stuck at 0. Arm off the first video packet instead.
-                if !clockArmed(), audioDecoder == nil, let aOut = audioOutput {
+                // ALSO the fallback for a declared-but-undecodable audio
+                // track (decoder opened but never produces buffers, e.g.
+                // a corrupt stream): without it neither arming branch
+                // ever fires and the session freezes on one frame. Many
+                // audio packets with zero produced buffers means the
+                // decoder is not going to recover.
+                if !clockArmed(), let aOut = audioOutput,
+                   audioDecoder == nil || (audioPacketsSeen >= 50 && !audioBuffersProduced) {
                     aOut.seekClock(to: initialClockTime, rate: initialRate)
                     markClockArmed()
                 }
             } else if streamIdx == audioStreamIndex, let aDec = audioDecoder, let aOut = audioOutput {
+                audioPacketsSeen += 1
                 let buffers = aDec.decode(packet: packet)
+                if !buffers.isEmpty { audioBuffersProduced = true }
                 for buf in buffers {
                     aOut.enqueue(sampleBuffer: buf)
                 }

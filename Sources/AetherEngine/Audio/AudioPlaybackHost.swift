@@ -408,12 +408,34 @@ final class AudioPlaybackHost {
                 // to `maxBufferAhead` seconds queued. Wait for the clock to
                 // play through everything enqueued before signaling the end,
                 // otherwise the host advances to the next track seconds early.
+                var seekedAway = false
                 while !stopRequested()
                     && (audioOutput?.currentTimeSeconds ?? lastEnqueuedEnd) < lastEnqueuedEnd - 0.25 {
+                    // A seek during the drain re-positions the demuxer, so
+                    // EOF no longer holds. Without this check the drain
+                    // played silence from the seek target up to the stale
+                    // high-water mark and then fired onEnd() anyway, which
+                    // skipped the track instead of playing the seek.
+                    if seekGeneration() != seenSeekGeneration {
+                        seekedAway = true
+                        break
+                    }
                     Thread.sleep(forTimeInterval: 0.1)
                 }
+                if seekedAway { continue }
+                if seekGeneration() != seenSeekGeneration { continue }
                 onEnd()
                 break
+            }
+
+            // A seek landed while this packet was in flight: it predates
+            // the seek's renderer flush, and enqueueing it would park a
+            // stale-position buffer in the fresh queue. Discard and
+            // re-read at the new position.
+            if seekGeneration() != seenSeekGeneration {
+                av_packet_unref(packet)
+                av_packet_free_safe(packet)
+                continue
             }
 
             if packet.pointee.stream_index == audioStreamIndex,

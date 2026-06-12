@@ -27,7 +27,17 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
 
     // MARK: - Public surface (mirrors SoftwareVideoDecoder)
 
-    var onFrame: DecodedFrameHandler?
+    /// Guarded by `skipLock` (a leaf lock, see `skipUntilPTS`): the VT
+    /// callback queue reads this in `handleDecodedFrame` while `close()`
+    /// nils it from another thread; an unsynchronized closure swap
+    /// against that read is a data race (multi-word write + release of
+    /// the old value). The main `lock` is NOT usable here: close() holds
+    /// it across the VT wait that drains this very callback.
+    var onFrame: DecodedFrameHandler? {
+        get { skipLock.lock(); defer { skipLock.unlock() }; return _onFrame }
+        set { skipLock.lock(); _onFrame = newValue; skipLock.unlock() }
+    }
+    private var _onFrame: DecodedFrameHandler?
     /// HDR10+ side data isn't extracted in the POC; the flag is here
     /// so the host's wiring stays identical to the software path.
     /// A follow-up pass will mirror `SoftwareVideoDecoder.extractHDR10PlusBytes`
@@ -52,6 +62,15 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     }
     private var _skipUntilPTS: CMTime?
     private let skipLock = NSLock()
+
+    /// Clear the skip threshold only if it is still the one we acted on.
+    private func clearSkip(ifStillAt threshold: CMTime) {
+        skipLock.lock()
+        if let current = _skipUntilPTS, CMTimeCompare(current, threshold) == 0 {
+            _skipUntilPTS = nil
+        }
+        skipLock.unlock()
+    }
 
     // MARK: - Internals
 
@@ -405,7 +424,10 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             if CMTimeCompare(pts, threshold) < 0 {
                 return
             }
-            skipUntilPTS = nil
+            // Compare-and-clear: a host seek can install a NEW threshold
+            // between the read above and this clear; blindly nil-ing
+            // would discard it and flash pre-seek frames.
+            clearSkip(ifStillAt: threshold)
         }
 
         // Attach color metadata so AVSampleBufferDisplayLayer renders

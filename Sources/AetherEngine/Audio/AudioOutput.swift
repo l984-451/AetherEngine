@@ -77,18 +77,16 @@ final class AudioOutput: @unchecked Sendable {
         #endif
     }
 
-    /// The current playback rate, stored so seekClock can restore it.
-    private var _rate: Float = 1.0
-
     /// Playback volume (0.0 = mute, 1.0 = full).
     var volume: Float {
         get { renderer.volume }
         set { renderer.volume = newValue }
     }
 
-    /// Set playback speed (0.5–2.0). Takes effect immediately.
+    /// Set playback speed (0.5–2.0). Takes effect immediately. The hosts
+    /// own the rate state (lastRate/pausedByHost); this object is
+    /// stateless about it.
     func setRate(_ rate: Float) {
-        _rate = rate
         synchronizer.setRate(rate, time: synchronizer.currentTime())
     }
 
@@ -167,7 +165,6 @@ final class AudioOutput: @unchecked Sendable {
     func seekClock(to time: CMTime, rate: Float) {
         lock.lock()
         defer { lock.unlock() }
-        _rate = rate
         synchronizer.setRate(rate, time: time)
     }
 }

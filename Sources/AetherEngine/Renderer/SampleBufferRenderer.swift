@@ -264,10 +264,6 @@ final class SampleBufferRenderer: @unchecked Sendable {
         }
         target.enqueue(sampleBuffer)
 
-        // Mark first frame after the most recent reset. Lock-protected
-        // because flushFrame runs on the decoder callback thread while
-        // AetherEngine reads / resets this from its actor.
-
         enqueueCount += 1
         // Sparse progress trail so a stall after enqueue #30 (the
         // existing log point) is distinguishable from "we just stop
