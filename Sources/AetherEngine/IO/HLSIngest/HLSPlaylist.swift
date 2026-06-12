@@ -4,6 +4,21 @@ import Foundation
 struct HLSVariant: Equatable {
     let bandwidth: Int
     let uri: String
+    /// GROUP-ID from the STREAM-INF's AUDIO attribute, nil when the
+    /// variant declares no alternate-audio group.
+    let audioGroupID: String?
+}
+
+/// Parsed master playlist: the variants plus the audio GROUP-IDs whose
+/// renditions live OUT-OF-BAND (#EXT-X-MEDIA:TYPE=AUDIO with a URI
+/// attribute). A variant referencing such a group is video-only; its
+/// audio would have to be ingested from a second playlist, which the
+/// TS ingest does not support (see HLSIngestError.demuxedAudioNotSupported).
+/// EXT-X-MEDIA entries WITHOUT a URI mean the audio is muxed into the
+/// variant stream itself and play fine.
+struct HLSMasterPlaylist: Equatable {
+    let variants: [HLSVariant]
+    let demuxedAudioGroupIDs: Set<String>
 }
 
 /// One media segment of a media playlist.
@@ -26,7 +41,7 @@ struct HLSMediaPlaylist: Equatable {
 }
 
 enum HLSPlaylist: Equatable {
-    case master([HLSVariant])
+    case master(HLSMasterPlaylist)
     case media(HLSMediaPlaylist)
 }
 
@@ -55,21 +70,34 @@ enum HLSPlaylistParser {
 
     // MARK: - Private
 
-    private static func parseMaster(_ lines: [String]) throws -> [HLSVariant] {
+    private static func parseMaster(_ lines: [String]) throws -> HLSMasterPlaylist {
         var variants: [HLSVariant] = []
+        var demuxedAudioGroups: Set<String> = []
         var pendingBandwidth: Int?
+        var pendingAudioGroup: String?
         for line in lines {
             if line.hasPrefix("#EXT-X-STREAM-INF:") {
                 pendingBandwidth = attribute("BANDWIDTH", in: line).flatMap(Int.init) ?? 0
+                pendingAudioGroup = attribute("AUDIO", in: line)
+            } else if line.hasPrefix("#EXT-X-MEDIA:") {
+                // TYPE=AUDIO renditions WITH a URI carry their audio in a
+                // separate playlist (demuxed); without a URI the audio is
+                // in the variant stream itself.
+                if attribute("TYPE", in: line) == "AUDIO",
+                   attribute("URI", in: line) != nil,
+                   let group = attribute("GROUP-ID", in: line) {
+                    demuxedAudioGroups.insert(group)
+                }
             } else if !line.hasPrefix("#"), let bw = pendingBandwidth {
-                variants.append(HLSVariant(bandwidth: bw, uri: line))
+                variants.append(HLSVariant(bandwidth: bw, uri: line, audioGroupID: pendingAudioGroup))
                 pendingBandwidth = nil
+                pendingAudioGroup = nil
             }
         }
         guard !variants.isEmpty else {
             throw HLSIngestError.playlistInvalid(reason: "master playlist without variants")
         }
-        return variants
+        return HLSMasterPlaylist(variants: variants, demuxedAudioGroupIDs: demuxedAudioGroups)
     }
 
     private static func parseMedia(_ lines: [String]) throws -> HLSMediaPlaylist {

@@ -232,10 +232,21 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
             // Direct media playlist: hand the parsed result back so the
             // ingest loop's first iteration does not refetch it.
             return (finalURL, media)
-        case .master(let variants):
-            guard let best = variants.max(by: { $0.bandwidth < $1.bandwidth }),
+        case .master(let master):
+            guard let best = master.variants.max(by: { $0.bandwidth < $1.bandwidth }),
                   let url = HLSPlaylistParser.resolve(uri: best.uri, against: finalURL) else {
                 throw HLSIngestError.playlistInvalid(reason: "no usable variant")
+            }
+            // A variant whose audio lives in a separate rendition playlist
+            // would ingest as video-only TS and play SILENT. Fail fast at
+            // join time instead; the host's existing fallback then takes
+            // the Jellyfin-mediated route, which muxes the audio back in.
+            if let group = best.audioGroupID, master.demuxedAudioGroupIDs.contains(group) {
+                EngineLog.emit(
+                    "[HLSIngest] variant audio is a separate rendition (group \"\(group)\"); demuxed-audio HLS unsupported, failing fast for host fallback",
+                    category: .engine
+                )
+                throw HLSIngestError.demuxedAudioNotSupported
             }
             EngineLog.emit("[HLSIngest] master playlist: picked variant bandwidth=\(best.bandwidth)", category: .engine)
             return (url, nil)

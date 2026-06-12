@@ -13,9 +13,10 @@ final class HLSPlaylistTests: XCTestCase {
         #EXT-X-STREAM-INF:BANDWIDTH=2560000,RESOLUTION=1280x720
         mid/index.m3u8
         """
-        guard case .master(let variants) = try HLSPlaylistParser.parse(text) else {
+        guard case .master(let master) = try HLSPlaylistParser.parse(text) else {
             return XCTFail("expected master playlist")
         }
+        let variants = master.variants
         XCTAssertEqual(variants.count, 3)
         XCTAssertEqual(variants.max(by: { $0.bandwidth < $1.bandwidth })?.uri, "high/index.m3u8")
     }
@@ -31,9 +32,10 @@ final class HLSPlaylistTests: XCTestCase {
         #EXT-X-STREAM-INF:AVERAGE-BANDWIDTH=4500000,BANDWIDTH=6000000,RESOLUTION=1920x1080
         high/index.m3u8
         """
-        guard case .master(let variants) = try HLSPlaylistParser.parse(text) else {
+        guard case .master(let master) = try HLSPlaylistParser.parse(text) else {
             return XCTFail("expected master playlist")
         }
+        let variants = master.variants
         XCTAssertEqual(variants[0].bandwidth, 1_280_000)
         XCTAssertEqual(variants[1].bandwidth, 6_000_000)
         XCTAssertEqual(variants.max(by: { $0.bandwidth < $1.bandwidth })?.uri, "high/index.m3u8")
@@ -47,10 +49,48 @@ final class HLSPlaylistTests: XCTestCase {
         #EXT-X-STREAM-INF:CODECS="avc1.64001f,BANDWIDTH=99",BANDWIDTH=100,RESOLUTION=640x360
         low/index.m3u8
         """
-        guard case .master(let variants) = try HLSPlaylistParser.parse(text) else {
+        guard case .master(let master) = try HLSPlaylistParser.parse(text) else {
             return XCTFail("expected master playlist")
         }
+        let variants = master.variants
         XCTAssertEqual(variants[0].bandwidth, 100)
+    }
+
+    func testDetectsDemuxedAudioGroups() throws {
+        // ARD-style master (Das Erste HD): video-only variants whose
+        // audio lives in a separate EXT-X-MEDIA rendition playlist.
+        // Ingesting such a variant plays silent video; the parser must
+        // surface the group so the reader can fail fast for fallback.
+        let text = """
+        #EXTM3U
+        #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aac",NAME="Deutsch",DEFAULT=YES,URI="audio/index.m3u8"
+        #EXT-X-STREAM-INF:BANDWIDTH=8500800,RESOLUTION=1920x1080,AUDIO="aac"
+        video/high.m3u8
+        #EXT-X-STREAM-INF:BANDWIDTH=2500000,RESOLUTION=1280x720,AUDIO="aac"
+        video/mid.m3u8
+        """
+        guard case .master(let master) = try HLSPlaylistParser.parse(text) else {
+            return XCTFail("expected master playlist")
+        }
+        XCTAssertEqual(master.demuxedAudioGroupIDs, ["aac"])
+        XCTAssertEqual(master.variants[0].audioGroupID, "aac")
+    }
+
+    func testInBandAudioRenditionIsNotDemuxed() throws {
+        // EXT-X-MEDIA without URI means the audio is muxed into the
+        // variant stream itself; that plays fine and must not trip the
+        // demuxed-audio gate.
+        let text = """
+        #EXTM3U
+        #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aac",NAME="Deutsch",DEFAULT=YES
+        #EXT-X-STREAM-INF:BANDWIDTH=3493377,AUDIO="aac"
+        chunks.m3u8
+        """
+        guard case .master(let master) = try HLSPlaylistParser.parse(text) else {
+            return XCTFail("expected master playlist")
+        }
+        XCTAssertTrue(master.demuxedAudioGroupIDs.isEmpty)
+        XCTAssertEqual(master.variants[0].audioGroupID, "aac")
     }
 
     func testParsesMediaPlaylist() throws {

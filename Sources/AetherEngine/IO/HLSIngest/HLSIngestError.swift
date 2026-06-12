@@ -18,6 +18,12 @@ public enum HLSIngestError: Error, Equatable, CustomStringConvertible {
     /// The playlist refreshed but produced no new segment for the stall
     /// budget (provider died or froze).
     case ingestStalled
+    /// The selected variant references an alternate-audio group whose
+    /// renditions live in a separate playlist (EXT-X-MEDIA:TYPE=AUDIO
+    /// with URI). Ingesting it would need a second loop + remux; until
+    /// that exists, failing fast at join time beats silently playing
+    /// video without sound (device repro: Das Erste HD via ARD's CDN).
+    case demuxedAudioNotSupported
 
     public var description: String {
         switch self {
@@ -26,6 +32,7 @@ public enum HLSIngestError: Error, Equatable, CustomStringConvertible {
         case .encryptedNotSupported: "encryptedNotSupported"
         case .unsupportedSegmentFormat: "unsupportedSegmentFormat"
         case .ingestStalled: "ingestStalled"
+        case .demuxedAudioNotSupported: "demuxedAudioNotSupported"
         }
     }
 }
