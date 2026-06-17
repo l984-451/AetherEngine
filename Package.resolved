@@ -1,6 +1,15 @@
 {
-  "originHash" : "f96e594c95830907543a638304c29774257df9c95d7310e94556c3dbe86c6cc8",
+  "originHash" : "90bfdfdbc43e335ac25a12637e1590f189caac35dbb7ddf5681ad5040688689c",
   "pins" : [
+    {
+      "identity" : "amsmb2",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/amosavian/AMSMB2",
+      "state" : {
+        "revision" : "1726aaaf7adf63d7d1d2a0c5d1b0e635028215c0",
+        "version" : "4.0.3"
+      }
+    },
     {
       "identity" : "ffmpegbuild",
       "kind" : "remoteSourceControl",

@@ -14,6 +14,10 @@ let package = Package(
             name: "AetherEngine",
             targets: ["AetherEngine"]
         ),
+        .library(
+            name: "AetherEngineSMB",
+            targets: ["AetherEngineSMB"]
+        ),
         // aetherctl is intentionally not exposed as a product. The target
         // uses Foundation.Process, which is unavailable on tvOS/iOS, so
         // exposing it would force SPM consumers to compile it on those
@@ -26,6 +30,7 @@ let package = Package(
         // Resolved over Git rather than a local path so consumers (and
         // Xcode Cloud) can build without a sibling FFmpegBuild checkout.
         .package(url: "https://github.com/superuser404notfound/FFmpegBuild", from: "1.0.0"),
+        .package(url: "https://github.com/amosavian/AMSMB2", from: "4.0.3"),
     ],
     targets: [
         .target(
@@ -42,15 +47,28 @@ let package = Package(
                 .linkedFramework("AudioToolbox"),
             ]
         ),
+        .target(
+            name: "AetherEngineSMB",
+            dependencies: [
+                "AetherEngine",
+                .product(name: "AMSMB2", package: "AMSMB2"),
+            ],
+            path: "Sources/AetherEngineSMB"
+        ),
         .executableTarget(
             name: "aetherctl",
-            dependencies: ["AetherEngine"],
+            dependencies: ["AetherEngine", "AetherEngineSMB"],
             path: "Sources/aetherctl"
         ),
         .testTarget(
             name: "AetherEngineTests",
             dependencies: ["AetherEngine"],
             path: "Tests/AetherEngineTests"
+        ),
+        .testTarget(
+            name: "AetherEngineSMBTests",
+            dependencies: ["AetherEngineSMB"],
+            path: "Tests/AetherEngineSMBTests"
         ),
     ]
 )
