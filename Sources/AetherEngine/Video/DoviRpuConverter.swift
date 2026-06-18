@@ -122,6 +122,10 @@ public enum DoviRpuConverter {
         for nal in outputNALs {
             total += lengthPrefixSize + nal.count
         }
+        // Degenerate: all NALs were EL and none survived (no base-layer
+        // video, no RPU). Leave the packet untouched rather than producing
+        // a zero-length video packet that would confuse downstream decoders.
+        guard total > 0 else { return true }
 
         let pad = Int(AV_INPUT_BUFFER_PADDING_SIZE)
         guard let newRef = av_buffer_alloc(total + pad) else {

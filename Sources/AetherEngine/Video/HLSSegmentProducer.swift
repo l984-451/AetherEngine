@@ -559,6 +559,13 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// One-shot latch: suppress repeated P7->8.1 conversion-failure
     /// log lines; only the first failure per session is emitted.
     private var loggedP7ConversionFailure = false
+    /// Mirrors `videoConfig.convertP7ToProfile81` but is latched to
+    /// `false` at an SSAI program switch (ad creatives are H.264; DV
+    /// NAL types 62/63 cannot appear in valid H.264, so the converter
+    /// would be a no-op, but the gating must stay consistent with the
+    /// muxer's `isReinit ? false : videoConfig.convertP7ToProfile81`
+    /// so correctness never rests on that coincidence).
+    private var convertP7Active: Bool = false
     /// One-shot log latches for the monotonic-dts repair. Bumps and
     /// drops both fire once per producer instance so the log shows
     /// the first occurrence without going noisy.
@@ -970,6 +977,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
         }
         self.videoStreamIndex = videoStreamIndex
         self.videoConfig = video
+        self.convertP7Active = video.convertP7ToProfile81
         self.audioConfig = audio
         self.cache = cache
         self.baseIndex = baseIndex
@@ -1853,6 +1861,10 @@ final class HLSSegmentProducer: @unchecked Sendable {
                     lastSeenVideoExtradata = nil
                     pendingVideoProgramSwitch = true
                     pendingAdVideoConfig = adConfig
+                    // Ad creatives are H.264; disable P7 conversion for
+                    // the ad stream (mirrors muxer's isReinit ? false :
+                    // videoConfig.convertP7ToProfile81 gating).
+                    convertP7Active = false
                     // A program switch is active boundary work, not a wedge:
                     // give the next cut a fresh watchdog window so the no-cut
                     // stall doesn't trip mid-ad-pod and force a needless
@@ -2805,12 +2817,15 @@ final class HLSSegmentProducer: @unchecked Sendable {
                     // once per session; the unconverted packet is muxed
                     // unchanged (HDR10 BL still plays; RPU carries wrong
                     // profile but the video is not lost).
-                    if videoConfig.convertP7ToProfile81 {
+                    // convertP7Active is latched false on an SSAI program
+                    // switch (ad creatives are H.264, not HEVC P7), keeping
+                    // this gating consistent with the muxer config gating.
+                    if convertP7Active {
                         if !DoviRpuConverter.convertPacketToProfile81(packet) {
                             if !loggedP7ConversionFailure {
                                 loggedP7ConversionFailure = true
                                 EngineLog.emit(
-                                    "[HLSVideoEngine] DV P7->8.1 conversion failed for a packet; muxing unconverted",
+                                    "[HLSSegmentProducer] DV P7->8.1 conversion failed for a packet; muxing unconverted",
                                     category: .session
                                 )
                             }
