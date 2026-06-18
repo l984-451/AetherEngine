@@ -38,7 +38,9 @@ public enum DoviRpuConverter {
     /// On any libdovi error the packet is left byte-for-byte untouched
     /// and every libdovi allocation made on the failing path is freed.
     public static func convertPacketToProfile81(_ packet: UnsafeMutablePointer<AVPacket>) -> Bool {
-        guard let data = packet.pointee.data, packet.pointee.size > 4 else { return false }
+        // A null/empty payload has no RPU to convert: not a libdovi failure.
+        guard let data = packet.pointee.data, packet.pointee.size > 0 else { return true }
+        guard packet.pointee.size > 4 else { return true }
         let size = Int(packet.pointee.size)
 
         // Output NAL units (each WITHOUT its length prefix; we re-prefix
@@ -83,9 +85,14 @@ public enum DoviRpuConverter {
                     return false
                 }
                 let outLen = out.pointee.len
-                if let outData = out.pointee.data, outLen > 0 {
-                    outputNALs.append([UInt8](UnsafeBufferPointer(start: outData, count: outLen)))
+                guard let outData = out.pointee.data, outLen > 0 else {
+                    // Zero-length or nil write is a libdovi failure, not an
+                    // empty packet. Free and signal failure so the caller falls back.
+                    dovi_data_free(out)
+                    dovi_rpu_free(rpu)
+                    return false
                 }
+                outputNALs.append([UInt8](UnsafeBufferPointer(start: outData, count: outLen)))
                 dovi_data_free(out)
                 dovi_rpu_free(rpu)
                 converted = true
