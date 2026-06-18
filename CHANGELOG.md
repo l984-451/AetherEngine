@@ -10,6 +10,75 @@ the public-API contract.
 
 ## [Unreleased]
 
+## [3.10.0] — 2026-06-17
+
+### Added
+
+- **`preserveASSMarkup` now covers external ASS sidecars.** `selectSidecarSubtitle(url:)` honours the session's `LoadOptions.preserveASSMarkup` for `.ass` / `.ssa` files exactly like embedded tracks: cues carry the raw libavcodec event line (override tags and style references intact) instead of stripped plain text, and the script header (`[Script Info]` + `[V4+ Styles]`) extracted from the file's subtitle-stream extradata is surfaced on the new published `engine.sidecarASSHeader`. Hosts pair the two through `ASSScriptBuilder` to drive a whole-script renderer (swift-ass-renderer's `loadTrack(content:)`) for external subtitles, not just embedded ones. SRT / VTT sidecars and the text-only secondary channel are unaffected (no ASS payload, header stays nil). `SubtitleRectText.rawASSLine(for:)` is now the shared raw-line extractor behind both the inline and sidecar decoders (AetherEngine#48).
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/3.10.0))
+
+## [3.9.0] — 2026-06-17
+
+### Added
+
+- **Independent secondary subtitle track (dual subtitles).** A second, fully independent subtitle channel now runs alongside the primary one, so a host can display two subtitle lines at once (for example the original language plus a translation, for bilingual playback and language learning). The public API mirrors the primary surface: `selectSecondarySubtitleTrack(index:)`, `selectSecondarySidecarSubtitle(url:httpHeaders:)`, `clearSecondarySubtitle()`, plus the published `secondarySubtitleCues`, `isSecondarySubtitleActive`, and `isLoadingSecondarySubtitles`. Internally a `SubtitleChannel` enum threads through the reader, apply, and cancel paths (the primary path stays behavior-identical), each channel owning its own side demuxer, seek re-arm, teardown, and audio-track-reload resume. The secondary channel is text-only (bitmap codecs are rejected) and always decodes to plain text: it never preserves ASS markup, so it stays clean even when the primary is a styled ASS track. `aetherctl dualsubs <file> --primary <i> --secondary <j>` validates the two channels emitting cues independently (AetherEngine#47).
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/3.9.0))
+
+## [3.8.0] — 2026-06-17
+
+### Added
+
+- **SMB2/3 playback via the optional `AetherEngineSMB` product.** Play media off an SMB share through the normal decode path, no server-side mount: `SMBConnection` (backed by AMSMB2 / libsmb2, LGPL-2.1, the same license tier as the bundled FFmpeg) is a read-only `ByteRangeSource`, and `SMBIOReader` adapts it to the engine's existing `IOReader`, bridging each synchronous demux-thread read to AMSMB2's async API. Seekable, so audio-track switching, background reload, embedded subtitles, and scrub previews all work. The SMB dependency is scoped to the new product, so the core engine and its tvOS hosts never link libsmb2. Read-only, NTLMv2 / guest auth; on tvOS the host supplies the local-network entitlement. `aetherctl smbtest <smb-url>` validates a share from macOS (AetherEngine#46).
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/3.8.0))
+
+## [3.7.0] — 2026-06-17
+
+### Fixed
+
+- **Seek on the native loopback-HLS path no longer bounces back through the pre-seek position.** A seek wrote the target clock optimistically and flipped state back to `.playing` without waiting for AVPlayer's seek to physically land, so the 100 ms periodic time observer kept publishing the stale pre-seek clock until the (seconds-late) loopback seek completed — the reported time read the target, snapped back to the old position, then re-settled. `seek(to:)` now awaits the real AVPlayer completion, and the native host suppresses the periodic observer's stale reads while a seek is in flight, so the clock holds the target across the landing (AetherEngine#37).
+- **Hang on MKV sources with a missing or out-of-bounds Cues index.** When a file's Cues seek index is absent or points past EOF (truncated / mis-muxed remux), libavformat's matroska seek degrades the VOD cue-prewarm into a multi-GB linear forward scan — tens of minutes (a de-facto hang) on a large remote source, even though every byte range of the stream serves fine. The prewarm seek is now bounded by a deadline (`HLSVideoEngine.cuePrewarmTimeout`); on timeout it falls back to the existing keyframe / uniform-stride segment plan so playback starts promptly. Healthy files (Cues resolve in well under a second) are unaffected.
+- **Playback above 2x no longer goes abnormal.** AVPlayer's HLS fast-forward is undefined above 2x for video (an audio-only session plays cleanly to 3x); driving a higher rate sent both audio and video abnormal. `setRate(_:)` now clamps the requested rate to the path's ceiling, and the new `AetherEngine.maxSupportedRate` exposes it (2.0 for video, 3.0 for audio-only) so a host can size its speed picker correctly (AetherEngine#39).
+
+### Added
+
+- **`isSeeking` / `seekTarget` published seek signal.** `AetherEngine.isSeeking` is true from seek entry until the seek physically lands (not the optimistic `.playing` flip), uniform across programmatic `seek(to:)` and native AVKit transport-bar scrubs (which drive a producer restart out of the served window). `seekTarget` carries the in-flight destination on the source-PTS axis. A host coordinating playback across devices can gate on these to tell a deliberate seek from a rebuffer or underflow skip without inferring it from `currentTime` jumps (AetherEngine#38).
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/3.7.0))
+
+## [3.6.1] — 2026-06-16
+
+### Fixed
+
+- **Live no-cut stall classified by read rate, not packet count.** A slow live source that trickles packets (a Wowza SMIL `bounce` re-buffering at an SSAI ad splice) could accumulate enough packets over a long stall to be misread as a cutter wedge, tripping the tight wedge timeout and forcing a premature host retune to the server transcode route mid-program. The watchdog now classifies wedge vs. source starvation by the packet read RATE over the stall window: a genuine wedge streams at full rate but cannot cut, a trickle stays well under the threshold and takes the longer starvation backstop, giving the source time to resume.
+
+### Changed
+
+- The no-cut stall trace now reports a per-window breakdown (video / keyframe / audio / foreign-stream packet counts, last foreign stream index, and the video PTS advance across the stall) so an undetected live boundary is diagnosable from one log line. Non-audio/video streams are also named by codec in the demuxer open log.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/3.6.1))
+
+## [3.6.0] — 2026-06-16
+
+### Added
+
+- **SSAI ad-pod direct play for FAST channels.** Server-side-ad-inserted live streams (Pluto and similar) now play their ad pods through the direct path instead of falling back to a server transcode. The producer detects a program switch when an ad creative arrives on a different video PID, parses the ad's SPS/PPS by hand to build a fresh codec config (`H264SPS`), rotates the fMP4 muxer, and emits a versioned `#EXT-X-MAP` per discontinuity so AVPlayer resyncs cleanly across the init and resolution change. A no-cut stall watchdog stays underneath as a safety net, escalating a genuinely wedged pod to a host retune.
+- **AES-128 clear-key direct play.** Live HLS streams encrypted with full-segment `METHOD=AES-128` (clear-key, the standard FAST-channel scheme) now direct-play: the playlist's `EXT-X-KEY` is parsed, the key fetched and memoised, and each segment decrypted (AES-128-CBC / PKCS7) before demux. SAMPLE-AES and keyless variants still fall back. This is standard HLS, not FairPlay / Widevine.
+
+### Fixed
+
+- **SSAI ad-pod audio sync.** Audio across an ad pod is re-anchored to the video timeline at every creative boundary so it cannot accumulate drift, and an output-timestamp sanitizer at the muxer keeps the stream monotonic across the splice. The final case: amux ad creatives that mux audio on a different source clock than video (audio near 2^33, video from 0) had their audio launched far into the future by copying the video shift verbatim; the audio shift is now derived from each stream's own boundary timestamp against the shared seam, so it stays sample-exact for any source base.
+- **Transient slow live segment no longer tears down the session.** A single slow CDN segment used to trip the no-cut watchdog and escalate to a host retune as if the pipeline had wedged. The watchdog now distinguishes a cutter wedge (reading fast, cannot cut) from source starvation (barely reading) and gives a slow segment a backstop that sits past the ingest reader's own retry budget, so it recovers and keeps playing.
+
+### Changed
+
+- High-frequency live trace (per-request local-server lines, per-segment captures) now logs at OSLog `.debug` level and is not mirrored to the host log handler, keeping the default Console stream and in-app log buffers focused on decision and error lines. Retrieve the trace on demand with `log stream --level debug`.
+- A successful SDR rate-only display switch (Match Frame Rate engaging on a 50/60 fps stream) no longer logs a misleading "panel stayed SDR despite HDR criteria" warning; the warning is now reserved for genuine HDR handshake failures.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/3.6.0))
+
 ## [3.5.0] — 2026-06-15
 
 ### Added

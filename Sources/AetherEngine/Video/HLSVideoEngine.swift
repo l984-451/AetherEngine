@@ -245,6 +245,16 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// lookup uses the right source-time conversion.
     var onPlaylistShiftChanged: (@Sendable (Double) -> Void)?
 
+    /// Fires when a native AVKit transport-bar scrub (or any AVPlayer seek
+    /// that lands out of the currently-served LRU window) drives a producer
+    /// restart, so AetherEngine can publish an accurate in-flight seek
+    /// signal for scrubs that bypass `engine.seek()` (AetherEngine#38).
+    /// `(true, playlistTime)` at the start of a coalesced restart run,
+    /// `(false, nil)` once the run drains. `playlistTime` is the requested
+    /// segment's start on the AVPlayer/playlist axis; the host folds it
+    /// with `playlistShiftSeconds` onto its source-PTS `seekTarget`.
+    var onSeekStateChanged: (@Sendable (Bool, Double?) -> Void)?
+
     /// Engine-owned deep copy of an AVCodecParameters. The saved
     /// video/audio configs previously held raw pointers INTO the
     /// session demuxer's AVStreams; a live reopen closes that demuxer
@@ -351,6 +361,14 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// inside the spec's 2-6 s acceptable range, and the slightly
     /// larger playlist footprint is negligible.
     static let targetSegmentDuration: Double = 4.0
+
+    /// Upper bound on the VOD cue-prewarm seek. A healthy MKV resolves its
+    /// Cues index in well under a second (one or two byte-range reads); a
+    /// source with a missing/out-of-bounds index instead triggers a multi-GB
+    /// linear scan. Past this many seconds we abort the seek and fall back to
+    /// the uniform-stride segment plan so playback starts promptly. Generous
+    /// enough not to false-trip on a slow link doing legitimate tail reads.
+    static let cuePrewarmTimeout: TimeInterval = 10.0
 
     // MARK: - Measurement spike: sliding-window prototype (superseded)
     //
@@ -676,10 +694,20 @@ public final class HLSVideoEngine: @unchecked Sendable {
             //    tail, which fans out into one or two HTTP byte-range
             //    reads. Mid-duration target so the prewarm doesn't strand
             //    the demuxer cursor far from where playback starts.
+            //
+            //    Bounded: when the Cues index is missing or points past EOF
+            //    (truncated / mis-muxed remux) the matroska seek degrades into
+            //    a multi-GB linear scan (tens of minutes on a remote source).
+            //    The deadline aborts it so we fall through to the uniform-stride
+            //    plan below and start playback immediately instead of hanging.
             let prewarmStart = DispatchTime.now()
-            dem.seek(to: durationSeconds * 0.5)
+            let prewarmOK = dem.seekBounded(to: durationSeconds * 0.5, timeout: Self.cuePrewarmTimeout)
             let prewarmMs = Double(DispatchTime.now().uptimeNanoseconds - prewarmStart.uptimeNanoseconds) / 1_000_000
-            EngineLog.emit("[HLSVideoEngine] cue prewarm: seek to \(String(format: "%.1f", durationSeconds * 0.5))s took \(String(format: "%.1f", prewarmMs))ms")
+            if prewarmOK {
+                EngineLog.emit("[HLSVideoEngine] cue prewarm: seek to \(String(format: "%.1f", durationSeconds * 0.5))s took \(String(format: "%.1f", prewarmMs))ms")
+            } else {
+                EngineLog.emit("[HLSVideoEngine] cue prewarm: capped at \(String(format: "%.1f", prewarmMs))ms (no usable Cues index — index points past EOF or is absent); building plan from whatever keyframes were scanned")
+            }
 
             // 3. Build the segment plan from real keyframes in the index,
             //    using the SAME cut algorithm libavformat's hls muxer uses
@@ -732,6 +760,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         let primaryCodecs = route.primaryCodecs
         let supplementalCodecs = route.supplementalCodecs
         let stripDolbyVisionMetadata = route.stripDolbyVisionMetadata
+        let convertP7ToProfile81 = route.convertP7ToProfile81
         let dvVariant = route.dvVariant
 
         let resolution = (Int(codecpar.pointee.width), Int(codecpar.pointee.height))
@@ -848,6 +877,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             timeBase: videoTimeBase,
             codecTagOverride: codecTagOverride,
             stripDolbyVisionMetadata: stripDolbyVisionMetadata,
+            convertP7ToProfile81: convertP7ToProfile81,
             colorOverride: p5ColorOverride,
             extradataOverride: hevcExtradataOverride
         )
@@ -1921,6 +1951,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
     func requestRestart(at idx: Int) {
         restartLock.lock()
         let shouldRun = restartCoalescer.begin(idx)
+        // Map the requested segment to its playlist-axis start time while we
+        // hold the lock that guards segmentPlan (issue #38 seek signal).
+        let seekTime = segmentStartSecondsLocked(idx)
         restartLock.unlock()
         guard shouldRun else {
             EngineLog.emit(
@@ -1929,19 +1962,38 @@ public final class HLSVideoEngine: @unchecked Sendable {
             )
             return
         }
+        // A native AVKit scrub (or any AVPlayer seek that landed out of the
+        // served LRU window) is now in flight; publish it until the coalesced
+        // restart run drains (#38). Purely additive to the #35 coalescer.
+        onSeekStateChanged?(true, seekTime)
         var target = idx
         while true {
             performRestart(at: target)
             restartLock.lock()
             let nextTarget = restartCoalescer.next(justRan: target)
+            let nextSeekTime = nextTarget.map { segmentStartSecondsLocked($0) } ?? nil
             restartLock.unlock()
             guard let nextTarget else { break }
             EngineLog.emit(
                 "[HLSVideoEngine] coalesced restart advancing to settled target idx=\(nextTarget)",
                 category: .session
             )
+            // Burst scrub coalesced to a new settled target: keep the signal
+            // in flight, update the published target.
+            onSeekStateChanged?(true, nextSeekTime)
             target = nextTarget
         }
+        // The restart run settled at the final target and the producer is
+        // rebuilt and serving; clear the in-flight seek signal.
+        onSeekStateChanged?(false, nil)
+    }
+
+    /// `segmentPlan[idx].startSeconds` on the AVPlayer/playlist axis, or nil
+    /// if out of range. Caller must hold `restartLock` (segmentPlan is
+    /// guarded by it).
+    private func segmentStartSecondsLocked(_ idx: Int) -> Double? {
+        guard idx >= 0, idx < segmentPlan.count else { return nil }
+        return segmentPlan[idx].startSeconds
     }
 
     // Renamed from restartProducer(at:). Now driven exclusively through

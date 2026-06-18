@@ -66,6 +66,68 @@ public final class AetherEngine: ObservableObject {
     /// Always false on the initial load spin-up (that is `state == .loading`).
     @Published public internal(set) var isBuffering: Bool = false
 
+    /// True from the moment a seek begins until it **physically lands**,
+    /// uniform across programmatic `seek(to:)` and native AVKit
+    /// transport-bar scrubs. Unlike `state == .seeking` (which the engine
+    /// optimistically flips back to `.playing` so a host UI does not stick
+    /// on the spinner), this spans the real landing on the loopback-HLS
+    /// native path, where the seek resolves seconds after the call. A host
+    /// coordinating playback across devices can gate on this to tell a
+    /// deliberate seek from a rebuffer or an underflow skip without
+    /// inferring it from `currentTime` jumps (AetherEngine#38). Paired with
+    /// `seekTarget`.
+    @Published public internal(set) var isSeeking: Bool = false
+
+    /// The source-PTS destination of the in-flight seek (the same axis as
+    /// `currentTime`), or `nil` when no seek is in flight. Set at seek
+    /// entry, cleared on the real landing. For native scrubs it is the
+    /// time of the segment AVPlayer requested out of range (AetherEngine#38).
+    @Published public internal(set) var seekTarget: Double? = nil
+
+    /// Monotonic counter bumped at the entry of every programmatic
+    /// `seek(to:)`. A seek finalizes its clock/state and clears the
+    /// `isSeeking` signal only if its captured generation still matches,
+    /// so a superseded seek's late landing cannot clobber the newer seek's
+    /// in-flight state (the engine-side mirror of the host's guard).
+    private var seekGeneration: UInt64 = 0
+
+    /// The two independent in-flight sources `isSeeking` unions over. A
+    /// programmatic `seek(to:)` and a native AVKit scrub are NOT mutually
+    /// exclusive: a programmatic seek to a far target drives AVPlayer,
+    /// which requests an out-of-range segment and triggers the same
+    /// producer-restart path a transport-bar scrub does. Tracking them
+    /// separately and OR-ing keeps `isSeeking` true until BOTH settle, so
+    /// the native restart finishing (producer rebuilt) cannot drop the
+    /// signal before a programmatic seek's AVPlayer landing, and vice
+    /// versa. Routed through `setProgrammaticSeek`/`setNativeScrubSeek`.
+    private var programmaticSeekInFlight = false
+    private var nativeScrubSeekInFlight = false
+
+    /// Publish `isSeeking`/`seekTarget` from the two in-flight sources.
+    /// `target` updates `seekTarget` only while seeking; cleared to nil
+    /// once both sources settle. Idempotent on `isSeeking` to avoid
+    /// redundant Combine emissions.
+    private func recomputeSeekSignal(target: Double?) {
+        let seeking = programmaticSeekInFlight || nativeScrubSeekInFlight
+        if isSeeking != seeking { isSeeking = seeking }
+        if seeking {
+            if let target { seekTarget = target }
+        } else {
+            seekTarget = nil
+        }
+    }
+
+    private func setProgrammaticSeek(inFlight: Bool, target: Double?) {
+        programmaticSeekInFlight = inFlight
+        recomputeSeekSignal(target: target)
+    }
+
+    /// Wired to `HLSVideoEngine.onSeekStateChanged`; see `requestRestart`.
+    func setNativeScrubSeek(inFlight: Bool, target: Double?) {
+        nativeScrubSeekInFlight = inFlight
+        recomputeSeekSignal(target: target)
+    }
+
     /// High-frequency playback clock (`currentTime`, `sourceTime`,
     /// live-edge fields). Deliberately a SEPARATE ObservableObject:
     /// its ~10 Hz ticks must not fire `objectWillChange` on the
@@ -193,6 +255,28 @@ public final class AetherEngine: ObservableObject {
     @Published public internal(set) var isLoadingSubtitles: Bool = false
     /// True when sidecar subtitles are the active subtitle source.
     @Published public internal(set) var isSubtitleActive: Bool = false
+
+    /// ASS script header (`[Script Info]` + `[V4+ Styles]` + the
+    /// `[Events]` Format line) for the active PRIMARY sidecar track,
+    /// or nil. The sidecar analogue of `TrackInfo.assHeader` (which
+    /// covers embedded tracks): populated by `selectSidecarSubtitle`
+    /// only when the session loaded with `LoadOptions.preserveASSMarkup`
+    /// and the file is ASS/SSA, in which case `subtitleCues` carry raw
+    /// event lines. Hosts pair the two to drive a whole-script renderer
+    /// (swift-ass-renderer via `ASSScriptBuilder`); see AetherEngine#48.
+    /// Nil for SRT / VTT sidecars and when markup preservation is off.
+    @Published public internal(set) var sidecarASSHeader: String? = nil
+
+    /// Decoded cues for the independent SECONDARY subtitle track
+    /// (issue #47). Text-only: bitmap codecs are rejected at selection.
+    /// Populated by `selectSecondarySubtitleTrack(index:)` (embedded)
+    /// or `selectSecondarySidecarSubtitle(url:)` (sidecar), independent
+    /// of the primary track.
+    @Published public internal(set) var secondarySubtitleCues: [SubtitleCue] = []
+    /// True while a secondary sidecar file is being downloaded + decoded.
+    @Published public internal(set) var isLoadingSecondarySubtitles: Bool = false
+    /// True when a secondary subtitle source is active.
+    @Published public internal(set) var isSecondarySubtitleActive: Bool = false
 
     /// True while the active session is a live stream (the host set
     /// `LoadOptions.isLive = true` at load time). Hosts use this to
@@ -486,6 +570,32 @@ public final class AetherEngine: ObservableObject {
     /// next periodic time tick. Unused on the SW / audio paths (shift 0).
     var nativeClockSeconds: Double = 0
 
+    /// Diagnostics-only ground truth for the native-path shift, read
+    /// straight off the active video producer (`HLSVideoEngine`'s own
+    /// `videoShiftPts`) rather than the host-folded `playlistShiftSeconds`.
+    /// The two normally track, but the host value is updated across an
+    /// async main-actor hop (the `onPlaylistShiftChanged` relay) and a
+    /// seam-history resolution, while this reads the producer's value
+    /// synchronously. A persistent gap between this and
+    /// `playlistShiftSeconds` means the published clock is folding the
+    /// on-screen frame with a stale shift, i.e. the "decoded frame ahead
+    /// of the reported clock" divergence (AetherEngine#49). 0 on the
+    /// SW / audio paths. Not for production playback logic; poll it
+    /// alongside `frameAhead` when capturing a divergence trace.
+    public var activeProducerShiftSeconds: Double {
+        nativeVideoSession?.playlistShiftSeconds ?? 0
+    }
+
+    /// `activeProducerShiftSeconds - playlistShiftSeconds`: how far the
+    /// producer's true shift leads the host-folded shift the clock is
+    /// publishing with. Positive means the decoded frame is ahead of the
+    /// reported `currentTime` by this many seconds. Stays ~0 when the
+    /// fold keeps up; a value that grows with seek count and does not
+    /// reconcile is the AetherEngine#49 accumulation. Diagnostics only.
+    public var frameAhead: Double {
+        activeProducerShiftSeconds - playlistShiftSeconds
+    }
+
     /// Monotonic load/stop generation. Bumped by every `stopInternal`
     /// (which runs at the head of every `load()`, `stop()`, and audio
     /// reload), captured by `load()`/`reloadWithAudioOverride` after
@@ -579,6 +689,14 @@ public final class AetherEngine: ObservableObject {
     /// `seek` to know whether to re-arm the side demuxer at the new
     /// playback position.
     var activeEmbeddedSubtitleStreamIndex: Int32 = -1
+
+    /// Secondary-channel mirrors of the subtitle reader state (issue #47).
+    /// Each is the exact analogue of the primary field above and is
+    /// driven only through `SubtitleChannel.secondary`.
+    var secondarySidecarTask: Task<Void, Never>?
+    var secondaryEmbeddedSubtitleTask: Task<Void, Never>?
+    var activeSecondaryEmbeddedSubtitleStreamIndex: Int32 = -1
+    var secondarySubtitleSideDemuxer: Demuxer?
 
     /// Source video dimensions captured at `load()` probe time. The
     /// embedded subtitle decoder uses these as a canvas-size fallback
@@ -1531,6 +1649,13 @@ public final class AetherEngine: ObservableObject {
         // window's session-relative seekable range.
         let target: Double = isLive ? (liveWindow?.clamp(seconds) ?? seconds) : max(0, min(seconds, duration))
         state = .seeking
+        // Span the real landing (not the optimistic .playing flip below) so a
+        // host gets an accurate in-flight seek signal (#38). The generation
+        // guard at each finalize point ensures a superseded seek's late
+        // landing cannot clear this while a newer seek is still in flight.
+        seekGeneration &+= 1
+        let seekGen = seekGeneration
+        setProgrammaticSeek(inFlight: true, target: target)
         if isLive {
             // Live/DVR native path: translate the session-time target into the
             // AVPlayer live clock. Measure how far behind the live edge the
@@ -1549,21 +1674,31 @@ public final class AetherEngine: ObservableObject {
             if softwareHost != nil, nativeHost == nil {
                 EngineLog.emit("[AetherEngine] SW live seek target=\(target)", category: .engine)
                 await softwareHost?.seek(to: target)
+                guard seekGeneration == seekGen else { return }
                 clock.currentTime = target
                 clock.sourceTime = target
                 state = .playing
+                setProgrammaticSeek(inFlight: false, target: nil)
                 return
             }
             let behind = (liveWindow?.edgeTime ?? target) - target   // >= 0; 0 == "to the edge"
             let clockTarget = max(0, (nativeHost?.seekableEnd ?? 0) - behind)
             EngineLog.emit("[AetherEngine] live seek target=\(target) behind=\(behind) seekableEnd=\(nativeHost?.seekableEnd ?? 0) clockTarget=\(clockTarget)", category: .engine)
-            nativeHost?.seek(to: clockTarget)
+            // Publish the target up front so the playhead holds it while the
+            // host suppresses the periodic observer's stale pre-seek reads,
+            // then await the real landing before flipping back to .playing.
+            nativeClockSeconds = clockTarget
+            clock.currentTime = target
+            clock.sourceTime = target
+            await nativeHost?.seek(to: clockTarget)
+            guard seekGeneration == seekGen else { return }
             nativeClockSeconds = clockTarget
             clock.currentTime = target
             clock.sourceTime = target
             // publishLiveWindow on the next tick recomputes behindLiveSeconds
             // against the new playhead.
             state = .playing
+            setProgrammaticSeek(inFlight: false, target: nil)
             return
         }
         // seek(to:) speaks source PTS (the unified engine clock). On the
@@ -1572,6 +1707,19 @@ public final class AetherEngine: ObservableObject {
         // run on source time (shift 0), making this a no-op there.
         let clockTarget = target - playlistShiftSeconds
         let gen = loadGeneration
+        // Native loopback-HLS lands a seek seconds late. Publish the target
+        // up front so the playhead snaps to the drop point; the host
+        // suppresses the periodic observer's stale pre-seek reads until the
+        // seek lands, so the clock holds the target instead of bouncing back
+        // through the old position (#37). Audio/SW hosts run on source time
+        // and resolve their seek synchronously to the await, so they write
+        // the clock only at finalize below, as before.
+        let nativeOnly = !audioAVPlayerActive && audioHost == nil && softwareHost == nil && nativeHost != nil
+        if nativeOnly {
+            nativeClockSeconds = clockTarget
+            clock.currentTime = target
+            clock.sourceTime = target
+        }
         if audioAVPlayerActive, let host = audioAVPlayerHost {
             await host.seek(to: clockTarget)
         } else if let host = audioHost {
@@ -1579,12 +1727,15 @@ public final class AetherEngine: ObservableObject {
         } else if let host = softwareHost {
             await host.seek(to: clockTarget)
         } else {
-            nativeHost?.seek(to: clockTarget)
+            // Await the real AVPlayer landing before flipping back to
+            // .playing so isSeeking spans it (#37/#38).
+            await nativeHost?.seek(to: clockTarget)
         }
         // A stop()/load() landing during the await above already tore
         // the session down; writing clock state + .playing into the
-        // singleton afterwards would publish a phantom session.
-        guard loadGeneration == gen else { return }
+        // singleton afterwards would publish a phantom session. A
+        // superseding seek bumped seekGeneration and owns the final state.
+        guard loadGeneration == gen, seekGeneration == seekGen else { return }
         nativeClockSeconds = clockTarget
         clock.currentTime = target
         clock.sourceTime = target
@@ -1608,10 +1759,24 @@ public final class AetherEngine: ObservableObject {
             }
         }
 
-        // AVPlayer surfaces post-seek readiness via its own KVO; the
-        // engine optimistically flips back to .playing so the host UI
-        // doesn't stick on .seeking when the seek lands fast.
+        // Mirror the re-arm for the secondary companion track (issue #47).
+        if activeSecondaryEmbeddedSubtitleStreamIndex >= 0, let url = loadedURL {
+            let streamIdx = activeSecondaryEmbeddedSubtitleStreamIndex
+            cancelEmbeddedSubtitleReader(channel: .secondary)
+            secondarySubtitleCues = []
+            if isCustomSource {
+                if let clone = customReader?.makeIndependentReader() {
+                    startEmbeddedSubtitleTask(url: url, reader: clone, formatHint: customFormatHint, streamIndex: streamIdx, startAt: target, channel: .secondary)
+                }
+            } else {
+                startEmbeddedSubtitleTask(url: url, reader: nil, formatHint: nil, streamIndex: streamIdx, startAt: target, channel: .secondary)
+            }
+        }
+
+        // The host seek has physically landed (we awaited it). Flip back to
+        // .playing and clear the in-flight seek signal.
         state = .playing
+        setProgrammaticSeek(inFlight: false, target: nil)
     }
 
     /// Deprecated alias for `seek(to:)`, which is now itself source-PTS
@@ -1728,12 +1893,33 @@ public final class AetherEngine: ObservableObject {
         if let v = desiredVolume { host.volume = v }
     }
 
-    /// Set playback speed (0.5-2.0). On the native AVPlayer path audio
-    /// pitch adjusts via `audioTimePitchAlgorithm`; on the SW path the
-    /// rate goes through the synchronizer and audio plays at the
-    /// changed rate without pitch correction.
+    /// The highest forward playback rate the active path plays reliably.
+    /// AVPlayer caps fast-forward at 2x for video; an audio-only session
+    /// (no video stream) plays cleanly up to 3x. Above this the AVPlayer
+    /// fast-forward becomes unstable (audio and video go abnormal, the
+    /// symptom in AetherEngine#39), so hosts should size their speed
+    /// picker against this value, and `setRate(_:)` clamps to it as a
+    /// backstop. Reflects the currently loaded session; query it after
+    /// load (it is 2.0 while idle).
+    public var maxSupportedRate: Float {
+        (audioAVPlayerActive || audioHost != nil) ? 3.0 : 2.0
+    }
+
+    /// Set playback speed. Forward rates are clamped to `maxSupportedRate`
+    /// (2x for video, 3x for an audio-only session): AVPlayer's HLS
+    /// fast-forward is undefined above that and drives both audio and
+    /// video abnormal (AetherEngine#39). 0 pauses; values at or below the
+    /// cap pass through unchanged. On the native AVPlayer path audio pitch
+    /// adjusts via `audioTimePitchAlgorithm`; on the SW path the rate goes
+    /// through the synchronizer and audio plays at the changed rate
+    /// without pitch correction.
     public func setRate(_ rate: Float) {
-        activeTransportHost?.setRate(rate)
+        let cap = maxSupportedRate
+        let clamped = min(rate, cap)
+        if clamped != rate {
+            EngineLog.emit("[AetherEngine] setRate(\(rate)) clamped to \(clamped) (max supported on this path)", category: .engine)
+        }
+        activeTransportHost?.setRate(clamped)
     }
 
     // MARK: - Audio / subtitle track selection
@@ -1800,6 +1986,8 @@ public final class AetherEngine: ObservableObject {
     /// so `selectAudioTrack` can rehydrate the same selection after the
     /// pipeline reload. Cleared by `clearSubtitle` and `stopInternal`.
     var loadedSidecarURL: URL?
+    /// Active secondary sidecar URL, or nil. Mirror of `loadedSidecarURL`.
+    var loadedSecondarySidecarURL: URL?
 
     // MARK: - Internal teardown
 
@@ -1917,6 +2105,13 @@ public final class AetherEngine: ObservableObject {
         nativeClockSeconds = 0
         clock.sourceTime = 0
         isBuffering = false
+        // A stop landing mid-seek must not strand the in-flight signal: a
+        // late host completion or restart-drain callback is dropped by the
+        // generation/session guards, so clear hard here (#38).
+        programmaticSeekInFlight = false
+        nativeScrubSeekInFlight = false
+        isSeeking = false
+        seekTarget = nil
 
         liveWindowTimerTask?.cancel()
         liveWindowTimerTask = nil
@@ -1927,7 +2122,15 @@ public final class AetherEngine: ObservableObject {
         loadedSidecarURL = nil
         isSubtitleActive = false
         subtitleCues = []
+        sidecarASSHeader = nil
         isLoadingSubtitles = false
+        cancelSidecarTask(channel: .secondary)
+        cancelEmbeddedSubtitleReader(channel: .secondary)
+        activeSecondaryEmbeddedSubtitleStreamIndex = -1
+        loadedSecondarySidecarURL = nil
+        isSecondarySubtitleActive = false
+        secondarySubtitleCues = []
+        isLoadingSecondarySubtitles = false
         // Audio-track state belongs to the host's picker; clear it so a
         // stale index from the previous session can't be re-applied via
         // `selectAudioTrack` before the next `load(url:)` repopulates

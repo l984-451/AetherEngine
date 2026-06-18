@@ -260,6 +260,18 @@ extension AetherEngine {
                 self.clock.sourceTime = self.currentTime
             }
         }
+        session.onSeekStateChanged = { [weak self] inFlight, playlistTime in
+            Task { @MainActor in
+                guard let self = self else { return }
+                // Fold the playlist-axis segment time onto the source-PTS
+                // axis the published seekTarget/currentTime use (#38), the
+                // same fold as the $currentTime sink. nil target while
+                // clearing leaves the last value untouched until both seek
+                // sources settle.
+                let target = playlistTime.map { $0 + self.playlistShiftSeconds }
+                self.setNativeScrubSeek(inFlight: inFlight, target: target)
+            }
+        }
         session.onPlaylistShiftRebased = { [weak self] seconds, seamOutputSeconds in
             Task { @MainActor in
                 guard let self = self else { return }
@@ -288,8 +300,24 @@ extension AetherEngine {
             Task { @MainActor in
                 // A stale session (superseded by a zap) must not trigger a
                 // retune of whatever is playing now.
-                guard let self, let session,
-                      self.nativeVideoSession === session else { return }
+                guard let self, let session else {
+                    EngineLog.emit(
+                        "[AetherEngine] onLiveSourceReset dropped: self/session deallocated",
+                        category: .session
+                    )
+                    return
+                }
+                guard self.nativeVideoSession === session else {
+                    EngineLog.emit(
+                        "[AetherEngine] onLiveSourceReset dropped: session superseded (not current)",
+                        category: .session
+                    )
+                    return
+                }
+                EngineLog.emit(
+                    "[AetherEngine] onLiveSourceReset → publishing liveSourceReset to host",
+                    category: .session
+                )
                 self.liveSourceReset.send()
             }
         }
@@ -780,6 +808,10 @@ extension AetherEngine {
         let sidecarToResume: URL? = isSubtitleActive && activeEmbeddedSubtitleStreamIndex < 0
             ? loadedSidecarURL
             : nil
+        let secondaryEmbeddedToResume: Int32 = activeSecondaryEmbeddedSubtitleStreamIndex
+        let secondarySidecarToResume: URL? = isSecondarySubtitleActive && activeSecondaryEmbeddedSubtitleStreamIndex < 0
+            ? loadedSecondarySidecarURL
+            : nil
         EngineLog.emit(
             "[AetherEngine] reload begin: audioStream=\(audioStreamIndex.map(String.init) ?? "nil") resumeAt=\(String(format: "%.2f", resumeAt))s embeddedSub=\(embeddedStreamToResume) sidecar=\(sidecarToResume?.lastPathComponent ?? "nil")",
             category: .engine
@@ -982,6 +1014,11 @@ extension AetherEngine {
             selectSidecarSubtitle(url: sidecar)
         } else if embeddedStreamToResume >= 0 {
             selectSubtitleTrack(index: Int(embeddedStreamToResume))
+        }
+        if let secondarySidecar = secondarySidecarToResume {
+            selectSecondarySidecarSubtitle(url: secondarySidecar)
+        } else if secondaryEmbeddedToResume >= 0 {
+            selectSecondarySubtitleTrack(index: Int(secondaryEmbeddedToResume))
         }
     }
 

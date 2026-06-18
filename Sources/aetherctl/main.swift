@@ -78,11 +78,13 @@ func printUsage() {
       aetherctl serve [--no-dv] <url>
       aetherctl validate [--no-dv] <url>
       aetherctl swdecode [--frames N] <url>
+      aetherctl dovitest <file>
       aetherctl extract [--at <sec>] [--snapshot] [--width <px>] [--loops <n>] <url>
       aetherctl audio [--seconds N] <url>
       aetherctl customio [--memory] [--forward-only] [--audio-only] [--reload] [--switch-audio] [--select-subs] [--extract] <file>
       aetherctl live [--seconds N] [--seed <path>] [--dvr-window N] [--serve-only] [--measure-rss] [--report-cache-bytes] [--rewind-test] [--reload-test] [--sw] [--drop-after N] [--discontinuity-at N] [--realtime] [--gen-highbitrate-seed]
       aetherctl dvr [--path native|sw|both] [--seconds N] [--dvr-window N]
+      aetherctl dualsubs <file> --primary <streamIndex> --secondary <streamIndex> [--seek <seconds>]
       aetherctl hlsfixture <input.ts> [--port N] [--segment-seconds N]
                            [--master] [--discontinuity-at N] [--slow-refresh]
                            [--drop-segment N] [--encrypted] [--fmp4] [--self-test]
@@ -130,6 +132,14 @@ func printUsage() {
       validate  Spin up the engine, run Apple's `mediastreamvalidator`
                 against the loopback manifest, print the report, tear
                 down. Requires Xcode (xcrun) on the PATH.
+
+      dovitest  Walk the source's HEVC video stream, convert each
+                packet's Dolby Vision RPU from Profile 7 to Profile
+                8.1 (and drop the enhancement layer) via
+                DoviRpuConverter, and write the result to
+                /tmp/aetherctl-dovitest.hevc in Annex-B form. Feed
+                that to `dovi_tool extract-rpu` + `info` to validate
+                the rewritten RPU against ground truth.
 
       swdecode  Open SoftwareVideoDecoder for the source's video
                 stream, feed packets, report counters + first-frame
@@ -229,6 +239,58 @@ if first == "seektest" {
     rest.removeAll { $0 == urlArg }
     rejectStrayFlags(rest, subcommand: "seektest")
     exit(runSeekTest(url: parseSourceURL(urlArg), seeks: seeks, gapMs: gapMs, settleSeconds: settle))
+}
+
+// SMB2/3 throughput + random-seek correctness harness.
+if first == "smbtest" {
+    var rest = Array(args.dropFirst(2))
+    let reads = takeIntFlag("--reads", from: &rest) ?? 64
+    guard let urlArg = rest.first(where: { !$0.hasPrefix("--") }) else {
+        print("ERROR: smbtest requires a <smb-url> argument")
+        exit(64)
+    }
+    rest.removeAll { $0 == urlArg }
+    rejectStrayFlags(rest, subcommand: "smbtest")
+    exit(runSMBTest([urlArg, "--reads", "\(reads)"]))
+}
+
+// Dual subtitle channel harness (issue #47).
+if first == "dualsubs" {
+    var rest = Array(args.dropFirst(2))
+    let primaryIndex   = takeIntFlag("--primary",   from: &rest)
+    let secondaryIndex = takeIntFlag("--secondary", from: &rest)
+    let seekTo         = takeDoubleFlag("--seek",   from: &rest)
+    guard let urlArg = rest.first(where: { !$0.hasPrefix("--") }) else {
+        print("ERROR: dualsubs requires a <file> argument")
+        print("Usage: aetherctl dualsubs <file> --primary <streamIndex> --secondary <streamIndex> [--seek <seconds>]")
+        exit(64)
+    }
+    rest.removeAll { $0 == urlArg }
+    guard let primary = primaryIndex else {
+        print("ERROR: dualsubs requires --primary <streamIndex>")
+        print("Usage: aetherctl dualsubs <file> --primary <streamIndex> --secondary <streamIndex> [--seek <seconds>]")
+        exit(64)
+    }
+    guard let secondary = secondaryIndex else {
+        print("ERROR: dualsubs requires --secondary <streamIndex>")
+        print("Usage: aetherctl dualsubs <file> --primary <streamIndex> --secondary <streamIndex> [--seek <seconds>]")
+        exit(64)
+    }
+    rejectStrayFlags(rest, subcommand: "dualsubs")
+    exit(runDualSubs(path: urlArg, primaryIndex: primary, secondaryIndex: secondary, seekTo: seekTo))
+}
+
+// Dolby Vision P7 -> 8.1 converter validation harness.
+if first == "dovitest" {
+    var rest = Array(args.dropFirst(2))
+    guard let urlArg = rest.first(where: { !$0.hasPrefix("--") }) else {
+        print("ERROR: dovitest requires a <file> argument")
+        print("Usage: aetherctl dovitest <file>")
+        exit(64)
+    }
+    rest.removeAll { $0 == urlArg }
+    rejectStrayFlags(rest, subcommand: "dovitest")
+    exit(runDoviTest(url: parseSourceURL(urlArg)))
 }
 
 // HLS live fixture subcommand.

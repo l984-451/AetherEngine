@@ -656,7 +656,7 @@ final class HLSLocalServer: @unchecked Sendable {
             stateLock.unlock()
 
             EngineLog.emit("[HLSLocalServer] conn opened fd=\(clientFd)",
-                           category: .hlsServer)
+                           category: .hlsServer, level: .verbose)
 
             workQueue.async { [weak self] in
                 self?.handleConnection(clientFd)
@@ -673,7 +673,7 @@ final class HLSLocalServer: @unchecked Sendable {
             stateLock.unlock()
             close(fd)
             EngineLog.emit("[HLSLocalServer] conn closed fd=\(fd)",
-                           category: .hlsServer)
+                           category: .hlsServer, level: .verbose)
         }
 
         // HTTP/1.1 keep-alive loop. AVPlayer reuses a single
@@ -782,7 +782,7 @@ final class HLSLocalServer: @unchecked Sendable {
         }
         let normalizedPath = (path == "/audio.m3u8") ? "/media.m3u8" : path
 
-        EngineLog.emit("[HLSLocalServer] \(firstLine)", category: .hlsServer)
+        EngineLog.emit("[HLSLocalServer] \(firstLine)", category: .hlsServer, level: .verbose)
         // Dump full request headers on first request per session.
         // AVPlayer's HLS pipeline may send capability headers
         // (Accept, Range, X-Playback-Session-Id) that influence its
@@ -796,7 +796,7 @@ final class HLSLocalServer: @unchecked Sendable {
         if dumpHeaders {
             let allLines = text.components(separatedBy: "\r\n")
             let headers = allLines.dropFirst().prefix(while: { !$0.isEmpty }).joined(separator: " | ")
-            EngineLog.emit("[HLSLocalServer] first request headers fd=\(fd): \(headers)", category: .hlsServer)
+            EngineLog.emit("[HLSLocalServer] first request headers fd=\(fd): \(headers)", category: .hlsServer, level: .verbose)
         }
 
         switch normalizedPath {
@@ -882,9 +882,9 @@ final class HLSLocalServer: @unchecked Sendable {
                 let head = lines.prefix(8).joined(separator: "\n")
                 let tail = lines.suffix(6).joined(separator: "\n")
                 EngineLog.emit("[HLSLocalServer] media.m3u8 head:\n\(head)",
-                               category: .hlsServer)
+                               category: .hlsServer, level: .verbose)
                 EngineLog.emit("[HLSLocalServer] media.m3u8 tail:\n\(tail)",
-                               category: .hlsServer)
+                               category: .hlsServer, level: .verbose)
             }
             return send200(fd: fd, path: normalizedPath,
                            data: Data(body.utf8),
@@ -1022,7 +1022,7 @@ final class HLSLocalServer: @unchecked Sendable {
         let headerData = Self.responseHeader(status: "200 OK", contentLength: data.count, contentType: contentType)
 
         EngineLog.emit("[HLSLocalServer] -> 200 \(path) bytes=\(data.count) type=\(contentType)",
-                       category: .hlsServer)
+                       category: .hlsServer, level: .verbose)
 
         guard writeAll(fd: fd, data: headerData, path: "\(path) [header]") else {
             return false
@@ -1048,7 +1048,7 @@ final class HLSLocalServer: @unchecked Sendable {
         let headerData = Self.responseHeader(status: "200 OK", contentLength: fileSize, contentType: contentType)
 
         EngineLog.emit("[HLSLocalServer] -> 200 \(path) bytes=\(fileSize) type=\(contentType) [filestream]",
-                       category: .hlsServer)
+                       category: .hlsServer, level: .verbose)
 
         guard writeAll(fd: fd, data: headerData, path: "\(path) [header]") else {
             return false

@@ -3,7 +3,45 @@ import Libavformat
 import Libavcodec
 import Libavutil
 
+/// Which subtitle output path a reader / apply / cancel call targets.
+/// `.primary` maps to the original single-track storage and behavior;
+/// `.secondary` maps to the independent companion track (issue #47).
+public enum SubtitleChannel: Sendable {
+    case primary
+    case secondary
+}
+
 extension AetherEngine {
+
+    // MARK: - Channel routing
+
+    func subtitleSideDemuxer(for channel: SubtitleChannel) -> Demuxer? {
+        switch channel {
+        case .primary:   return activeSubtitleSideDemuxer
+        case .secondary: return secondarySubtitleSideDemuxer
+        }
+    }
+
+    func setSubtitleSideDemuxer(_ demuxer: Demuxer?, for channel: SubtitleChannel) {
+        switch channel {
+        case .primary:   activeSubtitleSideDemuxer = demuxer
+        case .secondary: secondarySubtitleSideDemuxer = demuxer
+        }
+    }
+
+    func setLoadingSubtitles(_ value: Bool, for channel: SubtitleChannel) {
+        switch channel {
+        case .primary:   isLoadingSubtitles = value
+        case .secondary: isLoadingSecondarySubtitles = value
+        }
+    }
+
+    func isSubtitleActive(for channel: SubtitleChannel) -> Bool {
+        switch channel {
+        case .primary:   return isSubtitleActive
+        case .secondary: return isSecondarySubtitleActive
+        }
+    }
 
     /// Activate an embedded subtitle stream from the source. A side
     /// Demuxer opens the source independently of the main HLS pump,
@@ -53,21 +91,53 @@ extension AetherEngine {
         startEmbeddedSubtitleTask(url: url, reader: customClone, formatHint: customFormatHint, streamIndex: Int32(index), startAt: sourceTime)
     }
 
+    /// Activate an embedded subtitle stream as the SECONDARY companion
+    /// track, independent of the primary selection (issue #47). Text-only:
+    /// bitmap codecs are rejected by the reader. A second side demuxer runs
+    /// concurrently with the primary one.
+    public func selectSecondarySubtitleTrack(index: Int) {
+        guard let url = loadedURL else { return }
+        var customClone: IOReader? = nil
+        if isCustomSource {
+            guard let clone = customReader?.makeIndependentReader() else { return }
+            customClone = clone
+        }
+        cancelSidecarTask(channel: .secondary)
+        cancelEmbeddedSubtitleReader(channel: .secondary)
+
+        isSecondarySubtitleActive = true
+        secondarySubtitleCues = []
+        isLoadingSecondarySubtitles = true
+        activeSecondaryEmbeddedSubtitleStreamIndex = Int32(index)
+
+        startEmbeddedSubtitleTask(url: url, reader: customClone, formatHint: customFormatHint, streamIndex: Int32(index), startAt: sourceTime, channel: .secondary)
+    }
+
     /// Spin up the side-demuxer Task that streams cues into the
     /// engine. Captured-on-init: the URL, the stream index, the
     /// start position, and the source video dimensions. The Task's
     /// run loop is cancellable; `cancel()` triggers a clean exit.
-    func startEmbeddedSubtitleTask(url: URL, reader: IOReader?, formatHint: String?, streamIndex: Int32, startAt: Double) {
+    func startEmbeddedSubtitleTask(url: URL, reader: IOReader?, formatHint: String?, streamIndex: Int32, startAt: Double, channel: SubtitleChannel = .primary) {
         let w = sourceVideoWidth > 0 ? sourceVideoWidth : 1920
         let h = sourceVideoHeight > 0 ? sourceVideoHeight : 1080
         let headers = loadedOptions.httpHeaders
-        let preserveASS = loadedOptions.preserveASSMarkup
-        embeddedSubtitleTask = Task.detached(priority: .userInitiated) { [weak self] in
+        // The secondary channel is always rendered as plain text by the host
+        // (it never drives libass), so it must never preserve ASS markup,
+        // even when the session enabled it for a styled primary ASS track.
+        // Otherwise the secondary cues arrive as raw ASS event lines
+        // ("0,,Default,0,0,0,...") and leak into the overlay (issue #47).
+        let preserveASS = (channel == .primary) ? loadedOptions.preserveASSMarkup : false
+        let task = Task.detached(priority: .userInitiated) { [weak self] () -> Void in
             await self?.runEmbeddedSubtitleReader(
                 url: url, reader: reader, formatHint: formatHint,
                 headers: headers, streamIndex: streamIndex, startAt: startAt,
-                videoWidth: w, videoHeight: h, preserveASSMarkup: preserveASS
+                videoWidth: w, videoHeight: h, preserveASSMarkup: preserveASS,
+                channel: channel
             )
+        }
+        switch channel {
+        case .primary:   embeddedSubtitleTask = task
+        case .secondary: secondaryEmbeddedSubtitleTask = task
         }
     }
 
@@ -82,7 +152,8 @@ extension AetherEngine {
     nonisolated private func runEmbeddedSubtitleReader(
         url: URL, reader: IOReader?, formatHint: String?,
         headers: [String: String], streamIndex: Int32, startAt: Double,
-        videoWidth: Int32, videoHeight: Int32, preserveASSMarkup: Bool = false
+        videoWidth: Int32, videoHeight: Int32, preserveASSMarkup: Bool = false,
+        channel: SubtitleChannel = .primary
     ) async {
         let demuxer = Demuxer()
         // Register for abort: Task.cancel() is only observed BETWEEN
@@ -99,7 +170,7 @@ extension AetherEngine {
             // markClosed the wrong demuxer and A's identity-guarded defer
             // would nil B's registration, leaving B's reader unabortable.
             guard !Task.isCancelled, let self else { return false }
-            self.activeSubtitleSideDemuxer = demuxer
+            self.setSubtitleSideDemuxer(demuxer, for: channel)
             return true
         }
         guard registered else {
@@ -108,8 +179,8 @@ extension AetherEngine {
         }
         defer {
             Task { @MainActor [weak self, weak demuxer] in
-                if let self, let demuxer, self.activeSubtitleSideDemuxer === demuxer {
-                    self.activeSubtitleSideDemuxer = nil
+                if let self, let demuxer, self.subtitleSideDemuxer(for: channel) === demuxer {
+                    self.setSubtitleSideDemuxer(nil, for: channel)
                 }
             }
         }
@@ -126,7 +197,7 @@ extension AetherEngine {
                 // Stale-task guard: a cancelled reader (track switch in
                 // flight) must not clear the SUCCESSOR's loading spinner.
                 guard !Task.isCancelled else { return }
-                self?.isLoadingSubtitles = false
+                self?.setLoadingSubtitles(false, for: channel)
             }
             return
         }
@@ -168,7 +239,20 @@ extension AetherEngine {
                 // Stale-task guard: a cancelled reader (track switch in
                 // flight) must not clear the SUCCESSOR's loading spinner.
                 guard !Task.isCancelled else { return }
-                self?.isLoadingSubtitles = false
+                self?.setLoadingSubtitles(false, for: channel)
+            }
+            return
+        }
+
+        // Secondary channel is text-only (issue #47): a bitmap codec
+        // (PGS / DVB / DVD / XSUB) cannot stack as a companion line, so
+        // refuse it here as the safety net behind the host's track filter.
+        if channel == .secondary, EmbeddedSubtitleDecoder.isBitmapCodec(decoder.codecID) {
+            EngineLog.emit("[AetherEngine] secondary subtitle rejected: bitmap codec=\(decoder.codecID.rawValue) not supported as companion track", category: .engine)
+            await MainActor.run { [weak self] in
+                guard !Task.isCancelled else { return }
+                self?.setLoadingSubtitles(false, for: .secondary)
+                self?.isSecondarySubtitleActive = false
             }
             return
         }
@@ -198,7 +282,7 @@ extension AetherEngine {
 
         await MainActor.run { [weak self] in
             guard !Task.isCancelled else { return }
-            self?.isLoadingSubtitles = false
+            self?.setLoadingSubtitles(false, for: channel)
         }
 
         var totalPacketsRead = 0
@@ -265,7 +349,7 @@ extension AetherEngine {
                     }
                     await MainActor.run { [weak self] in
                         guard !Task.isCancelled else { return }
-                        self?.applySubtitleEvent(event)
+                        self?.applySubtitleEvent(event, channel: channel)
                     }
                 }
             } else {
@@ -319,14 +403,12 @@ extension AetherEngine {
     /// moment) and inserts new cues sorted by start time so the
     /// overlay's lookup stays correct after backward scrubs.
     @MainActor
-    private func applySubtitleEvent(_ event: EmbeddedSubtitleDecoder.SubtitleEvent) {
-        guard isSubtitleActive else { return }
+    private func applySubtitleEvent(_ event: EmbeddedSubtitleDecoder.SubtitleEvent, channel: SubtitleChannel) {
+        guard isSubtitleActive(for: channel) else { return }
 
-        // Diagnostic: for the first ~20 cues after activation, log
-        // each cue's time range alongside engine.currentTime (=
-        // AVPlayer.currentTime). Lets us spot whether the source-side
-        // PTS and the AVPlayer-side clock differ systematically.
-        if subtitleCueDiagnosticCount < 20, let firstCue = event.cues.first {
+        // Per-session diagnostic logging stays primary-only to keep the
+        // in-app overlay readable.
+        if channel == .primary, subtitleCueDiagnosticCount < 20, let firstCue = event.cues.first {
             subtitleCueDiagnosticCount += 1
             EngineLog.emit(
                 "[applySubtitleEvent #\(subtitleCueDiagnosticCount)] " +
@@ -337,21 +419,24 @@ extension AetherEngine {
             )
         }
 
-        // Cues stay in source PTS; the AVPlayer-clock translation is
-        // applied at the lookup boundary (host renders against
-        // `engine.sourceTime`, side-demuxer seeks against the same).
+        switch channel {
+        case .primary:
+            applyEventMutations(event, to: &subtitleCues)
+        case .secondary:
+            applyEventMutations(event, to: &secondarySubtitleCues)
+        }
+    }
 
-        // PGS clear-event trim: each PGS event implicitly terminates
-        // whatever was on screen. Truncate any image cue whose
-        // interval straddles the new event's start so it disappears
-        // at the right moment instead of staying up for the
-        // UINT32_MAX (~50-day) default the decoder hands us.
+    /// Shared cue-array mutation: PGS clear-event trim, sorted insert, prune.
+    /// Operates on whichever channel's cue store the caller passes in.
+    @MainActor
+    private func applyEventMutations(_ event: EmbeddedSubtitleDecoder.SubtitleEvent, to cues: inout [SubtitleCue]) {
         if let trimAt = event.pgsTrimAt {
-            for i in 0..<subtitleCues.count {
-                guard case .image = subtitleCues[i].body else { continue }
-                let cue = subtitleCues[i]
+            for i in 0..<cues.count {
+                guard case .image = cues[i].body else { continue }
+                let cue = cues[i]
                 if cue.startTime < trimAt && cue.endTime > trimAt {
-                    subtitleCues[i] = SubtitleCue(
+                    cues[i] = SubtitleCue(
                         id: cue.id,
                         startTime: cue.startTime,
                         endTime: trimAt,
@@ -360,53 +445,30 @@ extension AetherEngine {
                 }
             }
         }
-
-        // Cues mostly arrive in DTS order, but a backward scrub can
-        // make a fresh packet land before existing cues. Insert each
-        // in sorted position so the overlay's lookup (binary search
-        // then walk for overlapping cues) stays correct.
         for cue in event.cues {
-            var lo = 0, hi = subtitleCues.count
+            var lo = 0, hi = cues.count
             while lo < hi {
                 let mid = (lo + hi) / 2
-                if subtitleCues[mid].startTime < cue.startTime {
-                    lo = mid + 1
-                } else {
-                    hi = mid
-                }
+                if cues[mid].startTime < cue.startTime { lo = mid + 1 } else { hi = mid }
             }
-            subtitleCues.insert(cue, at: lo)
+            cues.insert(cue, at: lo)
         }
-
-        // Prune cues that ended more than `subtitleCueRetentionSeconds`
-        // before the current playback time. Bitmap cues (PGS / DVB /
-        // DVD) each carry a CGImage with retained RGBA pixel data; on
-        // long sessions with PGS subtitles the array grows by 1-2
-        // cues / second and the heap climbs proportionally. The
-        // retention window covers typical pause durations and the
-        // backward-scrub reach that doesn't trigger a producer
-        // restart; anything older that the user revisits via a far
-        // scrub gets re-emitted on restart (the restarted side reader
-        // instantiates a fresh EmbeddedSubtitleDecoder, so its dedupe
-        // set starts empty).
-        pruneOldSubtitleCues()
+        pruneOldSubtitleCues(&cues)
     }
 
     /// Remove subtitle cues whose `endTime` has fallen further behind
     /// the current source-PTS position than the retention window.
-    /// Called from `applySubtitleEvent` so the prune happens at the
-    /// cue-emit cadence (~1-2 / second on a typical PGS track) rather
-    /// than on a separate timer. Compares against `sourceTime` because
-    /// cue start / end timestamps are in
-    /// absolute source PTS seconds (see EmbeddedSubtitleDecoder.decode
+    /// Compares against `sourceTime` because cue start / end timestamps
+    /// are in absolute source PTS seconds (see EmbeddedSubtitleDecoder.decode
     /// docstring). sourceTime now equals currentTime (the clock is unified
     /// onto source PTS), so either is correct; sourceTime keeps the intent
     /// explicit.
-    private func pruneOldSubtitleCues() {
-        guard !subtitleCues.isEmpty else { return }
+    @MainActor
+    private func pruneOldSubtitleCues(_ cues: inout [SubtitleCue]) {
+        guard !cues.isEmpty else { return }
         let cutoff = sourceTime - subtitleCueRetentionSeconds
         guard cutoff > 0 else { return }
-        subtitleCues.removeAll { $0.endTime < cutoff }
+        cues.removeAll { $0.endTime < cutoff }
     }
 
     /// Cancel the embedded-subtitle side reader: cancel the task AND
@@ -414,11 +476,19 @@ extension AetherEngine {
     /// is only observed between reads; a side demuxer parked in a
     /// network read (or the AVIO reconnect loop) would otherwise
     /// survive the teardown (see runEmbeddedSubtitleReader).
-    func cancelEmbeddedSubtitleReader() {
-        embeddedSubtitleTask?.cancel()
-        embeddedSubtitleTask = nil
-        activeSubtitleSideDemuxer?.markClosed()
-        activeSubtitleSideDemuxer = nil
+    func cancelEmbeddedSubtitleReader(channel: SubtitleChannel = .primary) {
+        switch channel {
+        case .primary:
+            embeddedSubtitleTask?.cancel()
+            embeddedSubtitleTask = nil
+            activeSubtitleSideDemuxer?.markClosed()
+            activeSubtitleSideDemuxer = nil
+        case .secondary:
+            secondaryEmbeddedSubtitleTask?.cancel()
+            secondaryEmbeddedSubtitleTask = nil
+            secondarySubtitleSideDemuxer?.markClosed()
+            secondarySubtitleSideDemuxer = nil
+        }
     }
 
     /// Decode a sidecar subtitle file (`.srt` / `.ass` / `.vtt` /
@@ -443,13 +513,23 @@ extension AetherEngine {
         loadedSidecarURL = url
         isSubtitleActive = true
         subtitleCues = []
+        sidecarASSHeader = nil
         isLoadingSubtitles = true
 
         let effectiveHeaders = httpHeaders ?? loadedOptions.httpHeaders
+        // Mirror the embedded primary path (startEmbeddedSubtitleTask):
+        // an ASS/SSA sidecar honours the session's preserveASSMarkup so
+        // the host can drive a styled whole-script renderer. SRT / VTT
+        // carry no ASS payload, so the decoder falls back to plain text
+        // there regardless.
+        let preserveASS = loadedOptions.preserveASSMarkup
         sidecarTask = Task { [weak self] in
-            let cues: [SubtitleCue]
+            let result: SidecarDecodeResult
             do {
-                cues = try await SubtitleDecoder.decodeFile(url: url, httpHeaders: effectiveHeaders)
+                result = try await SubtitleDecoder.decodeFile(
+                    url: url, httpHeaders: effectiveHeaders,
+                    preserveASSMarkup: preserveASS
+                )
             } catch {
                 EngineLog.emit("[AetherEngine] sidecar decode failed: \(error)", category: .engine)
                 await MainActor.run {
@@ -475,8 +555,46 @@ extension AetherEngine {
                 // Sidecar cues stay in source PTS; host renders
                 // against `engine.sourceTime`, which already adds the
                 // active producer's playlist shift to AVPlayer's clock.
-                self.subtitleCues = cues
+                self.subtitleCues = result.cues
+                self.sidecarASSHeader = result.assHeader
                 self.isLoadingSubtitles = false
+            }
+        }
+    }
+
+    /// Decode a sidecar subtitle file as the SECONDARY companion track
+    /// (issue #47), independent of the primary selection.
+    public func selectSecondarySidecarSubtitle(url: URL, httpHeaders: [String: String]? = nil) {
+        cancelSidecarTask(channel: .secondary)
+        cancelEmbeddedSubtitleReader(channel: .secondary)
+        activeSecondaryEmbeddedSubtitleStreamIndex = -1
+
+        loadedSecondarySidecarURL = url
+        isSecondarySubtitleActive = true
+        secondarySubtitleCues = []
+        isLoadingSecondarySubtitles = true
+
+        let effectiveHeaders = httpHeaders ?? loadedOptions.httpHeaders
+        secondarySidecarTask = Task { [weak self] in
+            let result: SidecarDecodeResult
+            do {
+                // Secondary is always rendered as plain text by the host
+                // (it never drives libass), so it never preserves ASS
+                // markup, mirroring the embedded secondary path (#47).
+                result = try await SubtitleDecoder.decodeFile(url: url, httpHeaders: effectiveHeaders)
+            } catch {
+                EngineLog.emit("[AetherEngine] secondary sidecar decode failed: \(error)", category: .engine)
+                await MainActor.run {
+                    guard !Task.isCancelled, let self = self else { return }
+                    if self.isSecondarySubtitleActive { self.isLoadingSecondarySubtitles = false }
+                }
+                return
+            }
+            await MainActor.run {
+                guard !Task.isCancelled, let self = self else { return }
+                guard self.isSecondarySubtitleActive else { return }
+                self.secondarySubtitleCues = result.cues
+                self.isLoadingSecondarySubtitles = false
             }
         }
     }
@@ -490,11 +608,30 @@ extension AetherEngine {
         loadedSidecarURL = nil
         isSubtitleActive = false
         subtitleCues = []
+        sidecarASSHeader = nil
         isLoadingSubtitles = false
     }
 
-    func cancelSidecarTask() {
-        sidecarTask?.cancel()
-        sidecarTask = nil
+    func cancelSidecarTask(channel: SubtitleChannel = .primary) {
+        switch channel {
+        case .primary:
+            sidecarTask?.cancel()
+            sidecarTask = nil
+        case .secondary:
+            secondarySidecarTask?.cancel()
+            secondarySidecarTask = nil
+        }
+    }
+
+    /// Turn the secondary subtitle off and clear its cues. Tears down
+    /// the secondary sidecar decode task and the secondary side reader.
+    public func clearSecondarySubtitle() {
+        cancelSidecarTask(channel: .secondary)
+        cancelEmbeddedSubtitleReader(channel: .secondary)
+        activeSecondaryEmbeddedSubtitleStreamIndex = -1
+        loadedSecondarySidecarURL = nil
+        isSecondarySubtitleActive = false
+        secondarySubtitleCues = []
+        isLoadingSecondarySubtitles = false
     }
 }
