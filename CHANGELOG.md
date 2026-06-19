@@ -10,6 +10,18 @@ the public-API contract.
 
 ## [Unreleased]
 
+## [3.11.2] — 2026-06-19
+
+### Fixed
+
+- **Interlaced MPEG-2 / VC-1 / MPEG-4 (DVD rips, SD broadcast) played at half speed and froze on resume (#23).** `bwdif` / `yadif` configure their output link with `time_base = input / 2` and emit frame PTS in that halved base, but `DeinterlaceFilter.pull` handed those frames straight to `SoftwareVideoDecoder.emit`, which timestamps every frame on the stream time_base. Reading a doubled-tick PTS with the un-halved base placed every interlaced frame at 2x its real presentation time: from start the video paced at half rate (renderer queue fills, demux parks on back-pressure, audio drains then goes silent); on resume frames landed far in the future so the picture froze on one frame while the audio-driven clock advanced. `pull` now rescales the pulled PTS and duration from the buffersink time_base back into the stream time_base via `av_buffersink_get_time_base`, which also handles the `pts_multiplier = 1` fallback when `av_reduce` cannot form the exact half base.
+
+### Changed
+
+- Loopback-HLS request arrivals are now logged at `.info` (was `.debug`) to surface the request path during the #50 plain-playback 404 investigation.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/3.11.2))
+
 ## [3.11.1] — 2026-06-18
 
 ### Fixed
