@@ -72,7 +72,8 @@ extension AetherEngine {
     /// its declared name, then "Subtitle N"); `language` is the ISO code
     /// (fallback "und").
     nonisolated static func makeSubtitleRenditions(
-        from tracks: [TrackInfo]
+        from tracks: [TrackInfo],
+        bitmapOnly: Bool = false
     ) -> [SubtitleRendition] {
         // The native picker lists each rendition by its NAME, and AVKit
         // collapses entries sharing NAME + LANGUAGE. Build a consistent,
@@ -86,6 +87,14 @@ extension AetherEngine {
         var renditions: [SubtitleRendition] = []
         var usedNameCounts: [String: Int] = [:]
         for (offset, track) in tracks.enumerated() {
+            // When the native mov_text path (#55, prepareNativeSubtitles) is
+            // active it already lists every TEXT track in AVKit's picker, so
+            // the decoy path advertises ONLY bitmap tracks (PGS / DVB / DVD /
+            // XSUB) — the codecs the native path excludes — to avoid
+            // double-listing while keeping image subs selectable (the host
+            // overlay paints them). When `bitmapOnly` is false the behavior is
+            // unchanged: every track is advertised.
+            if bitmapOnly && !isBitmapSubtitleCodec(track.codec) { continue }
             let language = track.language?.trimmingCharacters(in: .whitespaces)
             let langCode = (language?.isEmpty == false) ? language! : "und"
             let localizedLang = (langCode != "und")
@@ -135,6 +144,22 @@ extension AetherEngine {
             ))
         }
         return renditions
+    }
+
+    /// True for image/bitmap subtitle codecs (PGS / DVB / DVD / XSUB), which
+    /// cannot be muxed into a native mov_text track and must be painted by the
+    /// host overlay. Mirrors `EmbeddedSubtitleDecoder.isBitmapCodec` against the
+    /// `avcodec_get_name` strings carried by `TrackInfo.codec` (aliases included).
+    nonisolated static func isBitmapSubtitleCodec(_ codec: String) -> Bool {
+        switch codec.lowercased() {
+        case "hdmv_pgs_subtitle", "pgssub", "pgs",
+             "dvb_subtitle", "dvbsub",
+             "dvd_subtitle", "dvdsub", "vobsub",
+             "xsub":
+            return true
+        default:
+            return false
+        }
     }
 
     /// Map an FFmpeg subtitle codec name to a short, user-facing format label.
