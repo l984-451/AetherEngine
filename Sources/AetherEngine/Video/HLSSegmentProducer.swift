@@ -914,6 +914,14 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// (byte-identical output).
     var subtitleCueStore: NativeSubtitleCueStore?
 
+    /// When true, `allocateMuxer` passes a `SubtitleConfig` to
+    /// `MP4SegmentMuxer` so the init moov declares a mov_text track.
+    /// Must be set BEFORE the first call to `allocateMuxer` (i.e.
+    /// before the pump loop runs). Set by the engine based on
+    /// `LoadOptions.prepareNativeSubtitles` and whether the probe
+    /// found at least one non-bitmap subtitle stream (#55).
+    var enableNativeSubtitleTrack: Bool = false
+
     /// Turn a segment window's cues into a contiguous mov_text sample
     /// plan: empty samples fill the gaps so the text track has no holes.
     /// Cues are assumed clipped and sorted by NativeSubtitleCueStore.cuesInWindow.
@@ -1337,11 +1345,17 @@ final class HLSSegmentProducer: @unchecked Sendable {
         }
 
         do {
+            // Pass a SubtitleConfig when the native mov_text track is requested
+            // (#55). Only the first (non-reinit) muxer declares the track; a
+            // re-init at an SSAI seam keeps the original track layout.
+            let muxerSubtitle: MP4SegmentMuxer.SubtitleConfig? =
+                (!isReinit && enableNativeSubtitleTrack) ? MP4SegmentMuxer.SubtitleConfig() : nil
             let muxer = try MP4SegmentMuxer(
                 initialSegmentIndex: initialSegmentIndex,
                 sessionDir: cache.sessionDir,
                 video: muxerVideo,
                 audio: muxerAudio,
+                subtitle: muxerSubtitle,
                 onInitCaptured: { [weak self] initBytes in
                     guard let self = self else { return }
                     if isReinit {

@@ -160,6 +160,35 @@ public final class HLSVideoEngine: @unchecked Sendable {
     var savedVideoConfig: HLSSegmentProducer.StreamConfig?
     var savedAudioConfig: HLSSegmentProducer.AudioConfig?
 
+    /// Mirror of `LoadOptions.prepareNativeSubtitles` + a text-subtitle
+    /// guard. When true, `makeProducer` sets `enableNativeSubtitleTrack`
+    /// on every producer it creates (initial + restart) so the muxer
+    /// always declares the mov_text track in the init moov (#55).
+    /// Set by `AetherEngine.loadNative` after the probe, before `start()`.
+    /// Also settable via the public `enableNativeSubtitles()` affordance.
+    var enableNativeSubtitleTrackForSession: Bool = false
+
+    /// Diagnostics affordance (#55): request the native mov_text track
+    /// in the init moov. Call BEFORE `start()` so `makeProducer` picks
+    /// up the flag when allocating the first muxer. Then call
+    /// `attachNativeSubtitleStore()` after `start()` to wire the cue
+    /// store to the already-running producer.
+    /// In a full `AetherEngine` session this is wired automatically;
+    /// these methods exist so `aetherctl serve --native-subs N` can
+    /// confirm the plumbing at the HLS-engine level.
+    public func requestNativeSubtitleTrack() {
+        enableNativeSubtitleTrackForSession = true
+    }
+
+    /// Attach a fresh `NativeSubtitleCueStore` to the current producer.
+    /// Call AFTER `start()`. The store starts empty; cues arrive once
+    /// `selectSubtitleTrack` on an `AetherEngine` instance feeds the
+    /// side demuxer.
+    public func attachNativeSubtitleStore() {
+        let store = NativeSubtitleCueStore()
+        producer?.subtitleCueStore = store
+    }
+
     /// Per-frame fallback durations (in the respective source
     /// time_base) so the producer can backfill `pkt->duration` when
     /// the matroska demuxer doesn't supply per-block durations.
@@ -1840,6 +1869,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
             guard let self, let prod else { return }
             self.handlePumpFinished(prod, reason: reason)
         }
+        // Native mov_text track: propagate the session-level flag onto every
+        // producer (initial + restart) so the muxer init moov is consistent
+        // across scrub-driven producer restarts (#55).
+        prod.enableNativeSubtitleTrack = enableNativeSubtitleTrackForSession
         return prod
     }
 
