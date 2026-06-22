@@ -1348,14 +1348,16 @@ final class HLSSegmentProducer: @unchecked Sendable {
             // Pass a SubtitleConfig when the native mov_text track is requested
             // (#55). Only the first (non-reinit) muxer declares the track; a
             // re-init at an SSAI seam keeps the original track layout.
-            let muxerSubtitle: MP4SegmentMuxer.SubtitleConfig? =
-                (!isReinit && enableNativeSubtitleTrack) ? MP4SegmentMuxer.SubtitleConfig() : nil
+            // Task 2 will replace this single-element array with the full
+            // per-track array derived from the source subtitle streams.
+            let muxerSubtitles: [MP4SegmentMuxer.SubtitleConfig] =
+                (!isReinit && enableNativeSubtitleTrack) ? [MP4SegmentMuxer.SubtitleConfig()] : []
             let muxer = try MP4SegmentMuxer(
                 initialSegmentIndex: initialSegmentIndex,
                 sessionDir: cache.sessionDir,
                 video: muxerVideo,
                 audio: muxerAudio,
-                subtitle: muxerSubtitle,
+                subtitles: muxerSubtitles,
                 onInitCaptured: { [weak self] initBytes in
                     guard let self = self else { return }
                     if isReinit {
@@ -1444,6 +1446,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 let plan = Self.movTextSamples(forWindow: (t0, t1), cues: cues)
                 for s in plan {
                     muxer.writeSubtitleSample(s.payload,
+                                              trackOrdinal: 0,
                                               ptsSeconds: s.pts,
                                               durationSeconds: s.duration)
                 }

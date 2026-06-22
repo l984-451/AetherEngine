@@ -195,15 +195,24 @@ final class MP4SegmentMuxer {
         let timeBase: AVRational
     }
 
-    /// Configuration for an optional mov_text (tx3g) subtitle output stream.
+    /// Configuration for a single mov_text (tx3g) subtitle output stream.
     /// The muxer synthesises the stream entirely; no source codecpar is needed.
     struct SubtitleConfig {
         /// Time base for the subtitle stream. Spike-validated default: 1/1000
         /// (millisecond precision, sufficient for SRT/WebVTT cues).
         let timeBase: AVRational
+        /// BCP-47 language tag (e.g. "en", "de", "en-US"). Converted to
+        /// ISO 639-2/T via `iso639_2(fromBCP47:)` and written into the
+        /// stream's metadata `language` key so QuickTime/AVFoundation can
+        /// label the track in the media-selection menu. Nil = no language box.
+        let language: String?
 
-        init(timeBase: AVRational = AVRational(num: 1, den: 1000)) {
+        init(
+            timeBase: AVRational = AVRational(num: 1, den: 1000),
+            language: String? = nil
+        ) {
             self.timeBase = timeBase
+            self.language = language
         }
     }
 
@@ -305,11 +314,14 @@ final class MP4SegmentMuxer {
     let videoOutputStreamIndex: Int32 = 0
     let audioOutputStreamIndex: Int32 = 1
 
-    /// The output stream index assigned by libavformat to the mov_text track.
-    /// Nil when no subtitle stream was configured. Captured from
-    /// `subStream.pointee.index` after `avformat_new_stream`; never hardcoded
-    /// because the index is 1 without audio or 2 when audio is present.
-    private(set) var subtitleOutputStreamIndex: Int32? = nil
+    /// Ordinal-to-muxer-stream-index map for the declared mov_text tracks.
+    /// Entry N holds the libavformat stream index for the Nth subtitle track
+    /// (ordinal matches the position in the `subtitles` array passed to
+    /// `init`). Empty when no subtitle streams were configured. Indices are
+    /// captured from `avformat_new_stream` and are never hardcoded because
+    /// the value is dynamic (1 without audio, 2 with audio, then increments
+    /// for each additional subtitle track).
+    private(set) var subtitleOutputStreamIndices: [Int32] = []
 
     /// The FragmentSplitter that parses the avio output stream and
     /// routes header vs fragment bytes. Owned strongly here so its
@@ -334,7 +346,7 @@ final class MP4SegmentMuxer {
         sessionDir: URL,
         video: VideoConfig,
         audio: AudioConfig?,
-        subtitle: SubtitleConfig? = nil,
+        subtitles: [SubtitleConfig] = [],
         onInitCaptured: @escaping (Data) -> Void
     ) throws {
         self.currentSegmentIndex = initialSegmentIndex
@@ -411,14 +423,14 @@ final class MP4SegmentMuxer {
         self.pb = pb
         ctx.pointee.pb = pb
 
-        var capturedSubtitleIndex: Int32? = nil
+        var capturedSubtitleIndices: [Int32] = []
         do {
             try Self.configureStreamsAndWriteHeader(
                 ctx: ctx,
                 video: video,
                 audio: audio,
-                subtitle: subtitle,
-                capturedSubtitleIndex: &capturedSubtitleIndex
+                subtitles: subtitles,
+                capturedSubtitleIndices: &capturedSubtitleIndices
             )
         } catch {
             cleanup()
@@ -430,10 +442,13 @@ final class MP4SegmentMuxer {
         if haveAudio {
             muxerAudioTimeBase = ctx.pointee.streams.advanced(by: 1).pointee!.pointee.time_base
         }
-        if let subIdx = capturedSubtitleIndex {
-            subtitleOutputStreamIndex = subIdx
-            muxerSubtitleTimeBase = ctx.pointee.streams.advanced(by: Int(subIdx)).pointee!.pointee.time_base
+        // Latch muxer-assigned time base from the first subtitle stream (all
+        // subtitle streams share the same 1/1000 time base; Task 2 can extend
+        // this to per-track if needed).
+        if let firstSubIdx = capturedSubtitleIndices.first {
+            muxerSubtitleTimeBase = ctx.pointee.streams.advanced(by: Int(firstSubIdx)).pointee!.pointee.time_base
         }
+        subtitleOutputStreamIndices = capturedSubtitleIndices
     }
 
     /// Strong ref to the byte-counter shared with the splitter
@@ -492,7 +507,7 @@ final class MP4SegmentMuxer {
     static func probeWriteHeader(
         video: VideoConfig,
         audio: AudioConfig?,
-        subtitle: SubtitleConfig? = nil
+        subtitles: [SubtitleConfig] = []
     ) -> Int32 {
         var ctxOut: UnsafeMutablePointer<AVFormatContext>?
         let allocRet = avformat_alloc_output_context2(&ctxOut, nil, "mp4", "probe.m4s")
@@ -518,14 +533,14 @@ final class MP4SegmentMuxer {
             }
         }
 
-        var unused: Int32? = nil
+        var unused: [Int32] = []
         do {
             try Self.configureStreamsAndWriteHeader(
                 ctx: ctx,
                 video: video,
                 audio: audio,
-                subtitle: subtitle,
-                capturedSubtitleIndex: &unused
+                subtitles: subtitles,
+                capturedSubtitleIndices: &unused
             )
             return 0
         } catch MuxerError.copyParametersFailed(let code) {
@@ -543,16 +558,17 @@ final class MP4SegmentMuxer {
     /// fails (or vice versa), which is exactly the failure mode the
     /// probe exists to prevent.
     ///
-    /// When `subtitle` is non-nil a mov_text (tx3g) stream is added
-    /// after the audio stream. Its `avformat_new_stream`-assigned index
-    /// is written to `capturedSubtitleIndex` so the caller can latch it
-    /// into `subtitleOutputStreamIndex` without hardcoding.
+    /// When `subtitles` is non-empty, one mov_text (tx3g) stream is added
+    /// per entry, in order, after the audio stream. Each stream's
+    /// `avformat_new_stream`-assigned index is appended to
+    /// `capturedSubtitleIndices` so the caller can latch the ordinal map
+    /// into `subtitleOutputStreamIndices` without hardcoding.
     private static func configureStreamsAndWriteHeader(
         ctx: UnsafeMutablePointer<AVFormatContext>,
         video: VideoConfig,
         audio: AudioConfig?,
-        subtitle: SubtitleConfig?,
-        capturedSubtitleIndex: inout Int32?
+        subtitles: [SubtitleConfig],
+        capturedSubtitleIndices: inout [Int32]
     ) throws {
         // strict=-2 lets the mp4 muxer write Dolby Vision atoms (dvcC,
         // dvvC) and other non-strict-ISOBMFF extensions when the source
@@ -600,9 +616,11 @@ final class MP4SegmentMuxer {
             audioStream.pointee.time_base = audio.timeBase
         }
 
-        // Subtitle stream (optional). Declared after audio so its stream
-        // index is dynamic: 1 without audio, 2 with audio. Captures the
-        // real index from avformat_new_stream into capturedSubtitleIndex.
+        // Subtitle streams (one per entry in `subtitles`). Declared after
+        // audio so their stream indices are dynamic: first subtitle gets
+        // index 1 without audio, 2 with audio, etc. Each entry's
+        // avformat_new_stream-assigned index is appended to
+        // capturedSubtitleIndices so the caller can build the ordinal map.
         //
         // Spike-verified disposition: set to 0 (no AV_DISPOSITION_DEFAULT)
         // so the mov muxer writes a tkhd with the enabled flag CLEAR, which
@@ -612,23 +630,24 @@ final class MP4SegmentMuxer {
         // (When disposition includes AV_DISPOSITION_DEFAULT the sole subtitle
         // track becomes the defaultOption and auto-displays, causing double
         // subtitles with the host-rendered inline track.)
-        //
-        // TODO(Task 5): after the producer drives real samples, ffprobe the
-        // loopback to confirm disposition:default=0 and verify
-        // AVFoundation's defaultOption is nil (spike target). If the mov
-        // muxer's default_mode=infer still forces default=1 on the sole
-        // subtitle stream, uncomment the av_dict_set line below.
-        if let subtitle = subtitle {
+        for cfg in subtitles {
             guard let subStream = avformat_new_stream(ctx, nil) else {
                 throw MuxerError.streamCreationFailed
             }
             subStream.pointee.codecpar.pointee.codec_type = AVMEDIA_TYPE_SUBTITLE
             subStream.pointee.codecpar.pointee.codec_id = AV_CODEC_ID_MOV_TEXT
-            subStream.pointee.time_base = subtitle.timeBase
+            subStream.pointee.time_base = cfg.timeBase
             // Spike-verified: clear AV_DISPOSITION_DEFAULT so the tkhd
             // enabled flag stays clear and AVFoundation does not auto-select.
             subStream.pointee.disposition = 0
-            capturedSubtitleIndex = subStream.pointee.index
+            // Write ISO 639-2/T language tag into the stream metadata so
+            // AVFoundation can label the track in the media-selection menu.
+            if let iso = iso639_2(fromBCP47: cfg.language) {
+                iso.withCString { cStr in
+                    _ = av_dict_set(&subStream.pointee.metadata, "language", cStr, 0)
+                }
+            }
+            capturedSubtitleIndices.append(subStream.pointee.index)
         }
 
         // Movflags: the leak-free trio. See class docstring.
@@ -657,16 +676,15 @@ final class MP4SegmentMuxer {
         // restart-invariant, matching the SegmentCache's pinned-init
         // assumption.
         av_dict_set(&opts, "use_editlist", "0", 0)
-        // Prevent the mp4 muxer from auto-marking the sole subtitle
-        // track as default. ffmpeg's movenc default_mode=infer would
-        // set tkhd enabled on the only subtitle stream even when
-        // disposition=0, causing AVFoundation to derive a non-nil
-        // defaultOption and auto-display the track. infer_no_subs
-        // skips that inference for subtitle tracks while still marking
-        // audio/video defaults normally. Guarded to only apply when a
-        // subtitle stream is present to avoid touching video/audio-only
-        // session behaviour.
-        if subtitle != nil {
+        // Prevent the mp4 muxer from auto-marking subtitle tracks as
+        // default. ffmpeg's movenc default_mode=infer would set tkhd
+        // enabled on the only subtitle stream even when disposition=0,
+        // causing AVFoundation to derive a non-nil defaultOption and
+        // auto-display the track. infer_no_subs skips that inference
+        // for subtitle tracks while still marking audio/video defaults
+        // normally. Guarded to only apply when subtitle streams are
+        // present to avoid touching video/audio-only session behaviour.
+        if !subtitles.isEmpty {
             av_dict_set(&opts, "default_mode", "infer_no_subs", 0)
         }
 
@@ -686,15 +704,50 @@ final class MP4SegmentMuxer {
         Int64((s * Double(timescale)).rounded())
     }
 
+    /// Map a BCP-47 language tag to an ISO 639-2/T three-letter code
+    /// suitable for the QuickTime `language` metadata key (e.g. "eng",
+    /// "deu"). Returns nil when `tag` is nil or not in the known table,
+    /// signaling "no language box" to the caller.
+    ///
+    /// Mapping rules:
+    /// - Strip any region subtag after the first "-" (en-US -> "en").
+    /// - Look up the base tag in a static two-letter -> three-letter table.
+    /// - A tag that is already three lowercase letters is passed through
+    ///   as-is (caller already has an ISO 639-2 code).
+    /// - Unknown tags return nil.
+    static func iso639_2(fromBCP47 tag: String?) -> String? {
+        guard let tag else { return nil }
+        // Strip region subtag: "en-US" -> "en".
+        let base = tag.split(separator: "-", maxSplits: 1).first.map(String.init) ?? tag
+        let lower = base.lowercased()
+        // Pass through already-3-letter codes unchanged.
+        if lower.count == 3 && lower.allSatisfy(\.isLetter) {
+            return lower
+        }
+        // BCP-47 two-letter -> ISO 639-2/T table (common languages).
+        let table: [String: String] = [
+            "en": "eng", "de": "deu", "ja": "jpn", "fr": "fra",
+            "es": "spa", "it": "ita", "pt": "por", "ru": "rus",
+            "zh": "zho", "ko": "kor", "nl": "nld", "pl": "pol",
+            "sv": "swe", "da": "dan", "no": "nor", "fi": "fin",
+            "tr": "tur", "ar": "ara", "cs": "ces", "el": "ell",
+            "he": "heb", "hi": "hin", "th": "tha", "uk": "ukr",
+        ]
+        return table[lower]
+    }
+
     /// Write one mov_text sample into the muxer's subtitle stream.
     ///
     /// `payload` is the `[uint16 BE len][UTF-8]` body produced by
-    /// `MovTextSampleBuilder`. `ptsSeconds` and `durationSeconds` are
+    /// `MovTextSampleBuilder`. `trackOrdinal` is the zero-based index into
+    /// the `subtitles` array passed to `init` (matches the source track's
+    /// ordinal from the producer). `ptsSeconds` and `durationSeconds` are
     /// on the AVPlayer timeline axis (same as the cue times stored in
     /// `NativeSubtitleCueStore`).
     ///
-    /// No-op when no subtitle stream is configured (`subtitleOutputStreamIndex == nil`),
-    /// which preserves byte-identical output for all existing video/audio-only sessions.
+    /// No-op when `trackOrdinal` is out of range (no subtitle streams, or
+    /// ordinal beyond the declared count), which preserves byte-identical
+    /// output for all existing video/audio-only sessions.
     ///
     /// AVPacket lifetime: `trackedPacketAlloc` + `av_new_packet` allocate
     /// the struct and its ref-counted data buffer. `av_interleaved_write_frame`
@@ -703,8 +756,14 @@ final class MP4SegmentMuxer {
     /// the packet but leaving the struct alive. `trackedPacketFree` in the
     /// defer then frees the now-empty struct. This mirrors the pattern in
     /// `SoftwarePlaybackHost.enqueue(packet:)` (line ~721).
-    func writeSubtitleSample(_ payload: Data, ptsSeconds: Double, durationSeconds: Double) {
-        guard let idx = subtitleOutputStreamIndex else { return }
+    func writeSubtitleSample(
+        _ payload: Data,
+        trackOrdinal: Int,
+        ptsSeconds: Double,
+        durationSeconds: Double
+    ) {
+        guard trackOrdinal < subtitleOutputStreamIndices.count else { return }
+        let idx = subtitleOutputStreamIndices[trackOrdinal]
         let timescale = muxerSubtitleTimeBase.den
         let ptsTicks = Self.subtitleTicks(forSeconds: ptsSeconds, timescale: timescale)
         let durTicks = Self.subtitleTicks(forSeconds: durationSeconds, timescale: timescale)

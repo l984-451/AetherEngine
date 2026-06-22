@@ -11,4 +11,12 @@ final class MovTextMuxerTests: XCTestCase {
         XCTAssertEqual(MP4SegmentMuxer.subtitleTicks(forSeconds: 0.0, timescale: 1000), 0)
         XCTAssertEqual(MP4SegmentMuxer.subtitleTicks(forSeconds: 90.0, timescale: 1000), 90000)
     }
+
+    func test_iso639_2_mapsCommonBCP47Tags() {
+        XCTAssertEqual(MP4SegmentMuxer.iso639_2(fromBCP47: "en"), "eng")
+        XCTAssertEqual(MP4SegmentMuxer.iso639_2(fromBCP47: "de"), "deu")
+        XCTAssertEqual(MP4SegmentMuxer.iso639_2(fromBCP47: "ja"), "jpn")
+        XCTAssertEqual(MP4SegmentMuxer.iso639_2(fromBCP47: "en-US"), "eng") // region stripped
+        XCTAssertNil(MP4SegmentMuxer.iso639_2(fromBCP47: nil))
+    }
 }
