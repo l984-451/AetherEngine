@@ -74,6 +74,56 @@ A single packet that carries multiple rects (PGS often emits signs/songs at the 
 
 Subtitle cues land in raw source PTS. On the native path, AVPlayer's HLS clock sits at `source_pts - producer.videoShiftPts` (the producer applies a per-session shift to align the first segment's tfdt with the playlist origin, and the shift can change on every restart). Render the overlay against `player.sourceTime` so cues match the spoken audio regardless of which producer session is active.
 
+### Native subtitle menu (tx3g / mov_text for PiP, AirPlay, and external display)
+
+Host-rendered subtitle overlays are invisible in Picture-in-Picture, AirPlay, and external-display sessions because those paths render the `AVPlayerLayer` content only; the SwiftUI / UIKit view tree is not composited. The native subtitle track feature solves this by muxing all text subtitle tracks as separate `mov_text` (tx3g) traks directly into the fragmented-MP4 stream so AVFoundation exposes them as a standard legible `AVMediaSelection` group that travels with the stream everywhere `AVPlayer` goes, including PiP and AirPlay.
+
+**Opt-in.** The feature is off by default (`LoadOptions.prepareNativeSubtitles = false`). When disabled, the muxer output is byte-identical to the prior behavior and `AVPlayerViewController` shows no subtitle menu.
+
+**All text tracks, not just the active one.** When `prepareNativeSubtitles` is `true` and the title has text subtitle tracks (embedded or sidecar), the engine declares one `mov_text` trak in the `init.mp4` moov per text track, each language-tagged (ISO 639-2), all with `disposition:default=0`. AVFoundation's legible group exposes every track as a selectable option. None is auto-displayed (`defaultOption` is `nil`); the host or the user's native AVPlayer menu chooses when to engage one. A single side-demuxer decode pass decodes all text streams in parallel into per-track bounded stores; memory is bounded by total cue count across all tracks.
+
+**Scope and format coverage.** Works on VOD with embedded text subtitles and sidecar files (SRT / VTT / ASS). Covers all SDR, HDR10, HLG, and Dolby Vision sources uniformly, including DV Profile 5 (which has no HLS master playlist, ruling out WebVTT in-manifest tracks). Bitmap subtitles (PGS / DVB / DVD) cannot become native text tracks; they remain host-rendered only. Live sources are out of scope for this release.
+
+**Rich ASS styling note.** Every native track carries plain text (ASS/SSA markup stripped, same as every other text format). Rich ASS styling (positions, speaker colours, karaoke) is still host-rendered inline via `LoadOptions.preserveASSMarkup`; the native track in PiP / AirPlay falls back to the system caption style.
+
+**Timing.** Cue PTS values written to the `mov_text` tracks are on the AVPlayer clock axis (`source_pts - producer.videoShiftPts`), so they stay in sync with the displayed frame regardless of producer restarts or seeks.
+
+**Selection: native menu.** AVPlayer's built-in legible menu enumerates all language-tagged tracks automatically. No host code is required for that path; selection works in PiP and AirPlay without any additional wiring.
+
+**Selection: host-driven API.** Three members on `AetherEngine` drive the native subtitle menu programmatically:
+
+```swift
+// true once cues from at least one text track are decoded into the native stores
+engine.$nativeSubtitleRenditionAvailable   // @Published var Bool
+
+// ordered list of all native mov_text tracks (ordinal, language tag, display name)
+engine.$nativeSubtitleTracks               // @Published var [NativeSubtitleTrack]
+
+// select a track by ordinal (nil deselects all); matches by language tag, positional fallback
+engine.setNativeSubtitleSelected(track ordinal: Int?)
+```
+
+`NativeSubtitleTrack` carries `.ordinal` (position in the muxer declaration), `.language` (ISO 639-2 tag), and `.displayName` (localized name suitable for a picker label).
+
+The recommended host pattern for PiP / AirPlay:
+
+1. Observe `$nativeSubtitleRenditionAvailable` (waits for the first cues to be ready before activating).
+2. On entering PiP / AirPlay / external display: call `setNativeSubtitleSelected(track: ordinal)` with the ordinal that matches the currently active inline track, and hide the host overlay.
+3. On leaving: call `setNativeSubtitleSelected(track: nil)` and re-enable the host overlay.
+
+This avoids double subtitles during inline playback (where the host overlay is already painting them) and ensures the user sees subtitles the moment the stream is mirrored or sent to PiP.
+
+**Device-verification checklist** (required before tagging a release):
+
+- Native menu lists every subtitle language with correct labels in AVPlayer's standard legible picker.
+- Selecting a language from the native menu displays it; switching languages (including in PiP) works.
+- Inline host ASS rendering unchanged: rich styling intact, no regression from the all-tracks decode pass.
+- No double subtitles while inline; no track is auto-displayed on session start.
+- Timing: no constant offset between audio and subtitle cues.
+- SDR, HDR10, and Dolby Vision picture behavior byte-identical to a session with `prepareNativeSubtitles = false` (the tx3g traks must not perturb video or audio).
+- DV Profile 5 source with a text subtitle: subtitle works via the native menu.
+- Memory bounded by total cue count across all tracks (not per-track allocation that grows with track count).
+
 ### Authored ASS styling
 
 Hosts that render authored ASS styling themselves (positioning, speaker colours, karaoke) opt out of the stripping with `LoadOptions(preserveASSMarkup: true)`: cues then carry the raw event line (override tags, style references, escapes intact), the script header (`[Script Info]` + `[V4+ Styles]`) is surfaced, and `engine.fontAttachments` carries the container's embedded fonts (TTF / OTF) for the renderer's font directory. `ASSScriptBuilder` reassembles raw event cues + header into a complete script for whole-file renderers such as swift-ass-renderer's `loadTrack(content:)`, hardened against real-world Matroska tracks (synthesized `[Events]` section, NUL stripping, content-keyed dedupe since real files hardcode `ReadOrder: 0`).

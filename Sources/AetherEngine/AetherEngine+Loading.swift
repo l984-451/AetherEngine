@@ -92,10 +92,18 @@ extension AetherEngine {
                 guard let self = self else { return }
                 self.nativeClockSeconds = value
                 self.clock.currentTime = value
-                self.clock.sourceTime = value
+                // `sourceTime` owned by the `$renderedTime` sink below so it
+                // tracks the picture across a seek (issue #49); shift is 0 on
+                // this direct-remote path, so it equals `currentTime` in
+                // steady playback.
                 if self.isLive {
                     self.publishLiveWindow(edgeSessionTime: host.seekableEnd)
                 }
+            }
+            .store(in: &nativeCancellables)
+        host.$renderedTime
+            .sink { [weak self] value in
+                self?.clock.sourceTime = value
             }
             .store(in: &nativeCancellables)
         startLiveWindowTimer(host: host)
@@ -257,7 +265,9 @@ extension AetherEngine {
                 // restart that landed past the planned keyframe), rather than
                 // lagging until the next periodic time tick.
                 self.clock.currentTime = self.nativeClockSeconds + seconds
-                self.clock.sourceTime = self.currentTime
+                // `sourceTime` re-folds on the next `$renderedTime` tick
+                // against the new shift; leaving it to that sink keeps it on
+                // the rendered position rather than this optimistic clock (#49).
             }
         }
         session.onSeekStateChanged = { [weak self] inFlight, playlistTime in
@@ -321,6 +331,43 @@ extension AetherEngine {
                 self.liveSourceReset.send()
             }
         }
+        // Enable the native mov_text track when the session was loaded with
+        // prepareNativeSubtitles and the source has at least one non-bitmap
+        // subtitle stream (#55). The flag gates whether allocateMuxer injects
+        // a SubtitleConfig; it must be set before start() allocates the first
+        // muxer instance. TrackInfo.codec is the lower-case libavcodec name
+        // string (e.g. "subrip", "ass", "mov_text"). Bitmap codecs are
+        // "hdmv_pgs_subtitle", "dvb_subtitle", "dvd_subtitle", "xsub".
+        let bitmapCodecNames: Set<String> = [
+            "hdmv_pgs_subtitle", "dvb_subtitle", "dvd_subtitle", "xsub"
+        ]
+        // Build the ordered native-track table: every non-bitmap subtitle
+        // stream, in source order. Each becomes one mov_text track in the
+        // muxer init moov (#55, all-tracks). Sidecar entries are appended
+        // at runtime when a sidecar is selected, so the load-time table is
+        // embedded-only here. `track.id` is the source AVStream index;
+        // `track.language` is the stream's metadata language tag (ISO 639-2).
+        let textTracks = subtitleTracks.filter { !bitmapCodecNames.contains($0.codec) }
+        nativeSubtitleTrackTable = textTracks.map { track in
+            NativeSubtitleTrackEntry(sourceStreamIndex: track.id, language: track.language)
+        }
+        // Publish the public NativeSubtitleTrack list from the load-time table.
+        // `displayName` is the locale's language name for known tags, otherwise
+        // "Subtitle <n>" (1-based for readability). The Locale lookup uses the
+        // engine host's current locale, same as AVKit's built-in track labels.
+        nativeSubtitleTracks = nativeSubtitleTrackTable.enumerated().map { ordinal, entry in
+            let name: String
+            if let lang = entry.language,
+               let localizedName = Locale.current.localizedString(forIdentifier: lang) {
+                name = localizedName
+            } else {
+                name = "Subtitle \(ordinal + 1)"
+            }
+            return NativeSubtitleTrack(ordinal: ordinal, language: entry.language, displayName: name)
+        }
+        let hasTextSubtitleTrack = !nativeSubtitleTrackTable.isEmpty
+        session.enableNativeSubtitleTrackForSession = loadedOptions.prepareNativeSubtitles && hasTextSubtitleTrack
+
         // AVPlayer HLS playback over the loopback HTTP server. Detach
         // the synchronous network I/O inside `session.start()` (opens
         // its own Demuxer + prewarm seek = another ~1-3 s on slow CDN)
@@ -337,6 +384,26 @@ extension AetherEngine {
             try checkLoadCurrent(generation)
         }
         self.nativeVideoSession = session
+
+        // Native mov_text rendition, all tracks (#55). When the session is
+        // enabled, allocate one cue store per declared text track, wire the
+        // set onto the session (so makeProducer re-threads it across
+        // restarts) and the running producer, then launch the dedicated
+        // multi-decode reader that fills every store in one side-demuxer
+        // pass. This is SEPARATE from the inline single-track decode the
+        // host drives via selectSubtitleTrack; the inline path keeps owning
+        // `subtitleCues` (host overlay) and is untouched here.
+        if session.enableNativeSubtitleTrackForSession, !nativeSubtitleTrackTable.isEmpty {
+            let stores = nativeSubtitleTrackTable.map { _ in NativeSubtitleCueStore() }
+            let shift = session.playlistShiftSeconds
+            stores.forEach { $0.setShiftSeconds(shift) }
+            let languages = nativeSubtitleTrackTable.map { $0.language }
+            session.nativeSubtitleCueStoresForSession = stores
+            session.nativeSubtitleLanguagesForSession = languages
+            session.producer?.subtitleCueStores = stores
+            session.producer?.nativeSubtitleLanguages = languages
+            startNativeSubtitleReaders(url: url, stores: stores)
+        }
 
         // Reuse the existing native host across a native->native reload
         // (episode change, audio-track switch) so the AVPlayer instance,
@@ -392,7 +459,9 @@ extension AetherEngine {
                     self.playlistShiftSeconds = active.shift
                 }
                 self.clock.currentTime = value + self.playlistShiftSeconds
-                self.clock.sourceTime = self.currentTime
+                // `sourceTime` is owned by the `$renderedTime` sink below so
+                // it tracks the picture, not this (optimistic, seek-suppressed)
+                // clock; the two agree in steady playback (issue #49).
                 // Live: publish the DVR window surfaces on every tick. The
                 // edge must sit on the SAME session axis as the playhead. The
                 // playhead is folded as host.currentTime + playlistShiftSeconds
@@ -403,6 +472,24 @@ extension AetherEngine {
                 if self.isLive {
                     self.publishLiveWindow(edgeSessionTime: host.seekableEnd + self.playlistShiftSeconds)
                 }
+            }
+            .store(in: &nativeCancellables)
+        // `sourceTime` rides AVPlayer's actually-rendered position, folded
+        // onto source PTS with the same seam-resolved shift as the playhead.
+        // It is published even while a seek is in flight (the `$currentTime`
+        // sink above is suppressed then), so frame-accurate consumers follow
+        // the on-screen picture instead of the optimistic scrub target during
+        // a not-yet-landed seek / rebuffer (issue #49).
+        host.$renderedTime
+            .sink { [weak self] value in
+                guard let self = self else { return }
+                let shift = self.liveShiftSeams.last(where: { value >= $0.activateAt })?.shift
+                    ?? self.playlistShiftSeconds
+                self.clock.sourceTime = value + shift
+                // Buffered frontier on the same folded source axis: end of
+                // AVPlayer's contiguous loaded span, shifted like the playhead.
+                // Clamp so it never trails the rendered frame (#54).
+                self.clock.bufferedPosition = max(value + shift, host.bufferedEnd + shift)
             }
             .store(in: &nativeCancellables)
         startLiveWindowTimer(host: host)
@@ -550,6 +637,9 @@ extension AetherEngine {
                 guard let self = self else { return }
                 self.clock.currentTime = value
                 self.clock.sourceTime = value
+                // SW buffered frontier: newest demuxed source PTS in session
+                // time, clamped to never trail the playhead (#54).
+                self.clock.bufferedPosition = max(value, host.bufferedSessionTime)
             }
             .store(in: &softwareCancellables)
         wireCommonHostSinks(
@@ -618,6 +708,9 @@ extension AetherEngine {
                 guard let self = self else { return }
                 self.clock.currentTime = value
                 self.clock.sourceTime = value
+                // Audio path exposes no buffer-ahead surface; mirror the
+                // playhead so bufferedPosition stays defined and resets (#54).
+                self.clock.bufferedPosition = value
             }
             .store(in: &audioCancellables)
         wireCommonHostSinks(

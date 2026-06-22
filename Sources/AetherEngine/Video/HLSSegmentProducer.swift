@@ -58,13 +58,19 @@ final class HLSSegmentProducer: @unchecked Sendable {
         /// where the engine has chosen to play a DV source as plain
         /// HEVC HDR10 (P7 on non-DV panel, P8.2). See
         /// `MP4SegmentMuxer.VideoConfig.stripDolbyVisionMetadata`.
-        /// Mutually exclusive with `convertP7ToProfile81`.
+        /// Mutually exclusive with `rewriteDoviConfigTo81`.
         let stripDolbyVisionMetadata: Bool
-        /// Rewrite the `dvcC` config to Profile 8.1 and convert each
-        /// video packet's RPU from P7 to 8.1 in the pump loop. True
-        /// only for HEVC P7 on a DV-capable panel. See
-        /// `MP4SegmentMuxer.VideoConfig.convertP7ToProfile81`.
+        /// Convert each video packet's RPU from P7 to 8.1 in the pump
+        /// loop. True only for HEVC P7 on a DV-capable panel. Gates the
+        /// per-packet `DoviRpuConverter` work only; the container `dvcC`
+        /// rewrite is a separate concern driven by `rewriteDoviConfigTo81`
+        /// (P7 sets both, the malformed-P8.6 route sets only the latter).
         let convertP7ToProfile81: Bool
+        /// Rewrite the container `dvcC` config record to a valid P8.1 in
+        /// `init.mp4`. Forwarded to
+        /// `MP4SegmentMuxer.VideoConfig.rewriteDoviConfigTo81`. True for
+        /// the P7-on-DV-panel and malformed-P8.6-on-DV-panel routes.
+        let rewriteDoviConfigTo81: Bool
         /// Optional color-signaling override forwarded to the muxer.
         /// See `MP4SegmentMuxer.ColorOverride`.
         let colorOverride: MP4SegmentMuxer.ColorOverride?
@@ -79,6 +85,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
             codecTagOverride: String?,
             stripDolbyVisionMetadata: Bool = false,
             convertP7ToProfile81: Bool = false,
+            rewriteDoviConfigTo81: Bool = false,
             colorOverride: MP4SegmentMuxer.ColorOverride? = nil,
             extradataOverride: [UInt8]? = nil
         ) {
@@ -87,6 +94,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
             self.codecTagOverride = codecTagOverride
             self.stripDolbyVisionMetadata = stripDolbyVisionMetadata
             self.convertP7ToProfile81 = convertP7ToProfile81
+            self.rewriteDoviConfigTo81 = rewriteDoviConfigTo81
             self.colorOverride = colorOverride
             self.extradataOverride = extradataOverride
         }
@@ -899,6 +907,51 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// reopen-with-backoff recovery when the source was lost.
     var onPumpFinished: (@Sendable (PumpExitReason) -> Void)?
 
+    /// Ordinal-indexed cue stores for native mov_text subtitle injection (#55).
+    /// Each entry corresponds to one subtitle track; the ordinal matches
+    /// `MP4SegmentMuxer.subtitleOutputStreamIndices`. Empty = disabled;
+    /// all sessions without subtitle tracks are byte-identical to v1.
+    var subtitleCueStores: [NativeSubtitleCueStore] = []
+
+    /// BCP-47 language tags parallel to `subtitleCueStores` (ordinal-indexed).
+    /// Set by the engine alongside the stores; used to build the per-track
+    /// `SubtitleConfig` array that `allocateMuxer` passes to the muxer.
+    /// Nil entry = no language box for that track.
+    var nativeSubtitleLanguages: [String?] = []
+
+    /// When true, `allocateMuxer` passes `SubtitleConfig` entries to
+    /// `MP4SegmentMuxer` so the init moov declares mov_text tracks.
+    /// Must be set BEFORE the first call to `allocateMuxer` (i.e.
+    /// before the pump loop runs). Set by the engine based on
+    /// `LoadOptions.prepareNativeSubtitles` and whether the probe
+    /// found at least one non-bitmap subtitle stream (#55).
+    var enableNativeSubtitleTrack: Bool = false
+
+    /// Turn a segment window's cues into a contiguous mov_text sample
+    /// plan: empty samples fill the gaps so the text track has no holes.
+    /// Cues are assumed clipped and sorted by NativeSubtitleCueStore.cuesInWindow.
+    /// `window` and `cues` are all on the same axis (AVPlayer-axis seconds).
+    static func movTextSamples(
+        forWindow window: (start: Double, end: Double),
+        cues: [(start: Double, end: Double, text: String)]
+    ) -> [(payload: Data, pts: Double, duration: Double)] {
+        var out: [(payload: Data, pts: Double, duration: Double)] = []
+        var cursor = window.start
+        for c in cues {
+            let cs = max(c.start, window.start)
+            let ce = min(c.end, window.end)
+            if cs > cursor {
+                out.append((MovTextSampleBuilder.emptySample(), cursor, cs - cursor))
+            }
+            out.append((MovTextSampleBuilder.sample(text: c.text), cs, max(0, ce - cs)))
+            cursor = ce
+        }
+        if cursor < window.end {
+            out.append((MovTextSampleBuilder.emptySample(), cursor, window.end - cursor))
+        }
+        return out
+    }
+
     /// Marks the FIRST segment this producer opens as discontinuous
     /// (`#EXT-X-DISCONTINUITY`). Set by the engine's live-reopen path:
     /// the fresh source connection joins the broadcast at "now", so the
@@ -1288,7 +1341,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
             // own codecpar carries its signaling, so don't force the
             // program's values onto it.
             stripDolbyVisionMetadata: isReinit ? false : videoConfig.stripDolbyVisionMetadata,
-            convertP7ToProfile81: isReinit ? false : videoConfig.convertP7ToProfile81,
+            rewriteDoviConfigTo81: isReinit ? false : videoConfig.rewriteDoviConfigTo81,
             colorOverride: isReinit ? nil : videoConfig.colorOverride,
             extradataOverride: isReinit ? nil : videoConfig.extradataOverride
         )
@@ -1297,11 +1350,27 @@ final class HLSSegmentProducer: @unchecked Sendable {
         }
 
         do {
+            // Pass one SubtitleConfig per cue store when native mov_text tracks are
+            // requested (#55). Each entry carries the BCP-47 language tag so the
+            // muxer can label the track for AVFoundation's media-selection menu.
+            // Only the first (non-reinit) muxer declares the tracks; a re-init at
+            // an SSAI seam keeps the original track layout (empty array).
+            let muxerSubtitles: [MP4SegmentMuxer.SubtitleConfig] = {
+                guard !isReinit && enableNativeSubtitleTrack && !subtitleCueStores.isEmpty else {
+                    return []
+                }
+                return subtitleCueStores.indices.map { i in
+                    MP4SegmentMuxer.SubtitleConfig(
+                        language: i < nativeSubtitleLanguages.count ? nativeSubtitleLanguages[i] : nil
+                    )
+                }
+            }()
             let muxer = try MP4SegmentMuxer(
                 initialSegmentIndex: initialSegmentIndex,
                 sessionDir: cache.sessionDir,
                 video: muxerVideo,
                 audio: muxerAudio,
+                subtitles: muxerSubtitles,
                 onInitCaptured: { [weak self] initBytes in
                     guard let self = self else { return }
                     if isReinit {
@@ -1339,12 +1408,74 @@ final class HLSSegmentProducer: @unchecked Sendable {
         }
     }
 
+    /// Compute the [start, end) time window for a VOD or live segment
+    /// on the AVPlayer axis (seconds), for subtitle cue injection.
+    ///
+    /// VOD: derives start and end from the pre-planned `segmentBoundaries`
+    /// array (source video TB ticks), then converts to AVPlayer-axis
+    /// seconds using `videoShiftPts`. Returns nil if the shift is not yet
+    /// known or the index is out of bounds.
+    ///
+    /// Live: reads from `liveSegmentStartByIndex`, which already stores
+    /// AVPlayer-axis seconds (the cutter records the post-shift `pts`
+    /// converted to seconds). Returns nil when either boundary is absent.
+    private func segmentWindowAVPlayerSeconds(
+        segIdx: Int,
+        nextSegIdx: Int
+    ) -> (start: Double, end: Double)? {
+        if isLive {
+            guard let t0 = liveSegmentStartByIndex[segIdx],
+                  let t1 = liveSegmentStartByIndex[nextSegIdx]
+            else { return nil }
+            return (t0, t1)
+        } else {
+            guard videoShiftPts != Int64.min, sourceVideoTbSeconds > 0 else { return nil }
+            let i = segIdx - baseIndex
+            let iNext = nextSegIdx - baseIndex
+            guard i >= 0, iNext < segmentBoundaries.count else { return nil }
+            let t0 = Double(segmentBoundaries[i] - videoShiftPts) * sourceVideoTbSeconds
+            let t1 = Double(segmentBoundaries[iNext] - videoShiftPts) * sourceVideoTbSeconds
+            return (t0, t1)
+        }
+    }
+
     /// Cross a fragment boundary on the existing single-session muxer:
     /// trigger a fragment cut (= flush queued packets + close the
     /// completed segment's fd + open the next segment's fd), then
     /// apply the cache-window backpressure for the new index.
     private func advanceMuxer(to newIdx: Int) -> MP4SegmentMuxer? {
         guard let muxer = currentMuxer else { return nil }
+
+        // Native mov_text subtitle injection (#55): drain cues for the
+        // segment being finalized and write mov_text samples before the
+        // cut so AVPlayer sees them in the same fragment as the A/V data.
+        // Fully gated on subtitleCueStores being non-empty; no-op (and
+        // byte-identical output) for all video/audio-only sessions.
+        // The window is computed once and shared across all tracks.
+        if !subtitleCueStores.isEmpty {
+            let segWindow = segmentWindowAVPlayerSeconds(
+                segIdx: currentMuxerSegmentIndex, nextSegIdx: newIdx)
+            if let (t0, t1) = segWindow, t1 > t0 {
+                var totalSamples = 0
+                for (ordinal, store) in subtitleCueStores.enumerated() {
+                    let cues = store.cuesInWindow(start: t0, end: t1)
+                    let plan = Self.movTextSamples(forWindow: (t0, t1), cues: cues)
+                    for s in plan {
+                        muxer.writeSubtitleSample(s.payload,
+                                                  trackOrdinal: ordinal,
+                                                  ptsSeconds: s.pts,
+                                                  durationSeconds: s.duration)
+                    }
+                    totalSamples += plan.count
+                }
+                EngineLog.emit(
+                    "[HLSSegmentProducer] subtitle inject seg-\(currentMuxerSegmentIndex) "
+                    + "window=[\(String(format: "%.3f", t0)), \(String(format: "%.3f", t1)))s "
+                    + "tracks=\(subtitleCueStores.count) totalSamples=\(totalSamples)",
+                    category: .engine, level: .verbose
+                )
+            }
+        }
 
         if let result = muxer.cutFragmentForNextSegment(newIdx) {
             EngineLog.emit(

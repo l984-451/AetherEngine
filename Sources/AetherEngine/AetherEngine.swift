@@ -245,11 +245,11 @@ public final class AetherEngine: ObservableObject {
     @Published public internal(set) var activeAudioDecoder: String?
 
     /// Decoded subtitle cues for the active subtitle source. Populated
-    /// by `selectSidecarSubtitle(url:)` only — embedded subtitle
-    /// streams in the source travel through HLSVideoEngine into the
-    /// fMP4 wrapper but aren't decoded back to text on this side yet
-    /// (AVMediaSelection wiring is a tracked follow-up). Sidecar SRT
-    /// works end-to-end.
+    /// by `selectSidecarSubtitle(url:)` and `selectSubtitleTrack(index:)`
+    /// (embedded streams via a side demuxer). When `LoadOptions.prepareNativeSubtitles`
+    /// is set, cues also flow into the `NativeSubtitleCueStore` so the
+    /// muxer can inject them into the mov_text track. Native text-subtitle
+    /// selection is available via `setNativeSubtitleSelected(track:)`.
     @Published public internal(set) var subtitleCues: [SubtitleCue] = []
     /// True while a sidecar file is being downloaded + decoded.
     @Published public internal(set) var isLoadingSubtitles: Bool = false
@@ -277,6 +277,24 @@ public final class AetherEngine: ObservableObject {
     @Published public internal(set) var isLoadingSecondarySubtitles: Bool = false
     /// True when a secondary subtitle source is active.
     @Published public internal(set) var isSecondarySubtitleActive: Bool = false
+
+    /// True once the native mov_text subtitle track has at least one
+    /// cue available in the `NativeSubtitleCueStore` (#55). Meaningful
+    /// only when `LoadOptions.prepareNativeSubtitles` was set and a
+    /// text subtitle track was selected. Hosts can use this to decide
+    /// whether to surface the native AVMediaSelection picker (PiP /
+    /// AirPlay). Cleared by `clearSubtitle` and `stopInternal`.
+    @Published public internal(set) var nativeSubtitleRenditionAvailable: Bool = false
+
+    /// The ordered list of native mov_text subtitle tracks available on the
+    /// current session (#55). One entry per text subtitle stream declared in
+    /// the muxer init moov, in ordinal order. Populated from
+    /// `nativeSubtitleTrackTable` after the session starts and
+    /// `LoadOptions.prepareNativeSubtitles` was set; empty otherwise.
+    /// Cleared on stop and at the start of each `load()`. Hosts use this
+    /// list to populate a track picker and call
+    /// `setNativeSubtitleSelected(track:)` with the chosen ordinal.
+    @Published public internal(set) var nativeSubtitleTracks: [NativeSubtitleTrack] = []
 
     /// True while the active session is a live stream (the host set
     /// `LoadOptions.isLive = true` at load time). Hosts use this to
@@ -596,6 +614,20 @@ public final class AetherEngine: ObservableObject {
         activeProducerShiftSeconds - playlistShiftSeconds
     }
 
+    /// `currentTime - sourceTime`: how far the optimistic scrub clock leads
+    /// the actually-rendered frame position. 0 in steady playback (both ride
+    /// the same fold). Positive while a native seek is in flight or the
+    /// loopback source is rebuffering after a seek: `currentTime` holds the
+    /// seek target while the picture stays parked, so `sourceTime` (driven by
+    /// AVPlayer's reported position) trails it. This is the divergence
+    /// rrgomes measured on-device for AetherEngine#49 (the published clock
+    /// running ahead of AVPlayer's own clock under a sustained seek rate),
+    /// distinct from `frameAhead` (the producer-shift fold, which reads 0
+    /// because the producer shift is correct). Diagnostics only.
+    public var clockLeadSeconds: Double {
+        clock.currentTime - clock.sourceTime
+    }
+
     /// Monotonic load/stop generation. Bumped by every `stopInternal`
     /// (which runs at the head of every `load()`, `stop()`, and audio
     /// reload), captured by `load()`/`reloadWithAudioOverride` after
@@ -649,12 +681,22 @@ public final class AetherEngine: ObservableObject {
     /// reloading the live playlist during a pause).
     var liveWindowTimerTask: Task<Void, Never>?
 
-    /// Source PTS of the currently displayed frame. Equal to `currentTime`
-    /// on every path now that the native clock is unified onto source time;
-    /// kept as a stable alias for callers that want to express source-
-    /// timeline intent explicitly (subtitle overlay, side-demuxer seek).
+    /// Source PTS of the currently displayed frame. Tracks AVPlayer's
+    /// actually-rendered position on the native path, so it equals
+    /// `currentTime` in steady playback but holds the on-screen frame while a
+    /// seek is in flight or the loopback source rebuffers, instead of jumping
+    /// to the seek target the scrub clock shows (issue #49). Use it wherever
+    /// you need the picture's position rather than the scrub intent (subtitle
+    /// overlay, side-demuxer re-arm). On the SW / audio paths (shift 0, seeks
+    /// resolve synchronously) it equals `currentTime` always.
     /// Forwarder; for push updates subscribe to `clock.$sourceTime`.
     public var sourceTime: Double { clock.sourceTime }
+
+    /// Source-axis position (seconds) up to which content is buffered
+    /// ahead of the playhead (AetherEngine#54). Read-only forwarder; for
+    /// push updates subscribe to `clock.$bufferedPosition`. See
+    /// `clock.bufferedPosition` for per-path semantics.
+    public var bufferedPosition: Double { clock.bufferedPosition }
 
     /// The `LoadOptions` the host passed for the current session.
     /// Replayed on every internal reopen of the source URL
@@ -738,6 +780,34 @@ public final class AetherEngine: ObservableObject {
     /// reconnect loop otherwise survives stop()/track switches.
     var activeSubtitleSideDemuxer: Demuxer?
 
+    /// One entry per native text subtitle track, in the order the muxer
+    /// declares its mov_text streams (#55, all-tracks). Built at load time
+    /// from the probed `subtitleTracks` (non-bitmap codecs, source order),
+    /// then sidecar entries appended as they are selected at runtime.
+    /// `sourceStreamIndex` is the source AVStream index for embedded tracks
+    /// (nil for sidecars); `language` is the track's metadata language tag
+    /// (ISO 639-2, e.g. "eng"). The ordinal is the entry's position in the
+    /// array. Empty => native subtitles stay disabled (the existing gating
+    /// in `enableNativeSubtitleTrackForSession`). Cleared on stop/load.
+    struct NativeSubtitleTrackEntry: Sendable {
+        let sourceStreamIndex: Int?
+        let language: String?
+    }
+    var nativeSubtitleTrackTable: [NativeSubtitleTrackEntry] = []
+
+    /// Detached reader that decodes EVERY embedded text subtitle stream in
+    /// ONE side-demuxer pass into its ordinal's `NativeSubtitleCueStore`
+    /// (#55, all-tracks). Separate from and parallel to the inline single-
+    /// track reader (`embeddedSubtitleTask`), which still drives
+    /// `subtitleCues` for the active track with full styling. Cancelled on
+    /// stop / clear / load.
+    var nativeSubtitleReadersTask: Task<Void, Never>?
+
+    /// Abort handle for the native multi-decode side demuxer. `markClosed`
+    /// unblocks a read parked in the AVIO reconnect loop so the reader exits
+    /// promptly on stop / clear (mirrors `activeSubtitleSideDemuxer`).
+    var nativeSubtitleReadersDemuxer: Demuxer?
+
     /// Cap the per-session subtitle event diagnostic logs so the in-
     /// app overlay stays readable. Reset on `load()` so each new
     /// session gets a fresh budget.
@@ -775,7 +845,63 @@ public final class AetherEngine: ObservableObject {
     /// and TCP backpressure (the 16 MB window high-water) pauses the
     /// transfer server-side, so the second connection throttles to
     /// playback rate instead of line rate.
+    ///
+    /// CRITICAL INVARIANT for native tx3g subtitle track (#55): this value
+    /// MUST remain greater than the producer's buffer-ahead distance
+    /// (bufferAheadSegments * targetSegmentDurationSeconds, currently 10 * 4 = 40s).
+    /// The embedded subtitle reader parks at this horizon, and the producer
+    /// drains decoded cues from the store when cutting each segment. If the
+    /// buffer-ahead distance ever exceeds this value, segments cut beyond
+    /// the park horizon would have no decoded cues, causing gaps in the native
+    /// subtitle track (inline host rendering is unaffected). Raising
+    /// bufferAheadSegments or targetSegmentDurationSeconds requires verifying
+    /// this constraint is maintained.
     nonisolated static let embeddedSubtitleReadAheadSeconds: Double = 90
+
+    /// Source-time span (seconds) a pending embedded-subtitle event batch may
+    /// cover before it is flushed to the MainActor. The embedded ASS reader
+    /// (#56) used to publish one decoded event per awaited `MainActor.run`
+    /// hop; on packet-dense tracks (hundreds of events clustered over a few
+    /// source seconds) those hops serialise the demux loop against the host's
+    /// on-MainActor ASS renderer, collapsing throughput so the published cues
+    /// fall far behind the playhead. Coalescing events that fall within this
+    /// window into a single hop decouples demux speed from MainActor pressure.
+    /// Kept small so a sparse track (one cue every few source seconds) still
+    /// flushes per event with no added latency, and well under the 2s seek
+    /// pre-roll so the first cue lands before the playhead reaches it.
+    nonisolated static let embeddedSubtitleFlushWindowSeconds: Double = 0.5
+
+    /// Hard cap on pending events per flush. The decisive throttle for the
+    /// pathological same-timestamp burst (span stays 0, so the window rule
+    /// never trips) and for NOPTS packets that yield no demux clock at all.
+    /// The #56 sample stacks 1534 ASS events on a single pts (5.207s); at this
+    /// cap that cluster publishes in ~12 hops instead of 1534. Sized large
+    /// because a same-pts burst is read far ahead of the playhead, so a bigger
+    /// batch costs no display latency, only fewer (cheaper) MainActor hops.
+    nonisolated static let embeddedSubtitleFlushCountCap = 128
+
+    /// Decide whether the pending embedded-subtitle event batch should be
+    /// flushed to the MainActor. Pure so the boundary behaviour is unit-tested
+    /// (`SubtitleBatchFlushTests`) without standing up a demuxer.
+    ///
+    /// - `batchSpanSeconds`: demux position minus the source time of the
+    ///   batch's first event, or nil when no usable clock exists yet (NOPTS).
+    ///
+    /// Flushes when the batch spans at least `windowSeconds` of source time
+    /// (the common case: the demux clock advances past the window as the reader
+    /// streams forward) or reaches `countCap` (the same-timestamp / NOPTS
+    /// fallback). An empty batch never flushes.
+    nonisolated static func shouldFlushSubtitleBatch(
+        pendingCount: Int,
+        batchSpanSeconds: Double?,
+        windowSeconds: Double = AetherEngine.embeddedSubtitleFlushWindowSeconds,
+        countCap: Int = AetherEngine.embeddedSubtitleFlushCountCap
+    ) -> Bool {
+        guard pendingCount > 0 else { return false }
+        if pendingCount >= countCap { return true }
+        if let span = batchSpanSeconds, span >= windowSeconds { return true }
+        return false
+    }
 
     // MARK: - Init
 
@@ -959,12 +1085,15 @@ public final class AetherEngine: ObservableObject {
         state = .loading
         isBuffering = false
         clock.currentTime = 0
+        clock.bufferedPosition = 0
         nativeClockSeconds = 0
         duration = 0
         clock.progress = 0
         audioTracks = []
         subtitleTracks = []
         subtitleRenditions = []
+        nativeSubtitleTrackTable = []
+        nativeSubtitleTracks = []
         metadata = nil
         fontAttachments = []
         subtitleCueDiagnosticCount = 0
@@ -1687,9 +1816,11 @@ public final class AetherEngine: ObservableObject {
             // Publish the target up front so the playhead holds it while the
             // host suppresses the periodic observer's stale pre-seek reads,
             // then await the real landing before flipping back to .playing.
+            // Only `currentTime` (the scrub clock) takes the optimistic target;
+            // `sourceTime` stays on the rendered frame via the `$renderedTime`
+            // sink until the seek actually lands (issue #49).
             nativeClockSeconds = clockTarget
             clock.currentTime = target
-            clock.sourceTime = target
             await nativeHost?.seek(to: clockTarget)
             guard seekGeneration == seekGen else { return }
             nativeClockSeconds = clockTarget
@@ -1716,9 +1847,10 @@ public final class AetherEngine: ObservableObject {
         // the clock only at finalize below, as before.
         let nativeOnly = !audioAVPlayerActive && audioHost == nil && softwareHost == nil && nativeHost != nil
         if nativeOnly {
+            // Optimistic scrub clock only; `sourceTime` holds the rendered
+            // frame via the `$renderedTime` sink until the seek lands (#49).
             nativeClockSeconds = clockTarget
             clock.currentTime = target
-            clock.sourceTime = target
         }
         if audioAVPlayerActive, let host = audioAVPlayerHost {
             await host.seek(to: clockTarget)
@@ -1791,6 +1923,7 @@ public final class AetherEngine: ObservableObject {
         stopInternal()
         state = .idle
         clock.currentTime = 0
+        clock.bufferedPosition = 0
         clock.progress = 0
         // Published-surface hygiene: without these, the PREVIOUS
         // session's metadata/track lists/duration/format survive until
@@ -2104,6 +2237,7 @@ public final class AetherEngine: ObservableObject {
         liveShiftSeams.removeAll()
         nativeClockSeconds = 0
         clock.sourceTime = 0
+        clock.bufferedPosition = 0
         isBuffering = false
         // A stop landing mid-seek must not strand the in-flight signal: a
         // late host completion or restart-drain callback is dropped by the
@@ -2124,6 +2258,10 @@ public final class AetherEngine: ObservableObject {
         subtitleCues = []
         sidecarASSHeader = nil
         isLoadingSubtitles = false
+        nativeSubtitleTrackTable = []
+        nativeSubtitleTracks = []
+        cancelNativeSubtitleReaders()
+        nativeSubtitleRenditionAvailable = false
         cancelSidecarTask(channel: .secondary)
         cancelEmbeddedSubtitleReader(channel: .secondary)
         activeSecondaryEmbeddedSubtitleStreamIndex = -1
@@ -2150,10 +2288,18 @@ public final class AetherEngine: ObservableObject {
         #if os(iOS) || os(tvOS)
         let nc = NotificationCenter.default
 
-        // Pause VIDEO when the app backgrounds so it doesn't keep streaming
-        // in the background. The host calls `reloadAtCurrentPosition()` from
-        // its own foreground hook to recover from any AVIO invalidation tvOS
-        // may do during suspension.
+        // Tear the VIDEO pipeline DOWN when the app backgrounds, rather than
+        // merely pausing it. Pausing left a live native session frozen across
+        // a multi-hour tvOS suspension: the AVPlayer decode session in the
+        // shared `mediaserverd`, the in-process loopback HLS server sockets,
+        // and the upstream AVIO connection all stayed allocated. On resume
+        // that wedged `mediaserverd` system-wide, every app (including
+        // unrelated ones) could only paint the first frame until the device
+        // was rebooted. `teardownVideoForBackground()` releases the decode
+        // session synchronously so nothing live crosses into suspension; the
+        // host's foreground hook rebuilds via `reloadAtCurrentPosition()`
+        // (which already does a full rebuild on every full-background return,
+        // so resume behaviour is unchanged).
         //
         // AUDIO (music) is the opposite: it is MEANT to keep playing in the
         // background (UIBackgroundModes audio). Pausing it here, or even just
@@ -2171,18 +2317,49 @@ public final class AetherEngine: ObservableObject {
                 guard let self = self else { return }
                 if self.audioAVPlayerActive || self.audioHost != nil { return }
                 guard self.state == .playing || self.state == .paused else { return }
-                self.nativeHost?.pause()
-                // The SW path must pause too: without this a SW session
-                // kept demuxing/decoding/streaming until tvOS suspended
-                // the process, while the published state already said
-                // .paused.
-                self.softwareHost?.pause()
-                self.state = .paused
+                await self.teardownVideoForBackground()
             }
         }
         lifecycleObservers.append(bgObserver)
         #endif
     }
+
+    #if os(iOS) || os(tvOS)
+    /// Release the full video pipeline on app background so nothing live
+    /// crosses into a tvOS process suspension.
+    ///
+    /// `stopInternal` unloads the AVPlayer item (`replaceCurrentItem(nil)`)
+    /// and invalidates the software path's `VTDecompressionSession`
+    /// synchronously, which is what frees the shared `mediaserverd` decode
+    /// session before suspension. `keepNativeHost: true` preserves the
+    /// `NativeAVPlayerHost` and `currentAVPlayer` so AVKit's system
+    /// Now-Playing registration survives the seam (issue #15); the item is
+    /// still unloaded, only the empty player shell is kept.
+    /// `keepCustomReader: true` retains a byte-source reader for the
+    /// foreground reload. `stopInternal` deliberately preserves
+    /// `clock.currentTime`, `loadedURL`, and `loadedOptions`, so the host's
+    /// `reloadAtCurrentPosition()` resumes at the paused position.
+    ///
+    /// A `UIApplication` background-task assertion is held across the
+    /// teardown so the synchronous decode-session release and the loopback
+    /// server's detached socket close (HLSVideoEngine.stop drains the
+    /// producer for up to 3 s before closing its sockets) complete before
+    /// tvOS suspends the process, instead of being frozen mid-flight.
+    @MainActor
+    private func teardownVideoForBackground() async {
+        let app = UIApplication.shared
+        let bgTask = app.beginBackgroundTask(withName: "AetherEngine.bgVideoTeardown")
+        stopInternal(resetDisplayCriteria: false, keepNativeHost: true, keepCustomReader: true)
+        // Mirror the former handler's published state: the session is torn
+        // down but the host will reload + repause on foreground return.
+        state = .paused
+        // Give the loopback server's detached cleanup (<=3 s producer drain,
+        // then synchronous socket shutdown/close) time to land before we
+        // release the assertion and let the process suspend.
+        try? await Task.sleep(nanoseconds: 3_500_000_000)
+        if bgTask != .invalid { app.endBackgroundTask(bgTask) }
+    }
+    #endif
 }
 
 // MARK: - Errors

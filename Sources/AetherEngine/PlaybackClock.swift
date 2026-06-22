@@ -35,11 +35,15 @@ public final class PlaybackClock: ObservableObject {
     /// folded with `playlistShiftSeconds`).
     @Published public internal(set) var currentTime: Double = 0
 
-    /// Source PTS of the currently displayed frame. Equal to
-    /// `currentTime` on every path now that the native clock is
-    /// unified onto source time; kept as a stable alias for callers
-    /// that want to express source-timeline intent explicitly
-    /// (subtitle overlay, side-demuxer seek).
+    /// Source PTS of the currently displayed frame. On the native path
+    /// this rides AVPlayer's actually-rendered position, so it equals
+    /// `currentTime` in steady playback but holds the on-screen frame
+    /// while a seek is in flight or the loopback source rebuffers,
+    /// rather than jumping to the seek target the scrub clock
+    /// (`currentTime`) shows. Frame-accurate consumers (subtitle
+    /// overlay, side-demuxer re-arm) read this so they follow the
+    /// picture and not the scrub intent (issue #49). On the SW / audio
+    /// paths it equals `currentTime` always.
     @Published public internal(set) var sourceTime: Double = 0
 
     /// Fractional progress through the loaded item. Reset to 0 on
@@ -61,4 +65,21 @@ public final class PlaybackClock: ObservableObject {
 
     /// Seconds the playhead trails the live edge. 0 at the edge.
     @Published public internal(set) var behindLiveSeconds: Double = 0
+
+    /// Source-axis position (seconds) up to which the engine has data
+    /// buffered ahead of the playhead (AetherEngine#54). On the SAME
+    /// axis as `sourceTime`, so a host draws a YouTube-style buffer bar
+    /// as `bufferedPosition / duration`. Clamped to never trail the
+    /// rendered frame, so it equals `sourceTime` when nothing ahead is
+    /// buffered or before the first frame.
+    ///
+    /// What "buffered" means per path:
+    /// - **Native AVPlayer** (HLS / direct): end of the contiguous
+    ///   `loadedTimeRanges` span covering the playhead, folded onto the
+    ///   source axis with the same seam shift as `sourceTime`.
+    /// - **Software** (dav1d / libavcodec): the newest source PTS the
+    ///   demuxer has pulled from the (possibly remote) source, i.e. how
+    ///   far ahead bytes have been fetched and demuxed.
+    /// - **Audio**: mirrors `currentTime` (no buffer-ahead surface).
+    @Published public internal(set) var bufferedPosition: Double = 0
 }

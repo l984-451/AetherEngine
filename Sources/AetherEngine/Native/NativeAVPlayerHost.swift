@@ -25,9 +25,33 @@ final class NativeAVPlayerHost {
 
     @Published private(set) var isReady: Bool = false
     @Published private(set) var currentTime: Double = 0
+    /// AVPlayer's actually-rendered position, published on EVERY periodic
+    /// tick including while a seek is in flight. Unlike `currentTime` (which
+    /// the seek path holds at the optimistic target and the observer
+    /// suppresses across `seekInFlight`, issue #37), this tracks where the
+    /// picture really is: during a not-yet-landed seek AVPlayer keeps
+    /// reporting the pre-seek clock, i.e. the parked on-screen frame. The
+    /// engine folds it onto source PTS and publishes it as `clock.sourceTime`
+    /// so frame-accurate consumers (subtitle overlay) follow the picture
+    /// instead of the scrub target (issue #49).
+    @Published private(set) var renderedTime: Double = 0
     @Published private(set) var duration: Double = 0
     @Published private(set) var rate: Float = 0
     @Published private(set) var failureMessage: String?
+    /// #50: monotonic token guarding a deferred item-failed confirmation.
+    /// Bumped each time a possibly-spurious `.failed` is deferred so a
+    /// later transition (a new failure, item swap) cancels an in-flight
+    /// confirmation.
+    private var failureConfirmToken: Int = 0
+    /// #50: latched true on the first `.playing` transition of this session.
+    /// Discriminates a genuine startup failure (never played, surface the
+    /// `.failed` promptly) from a mid-playback transient (played, then a
+    /// self-healing `.failed`). The instantaneous `timeControlStatus` at the
+    /// `.failed` KVO instant is unreliable for this: the `.failed` and
+    /// `timeControlStatus` KVOs are not synchronized, so a transient error
+    /// fired while the clock is still advancing can momentarily read
+    /// non-`.playing`. Reset with the item on a reused host.
+    private var hasEverPlayed = false
     /// True after the AVPlayer item reaches the end of its stream.
     /// Engine flips state to .idle so host end-of-content flows
     /// (auto-dismiss, next-episode countdown if no marker) fire.
@@ -389,7 +413,8 @@ final class NativeAVPlayerHost {
                         self.avPlayer.play()
                     }
                 case .failed:
-                    self.failureMessage = item.error?.localizedDescription ?? "AVPlayerItem failed (no description)"
+                    let desc = item.error?.localizedDescription ?? "AVPlayerItem failed (no description)"
+                    self.handleItemFailed(desc, item: item)
                 default:
                     break
                 }
@@ -430,6 +455,7 @@ final class NativeAVPlayerHost {
                 // Dolby) only once playback actually starts, so this is the
                 // first point the route reflects the true steady state. The
                 // downmix warnings run here, not at readyToPlay (issue #24).
+                if status == .playing { self.hasEverPlayed = true }
                 if status == .playing, !self.didSampleSettledRoute {
                     self.didSampleSettledRoute = true
                     Task { @MainActor [weak self] in
@@ -522,11 +548,17 @@ final class NativeAVPlayerHost {
             let value = time.seconds.isFinite ? time.seconds : 0
             Task { @MainActor in
                 guard let self else { return }
+                // `renderedTime` always tracks AVPlayer's reported position,
+                // even mid-seek: during a not-yet-landed seek that value is
+                // the parked on-screen frame, which is exactly what the
+                // source-PTS `sourceTime` should follow (issue #49).
+                self.renderedTime = value
                 // While a seek is in flight AVPlayer still reports the
                 // pre-seek clock until the seek physically lands on the
-                // loopback HLS-fMP4 source; publishing it bounces the
-                // engine clock back through the old position (issue #37).
-                // The seek completion handler publishes the landed time.
+                // loopback HLS-fMP4 source; publishing it to `currentTime`
+                // bounces the engine clock back through the old position
+                // (issue #37). The seek completion handler publishes the
+                // landed time.
                 guard !self.seekInFlight else { return }
                 self.currentTime = value
             }
@@ -625,6 +657,86 @@ final class NativeAVPlayerHost {
         unloadCurrentItem()
     }
 
+    // MARK: - Failure handling
+
+    /// #50: AVPlayer flips `item.status` to `.failed` on transient errors it
+    /// then self-heals - an in-range loopback 404 the host retries, or an
+    /// AVIOReader range-read reconnect ("The network connection was lost.") -
+    /// while the player keeps playing straight through from buffer: the clock
+    /// and subtitle cues keep advancing and the title plays to the end. The
+    /// `item.error` is non-nil, but the failure is not actually terminal.
+    /// Publishing it as a terminal `.error` aborts a session that is
+    /// demonstrably still playing (rrgomes' device capture: `tcs=playing`,
+    /// `rate=1.0` at the `.failed` transition).
+    ///
+    /// A genuine fatal failure leaves the player stopped. 426b45c gated the
+    /// publish on the *instantaneous* `timeControlStatus` at the `.failed`
+    /// instant: surface immediately when not `.playing`, defer-and-confirm
+    /// when still `.playing`. rrgomes' `426b45c` retest showed that single
+    /// sample is unreliable - the engine still published a terminal failure at
+    /// avpClock=27.3s while the AVPlayer kept playing smoothly, and the
+    /// "deferring" log never fired, meaning the immediate-surface branch ran
+    /// (`timeControlStatus != .playing` at that instant) even though playback
+    /// was demonstrably advancing. The `.failed` KVO and the `timeControlStatus`
+    /// KVO are not synchronized: a self-healing transient (in-range loopback
+    /// 404, AVIOReader range-read reconnect) can fire `.failed` during a brief
+    /// `.waitingToPlayAtSpecifiedRate` blip while the clock never stops.
+    ///
+    /// So discriminate on *whether playback was ever established*, not on an
+    /// instantaneous transport sample. Before the first `.playing` transition a
+    /// `.failed` is a genuine startup failure (no recovery expected) and
+    /// surfaces promptly. Once playback has established, every `.failed` is
+    /// treated as possibly-spurious and deferred; at confirmation a recovered
+    /// player is one that is `.playing` *or* whose clock advanced past the
+    /// failure point (clock progress is immune to the same instantaneous-sample
+    /// race on the confirmation side). Only a player that is both stopped and
+    /// has not advanced after the settle surfaces the failure.
+    @MainActor
+    private func handleItemFailed(_ desc: String, item: AVPlayerItem) {
+        // Ignore a late `.failed` KVO from an item we have already replaced.
+        guard playerItem === item else { return }
+
+        failureConfirmToken &+= 1
+        let token = failureConfirmToken
+
+        // Startup failure: never reached .playing, so nothing to recover.
+        if !hasEverPlayed {
+            failureMessage = desc
+            return
+        }
+
+        let clockAtFailure = renderedTime
+        EngineLog.emit(
+            "[NativeAVPlayerHost] #\(sessionID) item.status=.failed after playback established "
+            + "(tcs=\(avPlayer.timeControlStatus.rawValue) clock=\(String(format: "%.2f", clockAtFailure))); "
+            + "deferring possibly-spurious failure: \(desc)",
+            category: .engine
+        )
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 5_000_000_000)
+            guard let self = self,
+                  self.failureConfirmToken == token,
+                  self.playerItem === item else { return }
+            let advanced = self.renderedTime > clockAtFailure + 0.5
+            if self.avPlayer.timeControlStatus == .playing || advanced {
+                EngineLog.emit(
+                    "[NativeAVPlayerHost] #\(self.sessionID) deferred failure cleared: player recovered "
+                    + "(tcs=\(self.avPlayer.timeControlStatus.rawValue) "
+                    + "clock=\(String(format: "%.2f", self.renderedTime)) advanced=\(advanced))",
+                    category: .engine
+                )
+            } else {
+                EngineLog.emit(
+                    "[NativeAVPlayerHost] #\(self.sessionID) deferred failure confirmed: player stopped "
+                    + "(tcs=\(self.avPlayer.timeControlStatus.rawValue) "
+                    + "clock=\(String(format: "%.2f", self.renderedTime)))",
+                    category: .engine
+                )
+                self.failureMessage = desc
+            }
+        }
+    }
+
     // MARK: - Playback control
 
     /// Live, synchronous read of whether the player intends to be playing
@@ -640,6 +752,29 @@ final class NativeAVPlayerHost {
         guard let r = avPlayer.currentItem?.seekableTimeRanges.last?.timeRangeValue else { return 0 }
         let end = CMTimeGetSeconds(r.start + r.duration)
         return end.isFinite ? end : 0
+    }
+
+    /// End (seconds, AVPlayer clock) of the contiguous `loadedTimeRanges`
+    /// span covering the current playhead, i.e. how far ahead AVPlayer has
+    /// actually buffered (AetherEngine#54). Returns the playhead itself when
+    /// no loaded range covers it, so the engine's folded `bufferedPosition`
+    /// never trails `sourceTime`. Disjoint ranges ahead of a gap are ignored
+    /// on purpose: a buffer bar should show the continuously playable span.
+    var bufferedEnd: Double {
+        guard let item = avPlayer.currentItem else { return 0 }
+        let now = item.currentTime().seconds
+        guard now.isFinite else { return 0 }
+        var end = now
+        for value in item.loadedTimeRanges {
+            let r = value.timeRangeValue
+            let s = r.start.seconds
+            let e = (r.start + r.duration).seconds
+            guard s.isFinite, e.isFinite else { continue }
+            // Contiguous with the playhead (small tolerance for the gap
+            // between the rendered frame and the range's reported start).
+            if s <= now + 1.0 && e >= now { end = max(end, e) }
+        }
+        return end
     }
 
     func play() {
@@ -708,7 +843,13 @@ final class NativeAVPlayerHost {
                         // settles on the target immediately instead of
                         // waiting a tick for the periodic observer.
                         let landed = self.avPlayer.currentTime().seconds
-                        if landed.isFinite { self.currentTime = landed }
+                        if landed.isFinite {
+                            self.currentTime = landed
+                            // The picture now sits at the landed position too,
+                            // so settle the rendered clock with it rather than
+                            // waiting a tick for the periodic observer (#49).
+                            self.renderedTime = landed
+                        }
                     }
                     cont.resume()
                 }
@@ -777,6 +918,11 @@ final class NativeAVPlayerHost {
         // this reused host (episode 2+ of a binge otherwise silently
         // lost the issue-24 downmix warnings).
         didSampleSettledRoute = false
+        // Re-arm the #50 startup-vs-established discriminator: a reused host
+        // must treat the next session's pre-playback failures as startup
+        // failures (surface promptly), not inherit the prior session's
+        // established state.
+        hasEverPlayed = false
         // Force the player rate to 0 before swapping the item. On a
         // native->native reload the host (and its AVPlayer) is reused to
         // keep AVKit's system Now-Playing registration alive (issue #15),
@@ -802,6 +948,7 @@ final class NativeAVPlayerHost {
         isReady = false
         // (didReachEnd already cleared above, with the terminal flags.)
         currentTime = 0
+        renderedTime = 0
         duration = 0
         rate = 0
     }

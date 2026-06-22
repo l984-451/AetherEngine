@@ -10,6 +10,105 @@ the public-API contract.
 
 ## [Unreleased]
 
+## [3.13.1] — 2026-06-22
+
+### Fixed
+
+- **Embedded ASS subtitle feed fell behind playback on packet-dense tracks (#56).** The embedded subtitle side reader published each decoded event through its own awaited `MainActor.run` hop. On a track that stacks many events on the same (or nearly the same) timestamp, those per-event hops serialize the demux loop against the host's on-MainActor ASS renderer, so demux throughput collapses to the MainActor scheduling rate and the published `subtitleCues` fall far behind the playhead (in the reported sample, 1534 ASS events share a single 5.207 s timestamp). Decoded events are now coalesced and flushed to the MainActor in a single hop once the batch spans a short window of source time (sparse tracks still flush per event, so there is no added latency) or reaches a count cap (the decisive throttle for a same-timestamp burst, turning that 1534-event cluster into roughly a dozen hops instead of 1534). The native `tx3g` reader (3.13.0) already wrote cues off-actor and is unaffected.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/3.13.1))
+
+## [3.13.0] — 2026-06-22
+
+### Added
+
+- **Native subtitle tracks for Picture-in-Picture, AirPlay, and external display (#55).** All embedded and sidecar text subtitle tracks can be muxed into the fragmented-MP4 stream as native language-tagged `tx3g` (mov_text) tracks, so AVPlayer renders them itself and they survive PiP, AirPlay, and external-display playback, where a host-drawn overlay is never composited. AVPlayer's stock legible menu enumerates every language for selection. This rides the existing `media.m3u8` path with no master playlist, so SDR / HDR10 / HLG / Dolby Vision (including Profile 5) routing is byte-identical to before. Opt-in via `LoadOptions.prepareNativeSubtitles`; tracks are exposed as `nativeSubtitleTracks` with `setNativeSubtitleSelected(track:)`.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/3.13.0))
+
+## [3.12.0] — 2026-06-21
+
+### Added
+
+- **`clock.bufferedPosition` for buffer-bar indicators (#54).** A new published value on `engine.clock` reports how far ahead the engine has buffered, on the same source axis as `sourceTime`, so a host can draw a YouTube-style buffer bar as `bufferedPosition / duration`. On the native AVPlayer path it is the end of the contiguous `loadedTimeRanges` span covering the playhead, folded with the same seam shift as `sourceTime`; on the software (dav1d / libavcodec) path it is the newest demuxed source PTS, i.e. how far ahead bytes have been fetched and demuxed from the (possibly remote) source; the audio path mirrors `currentTime`. Clamped to never trail the rendered frame, reset on load / stop. Additive, no behavior change to existing surfaces.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/3.12.0))
+
+## [3.11.7] — 2026-06-20
+
+### Fixed
+
+- **Malformed Dolby Vision "Profile 8.6" rejected by AVPlayer (#53).** Some HEVC sources are tagged DV Profile 8 with an invalid `dv_bl_signal_compatibility_id` (typically 6, which is really P7's marker) because an old tool confused the profile with the `dvhe08.06` level field. The bitstream is a single-layer HDR10-base P8.1 stream, but a `dvvC` whose compat id contradicts the `db1p` brand makes AVPlayer reject the variant outright; previously the engine classified it as P8.1 yet stream-copied the source `dvcC` unmodified, so the invalid compat survived into `init.mp4`. On a DV-capable panel the engine now normalizes the container `dvcC` to a valid P8.1 (compat = 1, profile = 8, el_present = 0) so the `dvvC` and `db1p` supplemental agree and AVPlayer accepts it; no per-packet RPU work is needed since the elementary stream is already P8.1. On a non-DV panel the existing strip path still forces the HDR10 fallback, matching the server's DOVIInvalid remux. Internally this decoupled the container `dvcC` rewrite (`rewriteDoviConfigTo81`) from the P7 per-packet RPU conversion so both routes share the container fix.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/3.11.7))
+
+## [3.11.6] — 2026-06-20
+
+### Fixed
+
+- **Still-image / scrub-preview thumbnails of anamorphic SD content rendered horizontally stretched (#23).** `FrameExtractor` (the on-device frame source for scrub previews and chapter thumbnails) scaled each decoded frame using its coded width and height only, ignoring the sample aspect ratio, so an NTSC DVD (720x480 stored, displayed at 4:3) produced a 3:2 thumbnail. `FrameDecodeContext` now reads the stream SAR at open (per-frame SAR as a fallback, since the software decoder does not reliably attach it) and folds it into the output height via `displayDimensions(...)`, so thumbnails keep the source display aspect (4:3 here, 16:9 for anamorphic widescreen DVDs). Mirrors the main decode-path SAR fix (3.11.3). The HDR tone-map thumbnail path is unchanged (anamorphic content is effectively always SDR). Regression test covers NTSC, PAL, and anamorphic ratios.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/3.11.6))
+
+## [3.11.5] — 2026-06-20
+
+### Fixed
+
+- **Long delay to first subtitle cue when a track is activated mid-playback (no pause) on a slow/remote source (#52).** `selectSubtitleTrack(index:)` mid-playback on a large/remote (high-latency) source showed the first on-screen cue tens of seconds late instead of the ~1-2s the API promises. The side demuxer captured the playhead (`startAt`) before `demuxer.open` and the `duration*0.5` prewarm seek; on a slow source those steps cost several seconds of wall-clock during which unpaused playback advanced, so the reader then seeked to a now-stale position behind the live playhead and paged forward over already-played content. Those cues arrived behind the playhead and were dropped by the current-cue lookup until the read caught up. The reader now re-samples the live playhead after the open + prewarm and re-targets the single existing seek to it (no extra network seek), keeping the bitmap SETUP lead-in and seeding the read-ahead snapshot from the re-sampled value. It is a no-op when paused, on a fast/local open, and on the seek re-arm path.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/3.11.5))
+
+## [3.11.4] — 2026-06-20
+
+### Fixed
+
+- **Spurious terminal `.failed` published while the AVPlayer kept playing (#50).** On engine-native loopback-HLS playback the engine could publish a terminal failure while the player was demonstrably still advancing (clock and subtitle cues moving, segments flowing, title playing to the end), aborting a session that had self-healed. AVPlayer flips `item.status` to `.failed` on transient errors it then recovers from (an in-range loopback 404, or an AVIOReader range-read reconnect), and the `.failed` KVO is not synchronized with the `timeControlStatus` KVO, so the earlier gate (3.11.3) that checked the instantaneous transport state at the failure instant still let a transient through whenever it fired during a brief `.waitingToPlayAtSpecifiedRate` blip. The failure publish now discriminates on whether playback was ever established (a latch set on the first `.playing` transition) instead of an instantaneous sample: before playback establishes a `.failed` surfaces promptly (genuine startup failure), and after it every `.failed` is deferred and only surfaced if, after a settle, the player is both stopped and has not advanced its clock. No transient that keeps the clock moving can publish a terminal failure anymore.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/3.11.4))
+
+## [3.11.3] — 2026-06-19
+
+### Fixed
+
+- **Anamorphic SD content (DVD rips, widescreen DVDs) rendered "flattened" / horizontally squished (#23).** DVD MPEG-2 stores non-square pixels (NTSC 720x480 is encoded for 4:3 display; widescreen DVDs for 16:9), but `SoftwareVideoDecoder` attached only color-space metadata to its output `CVPixelBuffer`, never the sample aspect ratio. `CMVideoFormatDescriptionCreateForImageBuffer` therefore produced a format description with no `PixelAspectRatio` extension, and `AVSampleBufferDisplayLayer` sized the picture with square pixels (a too-wide 3:2). The decoder now captures the container SAR at `open()` and attaches each frame's `sample_aspect_ratio` (with that stream-level fallback) as `kCVImageBufferPixelAspectRatioKey`, so the picture displays at its intended aspect. The native VideoToolbox path already reads SAR from the container, so only the software path needed this.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/3.11.3))
+
+## [3.11.2] — 2026-06-19
+
+### Fixed
+
+- **Interlaced MPEG-2 / VC-1 / MPEG-4 (DVD rips, SD broadcast) played at half speed and froze on resume (#23).** `bwdif` / `yadif` configure their output link with `time_base = input / 2` and emit frame PTS in that halved base, but `DeinterlaceFilter.pull` handed those frames straight to `SoftwareVideoDecoder.emit`, which timestamps every frame on the stream time_base. Reading a doubled-tick PTS with the un-halved base placed every interlaced frame at 2x its real presentation time: from start the video paced at half rate (renderer queue fills, demux parks on back-pressure, audio drains then goes silent); on resume frames landed far in the future so the picture froze on one frame while the audio-driven clock advanced. `pull` now rescales the pulled PTS and duration from the buffersink time_base back into the stream time_base via `av_buffersink_get_time_base`, which also handles the `pts_multiplier = 1` fallback when `av_reduce` cannot form the exact half base.
+
+### Changed
+
+- Loopback-HLS request arrivals are now logged at `.info` (was `.debug`) to surface the request path during the #50 plain-playback 404 investigation.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/3.11.2))
+
+## [3.11.1] — 2026-06-18
+
+### Fixed
+
+- **System-wide `mediaserverd` wedge after a long background suspension.** A paused native session left running into a multi-hour tvOS suspension kept its AVPlayer decode session, the in-process loopback HLS server sockets, and the upstream AVIO connection all allocated. On resume that wedged the shared `mediaserverd` system-wide: every app (including unrelated ones) could only paint the first frame until the device was rebooted. The `didEnterBackground` handler now tears the video pipeline down instead of merely pausing, releasing the decode session synchronously before suspension. The native host shell and `currentAVPlayer` are kept so Now-Playing survives, and the clock / loaded URL / options are preserved so the host's foreground `reloadAtCurrentPosition()` resumes at the paused position.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/3.11.1))
+
+## [3.11.0] — 2026-06-18
+
+### Added
+
+- **Live Dolby Vision Profile 7 to 8.1 conversion.** P7 sources (dual-layer BL+EL+RPU, the common Blu-ray remux profile that Apple platforms cannot decode) now play by routing the base layer as 8.1 and rewriting the RPU live via `DoviRpuConverter` (libdovi, shipped as the new `LibDovi` xcframework). On any conversion failure the path falls back to HDR10 rather than rejecting the file. The conversion is gated off for SSAI re-init. `aetherctl dovitest <file>` exercises the converter. (S1483, S1484, S1489)
+- **P8.2 / P10.2 / P9 base-layer playback.** These profiles now play their base layers instead of being rejected outright.
+- **Intel Mac support.** `LibDovi` ships x86_64 fat binaries (macOS and iOS Simulator) as of 1.0.2, so AetherEngine cross-builds for x86_64. (1.0.1 added the iOS slices that 1.0.0 was missing.)
+
+### Fixed
+
+- **Loopback-HLS 404 `loadFailed` wedge after a rapid seek burst (#50).** An in-range VOD segment (`index < segmentCount`) evicted from the rolling window while the single producer sat elsewhere was answered with a 404, which AVPlayer treats as terminal `loadFailed`. The server now returns a retriable 503 for in-range misses (404 stays for genuinely out-of-range indices), and `serveSegment` re-asserts the producer reposition across bounded waits instead of orphaning it behind the #35 restart coalescer's single pending slot.
+- **Subtitles raced ahead of the picture during post-seek rebuffer (#49).** Under a sustained seek rate the published clock held the optimistic seek target while AVPlayer stayed parked at the pre-seek frame, so subtitles (which read `sourceTime`) led the on-screen image. `sourceTime` now tracks the actually-rendered frame on the native path while `currentTime` keeps scrub intent. Adds the `clockLeadSeconds` diagnostic.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/3.11.0))
+
 ## [3.10.0] — 2026-06-17
 
 ### Added
