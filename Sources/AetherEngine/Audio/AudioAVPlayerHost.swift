@@ -52,6 +52,11 @@ final class AudioAVPlayerHost {
     /// Start-position seconds stashed at load(); performed once readyToPlay, then cleared.
     private var pendingSeek: Double?
 
+    /// Bumped on each load() entry. load() now awaits async asset-track loading (audio-only composition), so a
+    /// superseding load() can start mid-await; after the await we bail if this generation is stale, so a superseded
+    /// load never replaceCurrentItems onto the shared player after its successor (the reorder the engine warns about).
+    private var loadGeneration: UInt64 = 0
+
     /// Now-playing metadata applied to each loaded item's externalMetadata so it survives a back-to-back swap.
     /// externalMetadata feeds AVKit's on-screen info pane; on a bare AVPlayer (no AVPlayerViewController) it does
     /// NOT surface in system Now-Playing. The Now-Playing channel is `nowPlayingInfo` below.
@@ -96,6 +101,8 @@ final class AudioAVPlayerHost {
     func load(url: URL, startPosition: Double?, httpHeaders: [String: String]) async throws {
         // Clean prior observers before swapping in a new item so a back-to-back load() doesn't leak or double-fire.
         teardownObservers()
+        loadGeneration &+= 1
+        let myGeneration = loadGeneration
 
         let asset: AVURLAsset
         if httpHeaders.isEmpty {
@@ -103,7 +110,21 @@ final class AudioAVPlayerHost {
         } else {
             asset = AVURLAsset(url: url, options: ["AVURLAssetHTTPHeaderFieldsKey": httpHeaders])
         }
-        let item = AVPlayerItem(asset: asset)
+        // Play through an audio-only AVMutableComposition, not the raw asset. The composition carries NO metadata,
+        // so neither AVPlayer nor MediaPlayer's now-playing machinery can reach the asset's embedded cover art. A
+        // Jellyfin FLAC/MP3 with a corrupt embedded picture (FLAC METADATA_BLOCK_PICTURE, surfaced as common
+        // metadata, not a track) otherwise gets harvested + decoded as a still image when we set nowPlayingInfo,
+        // which decodes the corrupt PNG ("Error -17102") on MediaPlayer's serial queue and trips
+        // dispatch_assert_queue_fail. The composition references the remote audio track and streams it; we supply
+        // title/artist/album/artwork ourselves via setNowPlayingInfo. Falls back to the raw asset if the audio
+        // track can't be resolved (e.g. an indefinite/live source), preserving prior behavior.
+        let item = await makeAudioOnlyItem(from: asset) ?? AVPlayerItem(asset: asset)
+        // A newer load() may have started during the async track load above; if so, abandon this one before it
+        // touches the shared AVPlayer, so it can't clobber its successor's item.
+        guard myGeneration == loadGeneration else {
+            EngineLog.emit("[AudioAVPlayerHost] load superseded mid-build (gen \(myGeneration) != \(loadGeneration)), abandoning", category: .swPlayback)
+            return
+        }
         // externalMetadata is unavailable on macOS (package builds there for tests/aetherctl).
         #if !os(macOS)
         item.externalMetadata = pendingExternalMetadata
@@ -233,6 +254,32 @@ final class AudioAVPlayerHost {
         // center mid-swap trips dispatch_assert_queue_fail. The readyToPlay edge publishes the first entry.
         // No auto-play: the engine calls play() after load(), mirroring
         // AudioPlaybackHost.
+    }
+
+    /// Build an audio-only AVPlayerItem from a composition containing just the asset's audio track, so the played
+    /// item carries no embedded artwork for the now-playing machinery to harvest/decode. Returns nil (caller falls
+    /// back to the raw asset) if no audio track or a usable duration can be resolved.
+    private func makeAudioOnlyItem(from asset: AVURLAsset) async -> AVPlayerItem? {
+        guard let audioTrack = try? await asset.loadTracks(withMediaType: .audio).first,
+              let duration = try? await asset.load(.duration),
+              duration.isNumeric, duration.seconds > 0 else {
+            EngineLog.emit("[AudioAVPlayerHost] audio-only item: no audio track / duration, using raw asset", category: .swPlayback)
+            return nil
+        }
+        let composition = AVMutableComposition()
+        guard let compTrack = composition.addMutableTrack(
+            withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid
+        ) else {
+            return nil
+        }
+        do {
+            try compTrack.insertTimeRange(CMTimeRange(start: .zero, duration: duration), of: audioTrack, at: .zero)
+        } catch {
+            EngineLog.emit("[AudioAVPlayerHost] audio-only item: insert failed (\(error.localizedDescription)), using raw asset", category: .swPlayback)
+            return nil
+        }
+        EngineLog.emit("[AudioAVPlayerHost] audio-only item built (stripped embedded artwork), dur=\(String(format: "%.1fs", duration.seconds))", category: .swPlayback)
+        return AVPlayerItem(asset: composition)
     }
 
     /// Disable any embedded still-image presented as a video track (e.g. MP4/M4A cover art), so the audio path never
