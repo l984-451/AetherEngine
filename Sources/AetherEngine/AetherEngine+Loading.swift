@@ -587,14 +587,20 @@ extension AetherEngine {
     func reloadWithAudioOverride(
         url: URL,
         audioStreamIndex: Int32?,
-        expectedGeneration: UInt64
+        expectedGeneration: UInt64,
+        discTitleIDOverride: Int? = nil,
+        resumeOverride: Double? = nil
     ) async {
         // Liveness guard: a stop()/load() between scheduling and here would resurrect a dismissed session or kill the successor. Generation captured at schedule time; both stop() and load() invalidate it.
         guard loadGeneration == expectedGeneration, loadedURL != nil else {
             EngineLog.emit("[AetherEngine] reload superseded before start; ignored", category: .engine)
             return
         }
-        let resumeAt = currentTime
+        // Disc title to reopen with: an explicit override (selectTitle on a custom disc) wins, else the title
+        // already playing so an audio switch / background-resume doesn't silently revert to the main title (#67).
+        let titleToReopen = discTitleIDOverride ?? activeDiscTitleID
+        // resumeOverride 0 restarts a title switch at the new title's head; nil keeps the current playhead.
+        let resumeAt = resumeOverride ?? currentTime
         let embeddedStreamToResume: Int32 = activeEmbeddedSubtitleStreamIndex
         let sidecarToResume: URL? = isSubtitleActive && activeEmbeddedSubtitleStreamIndex < 0
             ? loadedSidecarURL
@@ -633,7 +639,8 @@ extension AetherEngine {
                 customPreopened = try await Task.detached(priority: .userInitiated) {
                     let d = Demuxer()
                     // isLive preserved: a live custom source must not trigger SEEK_END on reopen.
-                    try d.open(reader: reader, formatHint: hint, isLive: isLiveReload)
+                    // selectTitleID rebuilds the disc concat stream for the chosen title (#67).
+                    try d.open(reader: reader, formatHint: hint, isLive: isLiveReload, selectTitleID: titleToReopen)
                     return d
                 }.value
             } catch {
@@ -649,6 +656,49 @@ extension AetherEngine {
                 }
                 EngineLog.emit("[AetherEngine] reload superseded after reader reopen; unwinding", category: .engine)
                 return
+            }
+        } else if titleToReopen != nil {
+            // URL/local disc audio switch: the backend would otherwise reopen by URL with no title id and
+            // silently revert to the main title. Preopen the disc demuxer with the title so the selection
+            // survives the reload (#67). Non-disc URL sources keep customPreopened nil and reopen by URL.
+            let headers = loadedOptions.httpHeaders
+            do {
+                customPreopened = try await Task.detached(priority: .userInitiated) {
+                    let d = Demuxer()
+                    try d.open(url: url, extraHeaders: headers, selectTitleID: titleToReopen)
+                    return d
+                }.value
+            } catch {
+                EngineLog.emit("[AetherEngine] reload: disc URL reopen failed: \(error)", category: .engine)
+                activeAudioTrackIndex = previousAudioIndex
+                state = .error("Reload failed: \(error.localizedDescription)")
+                return
+            }
+            if loadGeneration != gen {
+                customPreopened?.markClosed()
+                if let d = customPreopened {
+                    Task.detached { d.close() }
+                }
+                EngineLog.emit("[AetherEngine] reload superseded after disc URL reopen; unwinding", category: .engine)
+                return
+            }
+        }
+
+        // Capture the reopened title's disc + track metadata before the backend consumes the demuxer
+        // (start() nils preopenedDemuxer). Republished after the reload succeeds so a title switch updates
+        // the picker; an audio switch / non-disc reload re-publishes identical values, a harmless no-op (#67).
+        var reopenedDiscTitles: [TitleInfo] = []
+        var reopenedDiscChapters: [ChapterInfo] = []
+        var reopenedSelectedTitleID: Int? = nil
+        var reopenedAudioTracks: [TrackInfo] = []
+        var reopenedSubtitleTracks: [TrackInfo] = []
+        if let pre = customPreopened {
+            reopenedDiscTitles = pre.discTitleInfos()
+            if !reopenedDiscTitles.isEmpty {
+                reopenedDiscChapters = pre.discChapterInfos()
+                reopenedSelectedTitleID = pre.selectedDiscTitleID
+                reopenedAudioTracks = pre.audioTrackInfos()
+                reopenedSubtitleTracks = pre.subtitleTrackInfos()
             }
         }
 
@@ -738,6 +788,25 @@ extension AetherEngine {
             activeAudioTrackIndex = previousAudioIndex
             state = .error("Audio track switch failed: \(error.localizedDescription)")
             return
+        }
+
+        // Reload succeeded (failure paths returned above). Re-establish disc state stopInternal wiped.
+        // Gate the plain id on the same non-empty check as the published picker so the two can never disagree
+        // (a non-disc reload leaves both cleared); selectedDiscTitleID is non-nil whenever titles exist (#67).
+        if !reopenedDiscTitles.isEmpty {
+            activeDiscTitleID = reopenedSelectedTitleID
+            discTitles = reopenedDiscTitles
+            discChapters = reopenedDiscChapters
+            selectedDiscTitle = reopenedSelectedTitleID.flatMap { id in reopenedDiscTitles.first { $0.id == id } }
+            // A title switch changes the title's stream set. The native path already republished the session's
+            // real list via syncPublishedAudioStateFromNativeSession above; only the software path, which does
+            // not reconcile tracks post-load, needs the probe-derived lists re-applied here.
+            if wasOnSoftwarePath {
+                audioTracks = reopenedAudioTracks
+                subtitleTracks = reopenedSubtitleTracks
+            }
+        } else {
+            activeDiscTitleID = nil
         }
 
         // Re-arm subtitle: sidecar branch wins because loadedSidecarURL is set only for sidecar sources.

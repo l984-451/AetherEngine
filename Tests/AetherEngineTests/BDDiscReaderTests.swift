@@ -50,4 +50,19 @@ final class BDDiscReaderTests: XCTestCase {
         XCTAssertTrue(d.wrapRecognized)
         XCTAssertEqual(d.wrapFormatHint, "mpegts")
     }
+
+    // #67: selectTitle threads a title id into wrap. An out-of-range id must clamp to the main
+    // title (index 0), not crash or leak a stale id from a previously played disc. This is the
+    // cross-disc-bleed safety net selectTitle(id:) and the bg-resume reload both rely on.
+    func test_wrapSelectTitleIDOutOfRangeClampsToMain() throws {
+        let info = try XCTUnwrap(try DiscReader.wrap(DataIOReader(data: bdImage()), selectTitleID: 7))
+        XCTAssertEqual(info.titles.count, 1)
+        XCTAssertEqual(info.selectedTitleIndex, 0)
+    }
+
+    func test_wrapSelectTitleIDInRangeSelectsIt() throws {
+        let info = try XCTUnwrap(try DiscReader.wrap(DataIOReader(data: bdImage()), selectTitleID: 0))
+        XCTAssertEqual(info.selectedTitleIndex, 0)
+        XCTAssertEqual(info.selectedTitle?.id, 0)
+    }
 }
