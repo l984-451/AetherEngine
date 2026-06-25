@@ -39,7 +39,10 @@ public actor FrameExtractor {
             snapshotLimit: 2,
             thumbnailBucketSeconds: 1.0
         )
-        self.decodeQueue = DispatchQueue(label: "com.aetherengine.frameextractor", qos: .userInitiated)
+        // .utility (not .userInitiated): the disposable thumbnail decode must yield to
+        // the real-time software playback decode under CPU contention so it cannot
+        // starve playback on a weak box (issue #27).
+        self.decodeQueue = DispatchQueue(label: "com.aetherengine.frameextractor", qos: .utility)
     }
 
     public init(url: URL, httpHeaders: [String: String] = [:]) {

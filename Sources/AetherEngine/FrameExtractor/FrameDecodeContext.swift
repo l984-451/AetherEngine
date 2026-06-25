@@ -36,6 +36,19 @@ final class FrameDecodeContext: @unchecked Sendable {
         ColorAttachments.isHDRTransfer(trc)
     }
 
+    /// Thread budget for the disposable still/thumbnail decoder. Capped well below the
+    /// core count so it cannot grab every core at playback's QoS and starve the
+    /// real-time software decode (and, with subs on, the subtitle side-demuxer) on a
+    /// weak A12 box (issue #27). The thumbnail has no clock deadline, so 2 is plenty.
+    static func stillExtractionThreadCount(activeProcessorCount: Int) -> Int {
+        return max(1, min(2, activeProcessorCount))
+    }
+
+    /// Wall-clock ceiling for a single still/thumbnail decode's HTTP reads. A healthy
+    /// chunk returns far sooner; this only bounds a genuinely stalled remote source so
+    /// a frozen read cannot pin the FrameExtractor's serial decode queue (issue #27).
+    static let stillReadDeadlineSeconds: TimeInterval = 8
+
     init(url: URL, httpHeaders: [String: String]) {
         self.url = url
         self.httpHeaders = httpHeaders
@@ -132,7 +145,8 @@ final class FrameDecodeContext: @unchecked Sendable {
             }
             return AV_PIX_FMT_YUV420P
         }
-        ctx.pointee.thread_count = Int32(ProcessInfo.processInfo.activeProcessorCount)
+        ctx.pointee.thread_count = Int32(Self.stillExtractionThreadCount(
+            activeProcessorCount: ProcessInfo.processInfo.activeProcessorCount))
         ctx.pointee.thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE
 
         // Still extraction needs no deblock or full-rate quality: skip loop filter
@@ -172,6 +186,12 @@ final class FrameDecodeContext: @unchecked Sendable {
         isCancelled: () -> Bool
     ) -> CGImage? {
         guard isOpen, let ctx = codecContext, let demuxer else { return nil }
+
+        // Bound this decode's HTTP reads so a stalled remote source can't park the
+        // serial decode queue and freeze the scrub preview (issue #27). No-op for
+        // file:// / custom sources. Disarmed on every exit path.
+        demuxer.beginReadDeadline(secondsFromNow: Self.stillReadDeadlineSeconds)
+        defer { demuxer.endReadDeadline() }
 
         avcodec_flush_buffers(ctx)
 

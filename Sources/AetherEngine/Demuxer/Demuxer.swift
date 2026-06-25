@@ -13,19 +13,33 @@ struct DemuxerOpenProfile: Sendable {
     var maxAnalyzeDuration: Int64
     var avioPrefetch: Bool
     var avioChunkSize: Int
+    /// Per-chunk Range-request budget for the seekable (still-extraction) AVIO path.
+    /// Caps how long a single cold/stalled chunk read can park before it aborts.
+    /// Playback keeps the generous default (its reads go through the persistent
+    /// reader; this only bounds open-time size probes). Still extraction shrinks it
+    /// so a disposable scrub thumbnail never freezes the decode queue (issue #27).
+    var avioRequestTimeout: TimeInterval
+    /// Retry passes for a failed seekable chunk fetch. Still extraction drops this
+    /// to a single attempt: a scrub thumbnail is disposable and must fail fast
+    /// rather than ride a 3-retry-times-2-URL storm (issue #27).
+    var avioMaxRetries: Int
 
     static let playback = DemuxerOpenProfile(
         probesize: 50 * 1024 * 1024,
         maxAnalyzeDuration: 60 * 1_000_000,
         avioPrefetch: true,
-        avioChunkSize: 4 * 1024 * 1024
+        avioChunkSize: 4 * 1024 * 1024,
+        avioRequestTimeout: 35,
+        avioMaxRetries: 3
     )
 
     static let stillExtraction = DemuxerOpenProfile(
         probesize: 2 * 1024 * 1024,
         maxAnalyzeDuration: 2 * 1_000_000,
         avioPrefetch: false,
-        avioChunkSize: 1 * 1024 * 1024
+        avioChunkSize: 1 * 1024 * 1024,
+        avioRequestTimeout: 8,
+        avioMaxRetries: 1
     )
 }
 
@@ -124,7 +138,9 @@ public final class Demuxer: @unchecked Sendable {
             extraHeaders: extraHeaders,
             chunkSize: openProfile.avioChunkSize,
             prefetchEnabled: openProfile.avioPrefetch,
-            isLive: isLive
+            isLive: isLive,
+            chunkRequestTimeout: openProfile.avioRequestTimeout,
+            chunkMaxRetries: openProfile.avioMaxRetries
         )
         try openWithProvider(reader, isLive: isLive)
     }
@@ -520,6 +536,19 @@ public final class Demuxer: @unchecked Sendable {
         // is authoritative, not ret.
         let capped = reader?.readDeadlineFired ?? false
         return ret >= 0 && !capped
+    }
+
+    /// Arm a wall-clock read deadline on the AVIO reader so a stalled HTTP read
+    /// (seek or readPacket) aborts instead of parking. Used by FrameExtractor still
+    /// extraction so a disposable scrub thumbnail bounds its decode and never freezes
+    /// the serial decode queue (issue #27). No-op for file:// / custom sources.
+    func beginReadDeadline(secondsFromNow seconds: TimeInterval) {
+        (avioProvider as? AVIOReader)?.beginReadDeadline(secondsFromNow: seconds)
+    }
+
+    /// Disarm the read deadline armed by `beginReadDeadline`.
+    func endReadDeadline() {
+        (avioProvider as? AVIOReader)?.endReadDeadline()
     }
 
     /// Fast lock-free unblock: AVIO read callback returns -1, av_read_frame returns

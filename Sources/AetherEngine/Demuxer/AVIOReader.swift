@@ -192,12 +192,20 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// Demux-thread-only (AVIO callback executes synchronously inside av_read_frame).
     private(set) var lastUnplannedReconnectAt: Date?
 
-    init(url: URL, extraHeaders: [String: String] = [:], chunkSize: Int = 4 * 1024 * 1024, prefetchEnabled: Bool = true, isLive: Bool = false) {
+    /// Seekable-path per-chunk Range-request budget (seconds) and retry passes.
+    /// Defaults preserve the historical playback/probe behaviour; still extraction
+    /// passes smaller values so a stalled scrub thumbnail aborts fast (issue #27).
+    private let chunkRequestTimeout: TimeInterval
+    private let chunkMaxRetries: Int
+
+    init(url: URL, extraHeaders: [String: String] = [:], chunkSize: Int = 4 * 1024 * 1024, prefetchEnabled: Bool = true, isLive: Bool = false, chunkRequestTimeout: TimeInterval = 35, chunkMaxRetries: Int = 3) {
         self.url = url
         self.extraHeaders = extraHeaders
         self.chunkSize = chunkSize
         self.prefetchEnabled = prefetchEnabled
         self.isLive = isLive
+        self.chunkRequestTimeout = chunkRequestTimeout
+        self.chunkMaxRetries = max(1, chunkMaxRetries)
     }
 
     private func applyExtraHeaders(_ request: inout URLRequest) {
@@ -280,6 +288,11 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// since matroska may still return success with a partial index after abort.
     private(set) var readDeadlineFired = false
 
+    /// Contract: `readDeadline`/`readDeadlineFired` are demux-thread-only. The
+    /// still-extraction (FrameExtractor) reader satisfies this because it runs on one
+    /// serial decode queue and `avioPrefetch:false` means no background prefetch thread
+    /// touches them. A future profile that re-enables prefetch on a deadline-armed
+    /// reader would need these guarded.
     func beginReadDeadline(secondsFromNow seconds: TimeInterval) {
         readDeadlineFired = false
         readDeadline = Date(timeIntervalSinceNow: seconds)
@@ -390,6 +403,12 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         var totalRead = 0
 
         while totalRead < requestSize {
+            // Abort a superseded / torn-down / past-deadline still read between chunk
+            // fetches so it cannot park the decode queue (issue #27). Mirrors the
+            // checks readPersistent already does at its loop head.
+            if isClosed { return totalRead > 0 ? Int32(totalRead) : -1 }
+            if isPastReadDeadline { readDeadlineFired = true; return totalRead > 0 ? Int32(totalRead) : -1 }
+
             bufferLock.lock()
             let bufEnd = currentOffset + Int64(currentBuffer.count)
             let inRange = position >= currentOffset && position < bufEnd
@@ -454,6 +473,12 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 if fetchSize <= 0 { break }
 
                 guard let data = fetchChunk(from: position, size: fetchSize), !data.isEmpty else {
+                    // An aborted fetch (supersede/close/deadline) must report a read
+                    // error, not EOF (which would truncate the stream cleanly). issue #27.
+                    if isClosed || isPastReadDeadline {
+                        if isPastReadDeadline { readDeadlineFired = true }
+                        return totalRead > 0 ? Int32(totalRead) : -1
+                    }
                     // nil = transport failure; empty = 2xx with no body (would loop forever otherwise).
                     break
                 }
@@ -1076,7 +1101,12 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         }
         task.resume()
 
-        if semaphore.wait(timeout: .now() + .seconds(25)) == .timedOut {
+        // Bound + make abortable: still extraction caps this at its small budget so a
+        // reopen mid-scrub on a stalled source can't park ~25s, and a teardown during
+        // open returns at once (issue #27). Playback keeps its 25s ceiling.
+        let probeBudget = min(25, chunkRequestTimeout)
+        if Self.awaitSignal(semaphore, budget: probeBudget, pollInterval: 0.1,
+                            shouldAbort: { [weak self] in self?.isClosed == true }) != .signaled {
             task.cancel()
             EngineLog.emit("[AVIOReader] Range probe timed out, trying HEAD", category: .demux, level: .verbose)
             return nil
@@ -1096,7 +1126,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         applyExtraHeaders(&request)
 
         do {
-            let (_, response) = try syncRequest(request)
+            // Honour the still budget here too so the open-time HEAD fallback can't
+            // ride the default 35s on a stalled origin during a cold/reopen scrub (#27).
+            let (_, response) = try syncRequest(request, budget: chunkRequestTimeout)
             guard let http = response as? HTTPURLResponse,
                   (200...299).contains(http.statusCode) else {
                 EngineLog.emit("[AVIOReader] HEAD failed (HTTP \((response as? HTTPURLResponse)?.statusCode ?? -1)), streaming mode", category: .demux, level: .verbose)
@@ -1131,13 +1163,13 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         let rangeEnd = offset + Int64(size) - 1
         var request = URLRequest(url: target)
         request.setValue("bytes=\(offset)-\(rangeEnd)", forHTTPHeaderField: "Range")
-        request.timeoutInterval = 15
+        request.timeoutInterval = min(15, chunkRequestTimeout)
         applyExtraHeaders(&request)
 
         var lastError: Error?
-        for attempt in 0..<Self.maxRetries {
+        for attempt in 0..<chunkMaxRetries {
             do {
-                let (data, response) = try syncRequest(request)
+                let (data, response) = try syncRequest(request, budget: chunkRequestTimeout)
                 if let http = response as? HTTPURLResponse {
                     let status = http.statusCode
                     if status != 200 && status != 206 {
@@ -1159,14 +1191,17 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 addBytesFetched(data.count)
                 return data
             } catch {
+                // Superseded / closed / past the read deadline: this read is disposable,
+                // bail at once instead of retrying into the abort (issue #27).
+                if isClosed || isPastReadDeadline { return nil }
                 lastError = error
-                if attempt < Self.maxRetries - 1 {
+                if attempt < chunkMaxRetries - 1 {
                     Thread.sleep(forTimeInterval: Double(1 << attempt) * 0.5)
                 }
             }
         }
 
-        EngineLog.emit("[AVIOReader] Fetch failed after \(Self.maxRetries) retries at offset \(offset): \(lastError?.localizedDescription ?? "?")", category: .demux, level: .verbose)
+        EngineLog.emit("[AVIOReader] Fetch failed after \(chunkMaxRetries) retries at offset \(offset): \(lastError?.localizedDescription ?? "?")", category: .demux, level: .verbose)
         return nil
     }
 
@@ -1179,7 +1214,34 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         return URLSession(configuration: config, delegate: nil, delegateQueue: nil)
     }()
 
-    private func syncRequest(_ request: URLRequest) throws -> (Data, URLResponse) {
+    /// Outcome of an abortable semaphore wait (issue #27).
+    enum WaitOutcome: Equatable { case signaled, timedOut, aborted }
+
+    /// Wait on `semaphore` up to `budget` seconds, polling `shouldAbort` every
+    /// `pollInterval`. Returns `.signaled` the moment the semaphore fires,
+    /// `.aborted` within one poll of `shouldAbort()` going true, or `.timedOut`
+    /// when the budget elapses. Lets a seekable chunk read bail promptly on
+    /// supersede / close / read-deadline instead of parking the decode queue in a
+    /// flat 35s wait (the root cause of the frozen scrub preview, issue #27).
+    static func awaitSignal(
+        _ semaphore: DispatchSemaphore,
+        budget: TimeInterval,
+        pollInterval: TimeInterval,
+        shouldAbort: () -> Bool
+    ) -> WaitOutcome {
+        let deadline = Date(timeIntervalSinceNow: budget)
+        while true {
+            if shouldAbort() { return .aborted }
+            let now = Date()
+            if now >= deadline { return .timedOut }
+            let slice = min(pollInterval, deadline.timeIntervalSince(now))
+            if semaphore.wait(timeout: .now() + max(0.001, slice)) == .success {
+                return .signaled
+            }
+        }
+    }
+
+    private func syncRequest(_ request: URLRequest, budget: TimeInterval = 35) throws -> (Data, URLResponse) {
         let delegate = ChunkFetchDelegate(extraHeaders: extraHeaders)
         let task = Self.chunkSession.dataTask(with: request)
         task.delegate = delegate
@@ -1191,7 +1253,13 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         }
         task.resume()
 
-        if semaphore.wait(timeout: .now() + .seconds(35)) == .timedOut {
+        // Poll for close / read-deadline so a superseded or torn-down still-extraction
+        // read aborts within ~100ms instead of riding the full budget (issue #27).
+        let outcome = Self.awaitSignal(
+            semaphore, budget: budget, pollInterval: 0.1,
+            shouldAbort: { [weak self] in self?.isClosed == true || self?.isPastReadDeadline == true }
+        )
+        guard outcome == .signaled else {
             task.cancel()
             throw AVIOReaderError.requestTimeout
         }
