@@ -119,7 +119,8 @@ public final class AetherEngine: ObservableObject {
     // internal(set): syncPublishedAudioStateFromNativeSession replaces the probe-derived list with side-demuxer
     // tracks for demuxed-audio live sources after load completes.
     @Published public internal(set) var audioTracks: [TrackInfo] = []
-    @Published public private(set) var subtitleTracks: [TrackInfo] = []
+    // internal(set): the disc title-switch reload republishes the new title's tracks from AetherEngine+Loading.
+    @Published public internal(set) var subtitleTracks: [TrackInfo] = []
     /// Container metadata (tags + cover). Populated from the probe demuxer before backend dispatch; nil while idle.
     @Published public private(set) var metadata: MediaMetadata?
     /// Active audio stream index (matches TrackInfo.id), or nil when no audio is wired. Updated synchronously
@@ -132,6 +133,26 @@ public final class AetherEngine: ObservableObject {
     /// Use for media-attribute labels (Stats for Nerds); use `videoFormat` for panel-rendering UI.
     /// Late HDR10+ T.35 SEI upgrades flip this independently of `videoFormat`'s panel guard.
     @Published public internal(set) var sourceVideoFormat: VideoFormat = .sdr
+
+    // MARK: - Disc titles / chapters (#67)
+
+    /// Selectable titles on the loaded disc image (Blu-ray playlists / DVD titles), longest first so
+    /// id 0 is the main feature. Empty for non-disc sources. Populated from the probe demuxer at load.
+    @Published public internal(set) var discTitles: [TitleInfo] = []
+    /// The disc title currently playing, or nil for a non-disc source. Updated on `selectTitle` reload.
+    @Published public internal(set) var selectedDiscTitle: TitleInfo?
+    /// Chapters of the selected title. Empty until Blu-ray chapter parsing ships (Phase 2); declared
+    /// now so hosts can bind the picker against a stable API.
+    @Published public internal(set) var discChapters: [ChapterInfo] = []
+    /// The id of the title the disc demuxer should (re)open with. Mirrors `selectedDiscTitle?.id` but
+    /// kept as plain state so it survives the stopInternal inside a reload and threads into audio-switch /
+    /// background-resume reopens (a URL-disc reopen with no id would silently revert to the main title).
+    var activeDiscTitleID: Int?
+
+    /// Source container start PTS (seconds) from the probe (AVFormatContext.start_time). The software-path
+    /// playback clock begins here (the native path's content base is `playlistShiftSeconds`), so a DVD
+    /// chapter seek adds it to the chapter's title-relative (0-based) target. 0 when unknown (#67).
+    var sourceStartSeconds: Double = 0
 
     /// Active playback backend: `.native` (AVPlayer) or `.software` (SoftwarePlaybackHost/dav1d/libavcodec).
     /// Exposed for diagnostic overlays; hosts should not branch on it.
@@ -615,13 +636,15 @@ public final class AetherEngine: ObservableObject {
         url: URL,
         startPosition: Double? = nil,
         options: LoadOptions = .init(),
-        audioSourceStreamIndex: Int32? = nil
+        audioSourceStreamIndex: Int32? = nil,
+        discTitleID: Int? = nil
     ) async throws -> SourceProbe? {
         try await load(
             source: .url(url),
             startPosition: startPosition,
             options: options,
-            audioSourceStreamIndex: audioSourceStreamIndex
+            audioSourceStreamIndex: audioSourceStreamIndex,
+            discTitleID: discTitleID
         )
     }
 
@@ -648,11 +671,16 @@ public final class AetherEngine: ObservableObject {
     /// probe runs there) and when the probe failed but playback
     /// proceeds anyway (URL sources can be reopened internally).
     @discardableResult
+    /// - Parameter discTitleID: For a disc image (Blu-ray / DVD ISO), the title to open (id from
+    ///   `discTitles`). nil opens the main title. Threaded into the probe so the chosen title is honored
+    ///   on the first frame; an out-of-range id clamps to the main title. `selectTitle(id:)` and
+    ///   background-resume route through here to (re)open at the right title (#67).
     public func load(
         source: MediaSource,
         startPosition: Double? = nil,
         options: LoadOptions = .init(),
-        audioSourceStreamIndex: Int32? = nil
+        audioSourceStreamIndex: Int32? = nil,
+        discTitleID: Int? = nil
     ) async throws -> SourceProbe? {
         // Preserve the NativeAVPlayerHost across native->native reloads so AVKit's system Now-Playing
         // registration survives the seam (issue #15). Captured before stopInternal resets playbackBackend;
@@ -696,6 +724,9 @@ public final class AetherEngine: ObservableObject {
         nativeSubtitleTracks = []
         metadata = nil
         fontAttachments = []
+        discTitles = []
+        selectedDiscTitle = nil
+        discChapters = []
         subtitleCueDiagnosticCount = 0
         // Reset format/dimension state so paths that skip the probe (nativeRemoteHLS) or find no video
         // don't keep publishing the predecessor's values (e.g. Live TV after an HDR10 film kept reporting .hdr10).
@@ -748,10 +779,10 @@ public final class AetherEngine: ObservableObject {
                 case .url(let u):
                     // isLive configures the AVIOReader for endless-feed mode; must be set at open time because
                     // the probe demuxer is reused as the session demuxer (avformat_open_input runs only once).
-                    try probe.open(url: u, extraHeaders: options.httpHeaders, isLive: options.isLive)
+                    try probe.open(url: u, extraHeaders: options.httpHeaders, isLive: options.isLive, selectTitleID: discTitleID)
                 case .custom(let reader, let formatHint):
                     // isLive suppresses SEEK_END duration estimate on forward-only live readers; same open-time requirement.
-                    try probe.open(reader: reader, formatHint: formatHint, isLive: options.isLive)
+                    try probe.open(reader: reader, formatHint: formatHint, isLive: options.isLive, selectTitleID: discTitleID)
                 }
             }.value
             probeOpened = true
@@ -811,6 +842,17 @@ public final class AetherEngine: ObservableObject {
         subtitleTracks = probedSubtitleTracks
         metadata = probeOpened ? probe.mediaMetadata() : nil
         fontAttachments = probeOpened ? probe.fontAttachmentInfos() : []
+        // Disc titles/chapters off the probe demuxer (post-detach, on MainActor) so the host can populate
+        // a title picker. selectedDiscTitleID reflects what DiscReader.wrap actually selected (discTitleID
+        // clamped to an in-range id); non-disc sources report empty/nil (#67).
+        discTitles = probeOpened ? probe.discTitleInfos() : []
+        discChapters = probeOpened ? probe.discChapterInfos() : []
+        activeDiscTitleID = probeOpened ? probe.selectedDiscTitleID : nil
+        selectedDiscTitle = activeDiscTitleID.flatMap { id in discTitles.first { $0.id == id } }
+        // Content start PTS for the software-path chapter-seek base (see sourceStartSeconds). start_time is
+        // AV_NOPTS_VALUE (Int64.min) when unknown; only a positive value is a real offset.
+        let probedStartTime = probeOpened ? probe.formatStartTime : 0
+        sourceStartSeconds = probedStartTime > 0 ? Double(probedStartTime) / Double(AV_TIME_BASE) : 0
         // Assemble SourceProbe now while the demuxer is open; ownership transfers to loadNative/loadSoftware
         // after which streams are gone (AetherEngine#28).
         let sourceProbe: SourceProbe? = probeOpened
@@ -1134,6 +1176,9 @@ public final class AetherEngine: ObservableObject {
         }
         guard let url = loadedURL else { return }
         let pos = currentTime
+        // Snapshot the disc title before load()'s stopInternal wipes it, so a background-resumed disc image
+        // keeps the title the user selected instead of reverting to the main title (#67).
+        let titleID = activeDiscTitleID
         // Live: rejoin at the live edge; pre-suspend playhead is stale and may have slid out of the window.
         let resume: Double? = LiveReloadPolicy.resumePosition(
             isLive: loadedOptions.isLive, currentTime: pos)
@@ -1141,7 +1186,7 @@ public final class AetherEngine: ObservableObject {
         // backlog where the fresh-join contract (seg0 == live edge) no longer holds.
         var options = loadedOptions
         options.isLiveRejoin = options.isLive
-        try await load(url: url, startPosition: resume, options: options)
+        try await load(url: url, startPosition: resume, options: options, discTitleID: titleID)
         // Arm the watchdog so a live reopen whose AVPlayer never becomes ready fails visibly instead of freezing.
         if options.isLive, !options.nativeRemoteHLS, playbackBackend == .native {
             armLiveReloadWatchdog(generation: loadGeneration)
@@ -1432,6 +1477,92 @@ public final class AetherEngine: ObservableObject {
         }
     }
 
+    /// Switch the active disc title (a Blu-ray playlist or DVD-Video title) mid-playback. Rebuilds the
+    /// pipeline from the new title's start; expect a brief black frame like a fresh load. No-op when `id`
+    /// is out of range, already selected, there is no disc, or the source is a forward-only custom reader.
+    /// `id` is a `TitleInfo.id` from `discTitles`. (#67)
+    public func selectTitle(id: Int) {
+        if isCustomSource && !customSourceIsSeekable {
+            EngineLog.emit(
+                "[AetherEngine] selectTitle(\(id)) ignored: forward-only custom source cannot rebuild its pipeline",
+                category: .engine
+            )
+            return
+        }
+        guard let url = loadedURL else { return }
+        guard discTitles.contains(where: { $0.id == id }) else {
+            EngineLog.emit(
+                "[AetherEngine] selectTitle: id=\(id) not in discTitles (\(discTitles.map { $0.id })), ignored",
+                category: .engine
+            )
+            return
+        }
+        if activeDiscTitleID == id { return }
+
+        EngineLog.emit("[AetherEngine] selectTitle: scheduling switch to title \(id)", category: .engine)
+        let gen = loadGeneration
+        let options = loadedOptions
+        let custom = isCustomSource
+        Task { @MainActor [weak self] in
+            guard let self = self else { return }
+            if custom {
+                // Custom readers (e.g. SMB ISO) have no URL to reopen; rebuild on the retained reader with the
+                // title override, restarting at the new title's head.
+                await self.reloadWithAudioOverride(
+                    url: url,
+                    audioStreamIndex: nil,
+                    expectedGeneration: gen,
+                    discTitleIDOverride: id,
+                    resumeOverride: 0
+                )
+            } else {
+                // Liveness guard: a stop()/load() enqueued between selectTitle and this body would otherwise be
+                // resurrected by the load() below (selectAudioTrack gets this for free via reloadWithAudioOverride).
+                guard self.loadGeneration == gen else {
+                    EngineLog.emit("[AetherEngine] selectTitle reload superseded before start; ignored", category: .engine)
+                    return
+                }
+                // URL/local disc: a full reload re-probes the new title and republishes audio/subtitle/title/
+                // duration plus re-runs the display-criteria handshake. Correct because a title switch changes
+                // content entirely (unlike the audio-switch fast path, which keeps the panel mode).
+                do {
+                    try await self.load(url: url, startPosition: 0, options: options, discTitleID: id)
+                } catch is CancellationError {
+                    // Superseded by a newer load/stop; it owns engine state.
+                } catch {
+                    EngineLog.emit("[AetherEngine] selectTitle reload failed: \(error)", category: .engine)
+                }
+            }
+        }
+    }
+
+    /// Seek to a chapter within the active disc title. `id` is a `ChapterInfo.id` from `discChapters`. A thin
+    /// wrapper over `seek(to:)` (no pipeline rebuild, since the chapter lives in the playing title's stream).
+    /// No-op when `id` is unknown. (#67)
+    public func selectChapter(id: Int) {
+        guard let chapter = discChapters.first(where: { $0.id == id }) else {
+            EngineLog.emit(
+                "[AetherEngine] selectChapter: id=\(id) not in discChapters (\(discChapters.map { $0.id })), ignored",
+                category: .engine
+            )
+            return
+        }
+        // discChapters are title-relative (0-based: chapter 1 = 0), matching the disc timeline and the
+        // 0-based title duration. The engine clock and seek(to:) run on the source-PTS axis, which begins at
+        // the title's content start; that base differs by backend (native re-times onto a 0-based playlist
+        // shifted by playlistShiftSeconds; the software path's raw clock begins at the container start,
+        // sourceStartSeconds). Add it so the seek lands on the chapter, not the base seconds early.
+        let base = (playbackBackend == .software) ? sourceStartSeconds : playlistShiftSeconds
+        let target = chapter.startSeconds + base
+        EngineLog.emit(
+            "[AetherEngine] selectChapter: seeking to chapter \(id) @ title-relative "
+            + "\(String(format: "%.2f", chapter.startSeconds))s -> source \(String(format: "%.2f", target))s "
+            + "(base \(String(format: "%.2f", base))s, backend \(playbackBackend))",
+            category: .engine
+        )
+        Task { @MainActor [weak self] in await self?.seek(to: target) }
+    }
+
     /// Most recent sidecar subtitle URL; rehydrated by selectAudioTrack after pipeline reload. Cleared on clearSubtitle/stop.
     var loadedSidecarURL: URL?
     /// Active secondary sidecar URL, or nil. Mirror of loadedSidecarURL.
@@ -1551,6 +1682,13 @@ public final class AetherEngine: ObservableObject {
         isLoadingSecondarySubtitles = false
         // Clear so a stale index from the previous session can't be re-applied before the next load() repopulates audioTracks.
         activeAudioTrackIndex = nil
+        // Disc title state. activeDiscTitleID is plain state the reload paths snapshot BEFORE this runs, so
+        // clearing it here can't strip a title carried across an audio switch / background-resume reopen (#67).
+        discTitles = []
+        selectedDiscTitle = nil
+        discChapters = []
+        activeDiscTitleID = nil
+        sourceStartSeconds = 0
         isLive = false
         liveWindow = nil
         clock.liveEdgeTime = 0

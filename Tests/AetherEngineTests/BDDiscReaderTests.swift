@@ -23,10 +23,12 @@ final class BDDiscReaderTests: XCTestCase {
     }
 
     func test_wrapReturnsMpegtsConcatForBD() throws {
-        let (reader, hint) = try XCTUnwrap(try DiscReader.wrap(DataIOReader(data: bdImage())))
-        XCTAssertEqual(hint, "mpegts")
+        let info = try XCTUnwrap(try DiscReader.wrap(DataIOReader(data: bdImage())))
+        XCTAssertEqual(info.formatHint, "mpegts")
+        XCTAssertEqual(info.titles.count, 1)  // single-playlist fixture -> one title
+        XCTAssertEqual(info.selectedTitleIndex, 0)
         var buf = [UInt8](repeating: 0, count: 5)
-        _ = buf.withUnsafeMutableBufferPointer { reader.read($0.baseAddress, size: 5) }
+        _ = buf.withUnsafeMutableBufferPointer { info.reader.read($0.baseAddress, size: 5) }
         XCTAssertEqual(buf, [0x00,0x00,0x00,0x00,0x47])
     }
 
@@ -47,5 +49,28 @@ final class BDDiscReaderTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(d.resolvedM2TSExtentCount, 2)
         XCTAssertTrue(d.wrapRecognized)
         XCTAssertEqual(d.wrapFormatHint, "mpegts")
+    }
+
+    // #67: selectTitle threads a title id into wrap. An out-of-range id must clamp to the main
+    // title (index 0), not crash or leak a stale id from a previously played disc. This is the
+    // cross-disc-bleed safety net selectTitle(id:) and the bg-resume reload both rely on.
+    func test_wrapSelectTitleIDOutOfRangeClampsToMain() throws {
+        let info = try XCTUnwrap(try DiscReader.wrap(DataIOReader(data: bdImage()), selectTitleID: 7))
+        XCTAssertEqual(info.titles.count, 1)
+        XCTAssertEqual(info.selectedTitleIndex, 0)
+    }
+
+    func test_wrapSelectTitleIDInRangeSelectsIt() throws {
+        let info = try XCTUnwrap(try DiscReader.wrap(DataIOReader(data: bdImage()), selectTitleID: 0))
+        XCTAssertEqual(info.selectedTitleIndex, 0)
+        XCTAssertEqual(info.selectedTitle?.id, 0)
+    }
+
+    func test_inspectListsTitles() throws {
+        let d = DiscInspector.inspect(DataIOReader(data: bdImage()))
+        XCTAssertEqual(d.titles.count, 1)                          // single-playlist fixture -> one title
+        XCTAssertEqual(d.titles[0].id, 0)
+        XCTAssertEqual(d.selectedTitleIndex, 0)
+        XCTAssertTrue(d.titles[0].chapterStartsSeconds.isEmpty)    // the fixture playlist declares no PlayListMarks
     }
 }
