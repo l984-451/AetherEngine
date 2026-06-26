@@ -10,6 +10,139 @@ the public-API contract.
 
 ## [Unreleased]
 
+## [4.1.0] — 2026-06-25
+
+### Added
+
+- **Disc title and chapter selection for DVD-Video and Blu-ray (#67).** A disc image now exposes every selectable title and the chapters of the playing title, and the host can switch between them. `engine.discTitles` lists the titles (Blu-ray playlists / DVD title sets, longest first so id 0 is the main feature) with each one's duration and chapter count; `engine.selectedDiscTitle` is the active one; `engine.selectTitle(id:)` switches title, rebuilding from the new title's head (the selection survives audio-track switches and background resume, and a fresh `load` defaults to the main title). `engine.discChapters` carries the selected title's chapters and `engine.selectChapter(id:)` seeks to one (a thin seek, no pipeline rebuild). Blu-ray titles and chapters come from the MPLS playlists and their PlayListMark entries; DVD titles, durations, and chapters come from the VMGI TT_SRPT and each title set's program chain (whole-VTS resolution, per-cell / episodic splitting deferred). Chapter starts are title-relative and `selectChapter` rebases them onto the playback clock (the native playlist shift, or the software path's container start PTS) so the seek lands. A new `discTitleID` parameter on `load` opens a disc straight to a chosen title, and `aetherctl disc-inspect` prints the full title + chapter list for a local image.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/4.1.0))
+
+## [4.0.7] — 2026-06-25
+
+### Added
+
+- **Remote disc images (ISO 9660 / UDF / Blu-ray BDMV) over HTTP(S) (#64).** A local `.iso` is routed through the disc adapter, but the HTTP open path fed the source straight to libavformat, which fails to probe a disc image (it is a filesystem, not a media container) and returned an error, so network ISO playback never worked. New `HTTPDiscIOReader` is a seekable reader over an http(s) disc image using byte-range requests (the remote twin of the local file reader): it probes total size and range support up front and serves reads from an adaptive sliding read-ahead window (small for the scattered disc-structure reads at open, growing while playback stays sequential), with per-request retry/backoff so a transient blip does not end playback. `openHTTP` now routes a disc-image URL (`.iso` / `.img` / `.udf`) through the disc adapter exactly like the local path, and falls back to the streaming reader when the source is not a recognizable disc (so a mislabeled `.iso` still plays). The server must support byte ranges; if it does not, the reader logs why and falls back. Gated on the extension so normal media URLs keep the optimized streaming open with no probe cost.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/4.0.7))
+
+## [4.0.6] — 2026-06-25
+
+### Fixed
+
+- **DTS-HD Master Audio on a Blu-ray (MPEG-TS / M2TS) played silent (#64).** The bundled FFmpeg build (FFmpegBuild) enables a minimal parser allow-list, and it was missing the `dca` parser. On a byte-stream container the demuxer needs a codec's parser to assemble a complete frame; without `dca`, the MPEG-TS demuxer handed the decoder the DTS core (`0x7FFE8001`) and the following DTS-HD extension substream (`0x64582025`) as two separate packets, so every extension frame was rejected with "Residual encoded channels are present without core" and the track was silent. Matroska was unaffected because its blocks are already whole frames (only the `.m2ts` path was silent), which is why the same disc remuxed to MKV, or its audio extracted with `ffmpeg -c copy`, decoded fine. Fixed by bumping to FFmpegBuild 1.0.3, which enables `dca` and, in the same pass, the other parsers missing for already-bundled decoders: `mlp` (TrueHD/MLP), `vc1` (VC-1 video), and `dvbsub` / `dvdsub` (DVB and DVD bitmap subtitles), so the same framing class cannot bite TrueHD or VC-1 on M2TS either. No engine code change.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/4.0.6))
+
+## [4.0.5] — 2026-06-25
+
+### Fixed
+
+- **A Blu-ray whose content starts late played nothing until you seeked past the start (#64 follow-up).** The 4.0.4 disk-fill fix routes a sparse MPEG-TS keyframe index to the uniform-stride segment plan, but that plan anchored its source-axis boundaries at PTS 0. On a title whose first keyframe is well after zero (one real disc starts at 11.6s) the leading segments covered source time that has no frames, so the producer never emitted them while the playlist still advertised them, and the player's first-segment fetch was permanently out of range (it just kept restarting the producer). Playback only worked after seeking past the content start. The uniform plan now anchors its boundaries at the first keyframe (falling back to the video stream start time), exactly like the keyframe-aligned plan, so segment 0 begins at the content start. No public API change.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/4.0.5))
+
+## [4.0.4] — 2026-06-25
+
+### Fixed
+
+- **A Blu-ray (MPEG-TS / M2TS) source could fill the device disk and play neither video nor audio (#64).** MPEG-TS carries no upfront keyframe table the way Matroska Cues or MP4 `stss` do, so the VOD segment planner only saw the handful of keyframes that `avformat_find_stream_info` plus the mid-file prewarm seek happened to index (on a long title: one near the start, a cluster near the seek point). The keyframe-aligned planner trusted that sparse, clustered list whenever it had at least two entries and built a degenerate plan whose first segment spanned the whole gap (a 110 minute title produced a single ~3288 second segment). The fragmented-MP4 muxer runs with `+frag_custom`, so it emits a fragment only at an explicit segment cut; with one enormous segment it buffered nearly the entire title in libavformat's interleaver before any flush, which grew to multiple gigabytes that the device compressed and swapped until the disk filled, and `+delay_moov` kept `init.mp4` empty until that first flush so the player got no video either. Two fixes, both engine-internal: (1) the planner now rejects a keyframe index whose largest inter-keyframe gap exceeds `max(targetSegmentDuration * 4, 30)` seconds and falls back to the uniform-stride plan (regular ~4 second segments); (2) the muxer now caps how much it buffers within any one segment, force-flushing a fragment into the current file once the buffered video span exceeds ~2 segment durations (the same drain the cut uses, without rotating the file), which bounds memory on any long segment regardless of plan shape and also populates `init.mp4` promptly so video starts. No public API change.
+
+### Known limitations
+
+- On the same disc, the default DTS-HD Master Audio track decodes to no audio: its frames code the lossless extension as a residual on top of the core, which libavcodec's DCA decoder cannot reconstruct, so the bridge skips them. The fix above restores video; selecting one of the disc's AC3 tracks gives audio. The DTS-HD MA case is tracked separately.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/4.0.4))
+
+## [4.0.3] — 2026-06-25
+
+### Fixed
+
+- **Enabling subtitles could freeze or badly slow the scrub-preview (trickplay) thumbnails (#27).** On-device scrub thumbnails are produced by an independent still-extraction pipeline that opens its own connection to the source and runs on a single serial decode queue. Its remote-source chunk read could park on a flat ~35s timeout with no way to cancel it, so a single stalled read froze the queue and pinned the preview on one frame while further scrubs queued behind it. Turning subtitles on is what triggered it: that spins up a third reader (the subtitle side-demuxer, opened with the persistent playback profile and a 90s read-ahead) which competes with the thumbnail reader for the source's bandwidth and the device's cores, lengthening the cold reads into the park; with subtitles off the reads return promptly and the preview tracks the scrub. Interlaced 480p MPEG-2 made it worse because that codec is software-decoded, so playback already held the cores. The still-extraction reader now aborts an in-flight fetch within ~100ms when a scrub supersedes it (or on teardown), bounds each decode with a short read deadline, fails fast (one retry instead of three across two URLs), and the thumbnail decoder is capped to two threads at `.utility` QoS so it can no longer starve the real-time software playback decode. Engine-internal change; no public API change. The playback and live read paths are untouched.
+
+- **Dead live remote-HLS streams froze silently instead of retuning.** When a live IPTV/HLS source stopped delivering segments (segment 404s or an expired auth token), the native player's `failedToPlayToEnd` was only logged and the item stayed `readyToPlay`, so no terminal error reached the host and the automatic live retune never fired (the picture just froze). Remote-HLS `failedToPlayToEnd` is now routed through deferred-confirmation into a terminal error (gated to remote-HLS live only), so the host's live retune kicks in.
+
+### Diagnostics
+
+- Added a positive content-vs-clock ledger and a VOD backpressure-wedge probe to keep instrumenting the #65 post-seek-burst frame-drift investigation.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/4.0.3))
+
+## [4.0.2] — 2026-06-25
+
+### Fixed
+
+- **DTS-HD Master Audio lost its lossless XLL extension in FLAC bridge mode (#66).** The 4.0.1 fix routed every DTS source through the `dca_core` bitstream filter, stripping each packet to its lossy DTS core before the decoder. For DTS-HD MA streams that decode the full lossless XLL cleanly, that downgraded `.lossless` (FLAC) output to lossy 5.1, audible for hosts bridging to a multichannel-LPCM AVR. The bridge now decodes the full stream again (DTS-HD MA reconstructs the lossless XLL as S32P, re-encoded bit-perfectly to FLAC), and keeps the per-packet `EINVAL` skip that handles the rare residual-XLL-without-core frame (#64). It also re-derives the resampler input format from each decoded frame (the canonical libswresample contract, matching the software audio decoder), so a stream whose `sample_fmt` was unresolved at decoder open, or a bailed live probe, can no longer misread the decoded samples as the seed format. The `dca_core` filter is simply no longer used; no FFmpegBuild change is required.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/4.0.2))
+
+## [4.0.1] — 2026-06-24
+
+### Fixed
+
+- **DTS-HD Master Audio still failed to bridge after the 3.13.4 core-only attempt (#64).** 3.13.4 opened the `dca` decoder with `core_only=1` to skip the lossless XLL extension, but on Blu-ray the DTS core is carried as an asset inside the extension substream (EXSS), not as a standalone core sync, so `core_only` made libavcodec report "No valid DCA sub-stream found" and emit no audio (it even printed "Consider disabling 'core_only'"). The bridge now runs DTS through the `dca_core` bitstream filter, which strips each DTS-HD (MA / HRA) packet to its mandatory core at the bitstream level, so the decoder only ever sees full-rate 5.1/7.1 core PCM and never attempts the XLL reconstruction that residual-codes channels without a usable core. Falls back gracefully to the full decode path (with single-packet EINVAL skipping) if a build lacks the filter. Requires FFmpegBuild 1.0.2 (which enables `dca_core`).
+
+## [4.0.0] — 2026-06-24
+
+### Added
+
+- **End-of-media is now surfaced to hosts as `PlaybackState.ended` (#63).** Each playback host already tracked `didReachEnd`, but the engine consumed it internally and collapsed the public surface to `.idle`, indistinguishable from pre-load or `stop()`. Hosts that want end-of-playback behavior (mark-watched, autoplay-next, dismiss) could only work around it on the native path by observing the handed-out `AVPlayer` for `AVPlayerItemDidPlayToEndTime`; on the software-decode path there is no public `AVPlayer`, so there was no recourse at all. The engine now has a dedicated terminal state, `PlaybackState.ended`, set on end-of-media across every backend (native / software / audio); `stop()` still goes to `.idle`. `.ended` is terminal: `seek` / `togglePlayPause` are no-ops, and the next `load(...)` clears it.
+
+### Breaking
+
+- **`PlaybackState` gains a `.ended` case.** Adding a case to a (non-frozen) public enum is source-breaking: an exhaustive `switch` over `PlaybackState` that lacks an `@unknown default` no longer compiles until it handles `case .ended`. This is the only breaking change in 4.0.0 and the reason for the major bump; it ships as a major precisely so `from:`-pinned adopters opt into it deliberately rather than being broken on a routine `swift package update`. Migration: add `case .ended` (run end-of-playback handling) wherever you previously treated `.idle` as end-of-media, and keep `.idle` for pre-load / stopped.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/4.0.0))
+
+## [3.13.4] — 2026-06-24
+
+### Fixed
+
+- **DTS-HD Master Audio failed to bridge ("Residual encoded channels are present without core", #64).** When the audio bridge decoded a DTS-HD MA / HRA track (common on Blu-ray remuxes), the libavcodec `dca` decoder rejected many frames with `EINVAL` because their lossless XLL extension uses residual coding that cannot reconstruct standalone, so the bridge produced no audio for those frames. The bridge re-encodes to lossy EAC3 (or FLAC) and discards the XLL refinement anyway, so it now decodes the mandatory DTS core only (`core_only`), which reconstructs full-rate 5.1/7.1 PCM on every frame. No effect on plain DTS core streams.
+- **UDF reader follows allocation-extent continuations (tag 258).** A file whose allocation descriptors overflow its (E)FE chains the rest through an Allocation Extent Descriptor (extent type 3). The reader now follows that chain (depth-bounded) instead of treating the continuation pointer as a bogus data extent. Defensive: inline descriptors already cover ~114 GiB per file, so no current Blu-ray needs it, but a heavily fragmented title would otherwise under-resolve.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/3.13.4))
+
+## [3.13.3] — 2026-06-24
+
+### Fixed
+
+- **Music Now Playing crashed on tvOS 26 with embedded cover art.** The bare-AVPlayer audio Now Playing path crashed on tvOS 26 (`dispatch_assert_queue_fail`) when a track carried embedded artwork: the system harvested and decoded the asset's embedded cover off the expected queue, and a non-Sendable artwork closure ran off its actor. The engine now follows Apple's recommended path, an auto-publishing `MPNowPlayingSession` with per-item `AVPlayerItem.nowPlayingInfo` instead of manual `MPNowPlayingInfoCenter` writes or `externalMetadata`, with writes gated on item readiness to avoid the serial-queue crash during item swaps, and the audio is wrapped in a metadata-free composition so the system never decodes the asset's (sometimes corrupt) embedded artwork.
+- **Blu-ray ISO playback failed for every real UDF 2.50 disc image (#62).** The UDF reader found the volume anchor and parsed the volume structure, but listing the root directory returned nothing, so no `BDMV` was found, `DiscReader.wrap` returned `nil`, and the raw image fell through to a plain FFmpeg open that reports `AVERROR_INVALIDDATA`. The cause was a partition-reference bug: a metadata-resident file entry's `short_ad` allocation descriptors were resolved against the physical partition. A `short_ad` carries no partition reference, so it is relative to the file entry's own recording partition; for a metadata-partition entry that means metadata-virtual blocks resolved through the Metadata File. The root directory data lives in the metadata partition, so the wrong sectors were read. `short_ad` now resolves against the file entry's own partition (`long_ad`, which carries an explicit reference for the physical m2ts payload, was already correct). Verified end to end against the Blender Sintel Blu-ray ISO.
+- **Audio bridge pipeline diagnostics label ordered as "source -> bridge"** so the logged stage order reads correctly.
+
+### Changed
+
+- **The video decoder frame-handler contract is now `@Sendable`,** hardening the off-actor decode callback for Swift 6 strict concurrency.
+- **Bumped FFmpegBuild to 1.0.1 (FFmpeg n8.1.2).**
+
+### Added
+
+- **`AetherEngine.inspectDisc(url:)` plus `aetherctl disc-inspect [--dump]`.** An FFmpeg-free, stage-by-stage walk of a local disc image (ISO9660/UDF signatures, UDF root and BDMV tree, parsed `.mpls` playlists, selected main title, resolved m2ts extents) that reports exactly where recognition bails. `DiscReader` also emits gated `[disc]` diagnostics on the playback path so a future failure is debuggable instead of a silent `nil`.
+
+### Documentation
+
+- **Live MPEG-TS sliding-window and DVR rewind marked device-confirmed** in the formats documentation.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/3.13.3))
+
+## [3.13.2] — 2026-06-23
+
+### Fixed
+
+- **Adversarial bug-audit pass: roughly a dozen correctness, concurrency, and memory-safety fixes across the engine.** The demuxer now synchronizes its `AVIOReader` close flags to close a persistent-connection teardown race, the audio bridge serializes its mutators under an internal lock, drains the decoder at EOF so the final tail is not dropped, and frees partial encoded packets when a FIFO drain throws. The native subtitle cue store is now guarded against the pump thread, SMB `cancel()` unblocks a parked read instead of waiting out the timeout, live seek finalize is guarded on the load generation to drop superseded seeks, and `FrameExtractor` flushes its decoder at EOF so last-GOP snapshots are not lost.
+- **Disc reader hardened against untrusted and cancelled reads.** `DiscReader.readAll` now caps untrusted UDF extent allocation, `ConcatIOReader.cancel()` forwards to the base reader, and the sidecar subtitle path avoids a double-free of its `AVFormatContext` when an HTTP open fails. The DVR feeder also seeds at a real keyframe when the seek target precedes the ring.
+
+### Performance
+
+- **O(log n) `segmentIndex` lookup.** The per-packet segment-index resolution now uses a binary search instead of an O(n) linear scan over stored segments.
+
+### Changed
+
+- **Internal quality pass.** Strict-concurrency and deprecation warnings cleared (27 in total), dead code and redundant comments pruned, FragmentSplitter and SegmentCache index math covered by new tests, and the dual-subtitle API plus `dualsubs` CLI documented.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/3.13.2))
+
 ## [3.13.1] — 2026-06-22
 
 ### Fixed

@@ -13,96 +13,99 @@ struct DemuxerOpenProfile: Sendable {
     var maxAnalyzeDuration: Int64
     var avioPrefetch: Bool
     var avioChunkSize: Int
+    /// Per-chunk Range-request budget for the seekable (still-extraction) AVIO path.
+    /// Caps how long a single cold/stalled chunk read can park before it aborts.
+    /// Playback keeps the generous default (its reads go through the persistent
+    /// reader; this only bounds open-time size probes). Still extraction shrinks it
+    /// so a disposable scrub thumbnail never freezes the decode queue (issue #27).
+    var avioRequestTimeout: TimeInterval
+    /// Retry passes for a failed seekable chunk fetch. Still extraction drops this
+    /// to a single attempt: a scrub thumbnail is disposable and must fail fast
+    /// rather than ride a 3-retry-times-2-URL storm (issue #27).
+    var avioMaxRetries: Int
 
     static let playback = DemuxerOpenProfile(
         probesize: 50 * 1024 * 1024,
         maxAnalyzeDuration: 60 * 1_000_000,
         avioPrefetch: true,
-        avioChunkSize: 4 * 1024 * 1024
+        avioChunkSize: 4 * 1024 * 1024,
+        avioRequestTimeout: 35,
+        avioMaxRetries: 3
     )
 
     static let stillExtraction = DemuxerOpenProfile(
         probesize: 2 * 1024 * 1024,
         maxAnalyzeDuration: 2 * 1_000_000,
         avioPrefetch: false,
-        avioChunkSize: 1 * 1024 * 1024
+        avioChunkSize: 1 * 1024 * 1024,
+        avioRequestTimeout: 8,
+        avioMaxRetries: 1
     )
 }
 
-/// FFmpeg AVFormatContext wrapper. Opens a media URL, reads the stream
-/// info, and produces demuxed `AVPacket`s for the decoder.
-///
-/// For HTTP(S) URLs, uses a custom AVIO context backed by URLSession
-/// (since FFmpegBuild has no built-in network stack). File URLs are
-/// handled directly by FFmpeg's file protocol.
-///
-/// Thread safety: `readPacket()` and `seek()` are serialized via an
-/// internal lock, so `seek()` can safely be called from any thread
-/// (e.g. main actor) while the demux loop reads on a background queue.
+/// AVFormatContext wrapper. HTTP(S) uses custom AVIO via URLSession (no built-in
+/// network stack in FFmpegBuild); file:// uses FFmpeg's file protocol directly.
+/// `readPacket()` and `seek()` serialized via `accessLock` for thread safety.
 public final class Demuxer: @unchecked Sendable {
     private var formatContext: UnsafeMutablePointer<AVFormatContext>?
 
-    /// Serializes access to formatContext between readPacket() (demux queue)
-    /// and seek() (main actor), prevents concurrent AVFormatContext access
-    /// that triggers assertion failures in matroskadec.c.
+    // Serializes formatContext access between readPacket() and seek();
+    // concurrent access triggers assertion failures in matroskadec.c.
     private let accessLock = NSLock()
 
-    /// Retained while the format context is open for AVIO-backed sources
-    /// (HTTP via AVIOReader, custom via CustomIOReaderBridge).
     private var avioProvider: AVIOProvider?
-
-    /// Profile supplied to the most recent `open` call. Governs probe
-    /// budget in `applyProbeBudget` and (in a later task) AVIO tuning.
     private var openProfile: DemuxerOpenProfile = .playback
 
-    /// Cumulative bytes fetched by the AVIO reader since the source
-    /// was opened. Used by the engine's memory probe to compare
-    /// network throughput against RSS growth. Zero for `file://`
-    /// sources (no AVIOReader is involved).
-    var avioBytesFetched: Int64 {
-        avioProvider?.cumulativeBytesFetched ?? 0
-    }
+    // Memory probe: compare against RSS growth; 0 for file:// sources.
+    var avioBytesFetched: Int64 { avioProvider?.cumulativeBytesFetched ?? 0 }
 
-    /// Whether the opened source supports seeking. Forward-only custom
-    /// sources report false; URL sources and unopened demuxers report true.
-    var isSourceSeekable: Bool {
-        avioProvider?.isSeekable ?? true
-    }
+    // Forward-only custom sources report false.
+    var isSourceSeekable: Bool { avioProvider?.isSeekable ?? true }
 
-    /// Timestamp of the AVIO reader's last unplanned reconnect (drop or
-    /// stall, not a seek). Nil for non-HTTP sources or when no drop has
-    /// occurred. The live producer correlates this with a backward
-    /// source-PTS reset to detect a server that restarted its stream
-    /// from the beginning on re-GET (see `AVIOReader.lastUnplannedReconnectAt`).
+    /// Timestamp of last unplanned reconnect (drop/stall, not a seek).
+    /// Live producer correlates with backward source-PTS reset to detect
+    /// Jellyfin transcode respawn. See `AVIOReader.lastUnplannedReconnectAt`.
     var lastUnplannedSourceReconnectAt: Date? {
         (avioProvider as? AVIOReader)?.lastUnplannedReconnectAt
     }
 
+    // MARK: - Disc titles / chapters (#67)
+
+    private(set) var discTitles: [DiscTitle] = []
+    private(set) var selectedDiscTitleIndex: Int = 0
+
+    private func adoptDiscInfo(_ info: DiscInfo) {
+        discTitles = info.titles
+        selectedDiscTitleIndex = info.selectedTitleIndex
+    }
+
+    /// The disc's titles mapped to the public model (empty for non-disc sources).
+    func discTitleInfos() -> [TitleInfo] { discTitles.map { $0.titleInfo() } }
+    /// Chapters of the currently selected title (empty until BD/DVD chapters are populated).
+    func discChapterInfos() -> [ChapterInfo] { discTitles.chapterInfos(selectedIndex: selectedDiscTitleIndex) }
+    /// The id of the selected title, or nil for a non-disc source.
+    var selectedDiscTitleID: Int? {
+        discTitles.indices.contains(selectedDiscTitleIndex) ? discTitles[selectedDiscTitleIndex].id : nil
+    }
+
     /// Open a media URL and probe its streams.
-    ///
-    /// `extraHeaders` are attached to every HTTP request the AVIO
-    /// reader issues against `url` (HEAD probe + Range / streaming
-    /// GETs). Ignored for `file://` URLs. Pass auth tokens or any
-    /// other server-required headers here. Default empty.
-    ///
-    /// `isLive` marks the source as a genuinely endless live feed and
-    /// is forwarded to `AVIOReader` so it suppresses the
-    /// `position >= fileSize` EOF synthesis and surfaces a terminal
-    /// error when the reconnect cap is hit (instead of collapsing to a
-    /// silent EOF). Has no effect on `file://` sources.
-    func open(url: URL, extraHeaders: [String: String] = [:], profile: DemuxerOpenProfile = .playback, isLive: Bool = false) throws {
+    /// - Parameters:
+    ///   - extraHeaders: Attached to every HTTP request (ignored for file:// URLs).
+    ///   - isLive: Suppresses EOF synthesis and surfaces terminal error on reconnect cap.
+    func open(url: URL, extraHeaders: [String: String] = [:], profile: DemuxerOpenProfile = .playback, isLive: Bool = false, selectTitleID: Int? = nil) throws {
         self.openProfile = profile
         let isHTTP = url.scheme == "http" || url.scheme == "https"
 
         if isHTTP {
-            try openHTTP(url: url, extraHeaders: extraHeaders, isLive: isLive)
+            try openHTTP(url: url, extraHeaders: extraHeaders, isLive: isLive, selectTitleID: selectTitleID)
         } else {
             // Route a local DVD ISO through the disc adapter (FileIOReader keeps it
             // out of RAM). Falls back to the normal local open when not a disc.
             if url.isFileURL, let fileReader = FileIOReader(url: url),
-               let (discReader, discHint) = try DiscReader.wrap(fileReader) {
-                let bridge = CustomIOReaderBridge(reader: discReader)
-                let inputFormat = av_find_input_format(discHint)
+               let discInfo = try DiscReader.wrap(fileReader, selectTitleID: selectTitleID) {
+                adoptDiscInfo(discInfo)
+                let bridge = CustomIOReaderBridge(reader: discInfo.reader)
+                let inputFormat = av_find_input_format(discInfo.formatHint)
                 try openWithProvider(bridge, inputFormat: inputFormat, isLive: isLive)
                 return
             }
@@ -112,7 +115,6 @@ public final class Demuxer: @unchecked Sendable {
 
     // MARK: - Open Strategies
 
-    /// Open a local file URL via FFmpeg's built-in file protocol.
     private func openLocal(url: URL) throws {
         var ctx: UnsafeMutablePointer<AVFormatContext>? = avformat_alloc_context()
         guard let allocated = ctx else {
@@ -133,23 +135,16 @@ public final class Demuxer: @unchecked Sendable {
         try probeStreams(openedCtx)
     }
 
-    /// Open a media source backed by a custom `IOReader` (memory buffer,
-    /// encrypted archive, etc.). `formatHint` (e.g. "mp4", "matroska")
-    /// disambiguates probing when no filename is available; pass nil to
-    /// probe from content only. `isLive` suppresses the duration-estimate
-    /// SEEK_END that would latch EOF on a forward-only live reader (same
-    /// fix as the URL live path, 38ad60b, now for custom sources).
-    func open(reader: IOReader, formatHint: String? = nil, profile: DemuxerOpenProfile = .playback, isLive: Bool = false) throws {
+    /// Open a custom `IOReader` source. `formatHint` disambiguates probing when
+    /// no filename is available. `isLive` suppresses SEEK_END that latches EOF
+    /// on forward-only readers (38ad60b). AetherEngine#36: DiscReader adapts
+    /// DVD/BD ISOs to VOB/MPEGTS concat streams.
+    func open(reader: IOReader, formatHint: String? = nil, profile: DemuxerOpenProfile = .playback, isLive: Bool = false, selectTitleID: Int? = nil) throws {
         self.openProfile = profile
-        // DVD ISO detection (AetherEngine #36). An ISO is a filesystem image,
-        // not a demuxable container; DiscReader adapts it to the main title's
-        // concatenated VOB stream demuxed as MPEG-PS. Non-disc sources return
-        // nil from wrap and fall through to the normal custom-reader open.
-        // The synthetic reader's bytes are the VOB stream (no "CD001"), so this
-        // cannot re-trigger detection.
-        if let (discReader, discHint) = try DiscReader.wrap(reader) {
-            let bridge = CustomIOReaderBridge(reader: discReader)
-            let inputFormat = av_find_input_format(discHint)
+        if let discInfo = try DiscReader.wrap(reader, selectTitleID: selectTitleID) {
+            adoptDiscInfo(discInfo)
+            let bridge = CustomIOReaderBridge(reader: discInfo.reader)
+            let inputFormat = av_find_input_format(discInfo.formatHint)
             try openWithProvider(bridge, inputFormat: inputFormat, isLive: isLive)
             return
         }
@@ -158,34 +153,51 @@ public final class Demuxer: @unchecked Sendable {
         try openWithProvider(bridge, inputFormat: inputFormat, isLive: isLive)
     }
 
-    /// Open an HTTP(S) URL via custom AVIO context + URLSession.
-    private func openHTTP(url: URL, extraHeaders: [String: String], isLive: Bool = false) throws {
+    /// A remote disc image (ISO 9660 / UDF / BDMV) by URL extension. Gates the HTTP disc-adapter
+    /// path so a normal media URL keeps the optimized streaming AVIOReader open with no probe cost.
+    static func isDiscImageURL(_ url: URL) -> Bool {
+        ["iso", "img", "udf"].contains(url.pathExtension.lowercased())
+    }
+
+    private func openHTTP(url: URL, extraHeaders: [String: String], isLive: Bool = false, selectTitleID: Int? = nil) throws {
+        // A remote disc image goes through the same disc adapter as a local ISO (a raw .iso handed
+        // straight to libavformat fails to probe; it is a filesystem, not a media container, #64).
+        // Gated on the disc-image extension so normal media URLs skip the range-probe entirely; if
+        // the source is not a recognizable disc, fall through to the streaming reader.
+        if !isLive, Self.isDiscImageURL(url),
+           let discReader = HTTPDiscIOReader(url: url, extraHeaders: extraHeaders) {
+            if let discInfo = try DiscReader.wrap(discReader, selectTitleID: selectTitleID) {
+                adoptDiscInfo(discInfo)
+                let bridge = CustomIOReaderBridge(reader: discInfo.reader)
+                let inputFormat = av_find_input_format(discInfo.formatHint)
+                try openWithProvider(bridge, inputFormat: inputFormat, isLive: false)
+                return
+            }
+            discReader.close()
+        }
         let reader = AVIOReader(
             url: url,
             extraHeaders: extraHeaders,
             chunkSize: openProfile.avioChunkSize,
             prefetchEnabled: openProfile.avioPrefetch,
-            isLive: isLive
+            isLive: isLive,
+            chunkRequestTimeout: openProfile.avioRequestTimeout,
+            chunkMaxRetries: openProfile.avioMaxRetries
         )
         try openWithProvider(reader, isLive: isLive)
     }
 
-    /// Shared open path for AVIO-backed sources. Opens the provider,
-    /// attaches its AVIOContext to a fresh AVFormatContext, then runs
-    /// avformat_open_input + the stream probe. `inputFormat` forces a
-    /// demuxer when non-nil (custom sources with a format hint). `isLive`
-    /// suppresses the duration-estimate SEEK_END that would latch EOF on an
-    /// unknown-length live source.
+    /// Common AVIO open path. `inputFormat` forces a demuxer (custom sources with
+    /// a format hint). `isLive` suppresses duration-estimate SEEK_END that latches
+    /// EOF on unknown-length live sources.
     private func openWithProvider(
         _ provider: AVIOProvider,
         inputFormat: UnsafePointer<AVInputFormat>? = nil,
         isLive: Bool = false
     ) throws {
-        // 1. Open the provider (HEAD probe for HTTP, alloc context for custom).
         try provider.open()
         avioProvider = provider
 
-        // 2. Allocate an empty AVFormatContext and attach the provider's AVIO.
         guard let ctx = avformat_alloc_context() else {
             avioProvider?.close()
             avioProvider = nil
@@ -195,7 +207,7 @@ public final class Demuxer: @unchecked Sendable {
         applyProbeBudget(ctx)
         formatContext = ctx
 
-        // 3. Open input, URL is nil because pb is already set.
+        // URL is nil because pb is already set.
         var ctxPtr: UnsafeMutablePointer<AVFormatContext>? = ctx
         var opts: OpaquePointer? = nil
         Self.applyDemuxerOptions(&opts, isLive: isLive)
@@ -207,80 +219,34 @@ public final class Demuxer: @unchecked Sendable {
             avioProvider = nil
             throw DemuxerError.openFailed(code: ret)
         }
-        // avformat_open_input may reallocate, update our reference.
-        formatContext = ctxPtr
+        formatContext = ctxPtr  // avformat_open_input may reallocate
 
         try probeStreams(ctxPtr!)
     }
 
-    /// Default probe budgets are tuned for live network streams, 5 MB
-    /// of bytes and ~5 seconds of analysed content. For big container
-    /// files (10–20 GB Blu-ray rips) with sparse subtitle streams that
-    /// budget runs out before libavformat sees a single PGS / DVB
-    /// presentation segment, leaving those tracks with no codec
-    /// parameters and the decoder unable to assemble cues. Bumping
-    /// to 50 MB / 60 s gives the probe enough material without
-    /// noticeably slowing playback start (LAN can move 50 MB in
-    /// well under a second).
+    /// Default 5 MB/5s budgets miss sparse PGS/DVB tracks on 10-20 GB Blu-ray rips.
+    /// 50 MB/60 s ensures codec params are populated without noticeably slowing open.
     private func applyProbeBudget(_ ctx: UnsafeMutablePointer<AVFormatContext>) {
         ctx.pointee.probesize = openProfile.probesize
         ctx.pointee.max_analyze_duration = openProfile.maxAnalyzeDuration
     }
 
-    /// Demuxer options passed to every `avformat_open_input` call.
-    ///
-    /// `+genpts`: libavformat regenerates missing pts/dts values
-    /// using its own battle-tested algorithm rather than relying on
-    /// our custom NOPTS-dts repair logic. Per DrHurt's pointer on
-    /// AetherEngine#4 this is the option Jellyfin's server-side
-    /// remux uses for problem MKVs. Empirically cuts the long-form
-    /// 4K HDR HEVC RSS growth roughly in half on Sodalite (3.24
-    /// MB/sec → ~1.7 MB/sec).
-    ///
-    /// Tried + reverted (in this order):
-    ///   `+sortdts`        — re-orders output packets by dts. Empirical
-    ///                       RSS growth got worse: sortdts buffers more
-    ///                       inside libavformat before yielding sorted
-    ///                       packets. Also doesn't honour HEVC open-GOP
-    ///                       leading B-frames in matroska.
-    ///   `+discardcorrupt` — drops packets the demuxer flags as
-    ///                       corrupted. AVPlayer buffers around those
-    ///                       drops, RSS growth got worse.
-    ///   `+igndts`         — DrHurt's suggestion (AetherEngine#5,
-    ///                       2026-05-22). Tells libavformat to ignore
-    ///                       container dts and infer from pts. Intent
-    ///                       was to obsolete the producer-side NOPTS
-    ///                       repair stack. Field test showed the
-    ///                       "video dts non-monotonic at source" log
-    ///                       line still fires once per producer init on
-    ///                       HEVC open-GOP CRA leading B-frames — the
-    ///                       matroska demuxer emits dts=0 for the
-    ///                       leading B-frame even with +igndts (pts
-    ///                       inference would give pts < anchor dts for
-    ///                       B-frames, which would itself be wrong in
-    ///                       decode order, so the demuxer keeps the
-    ///                       zero). Repair stack stayed load-bearing,
-    ///                       reverted to avoid carrying an option that
-    ///                       doesn't change behaviour. See
-    ///                       [[project_matroska_nopts_dts]].
+    /// Demuxer fflags applied to every avformat_open_input.
+    /// +genpts: libavformat regenerates missing pts/dts; per AetherEngine#4 this is
+    /// what Jellyfin's server-side remux uses. Cuts 4K HDR HEVC RSS growth ~50%
+    /// (3.24 MB/s -> ~1.7 MB/s). Tried+reverted: +sortdts (worse RSS), +discardcorrupt
+    /// (worse RSS), +igndts (AetherEngine#5: matroska still emits dts=0 on HEVC open-GOP
+    /// CRA B-frames, NOPTS repair stack stayed load-bearing).
     private static func applyDemuxerOptions(_ opts: inout OpaquePointer?, isLive: Bool = false) {
         av_dict_set(&opts, "fflags", "+genpts", 0)
         if isLive {
-            // A live HTTP source has unknown length (Content-Length absent,
-            // fileSize == -1). libavformat's stream-info pass still tries to
-            // estimate the duration by seeking toward SEEK_END; our reader
-            // returns -1 for that seek, and the failed end-seek LATCHES
-            // `pb->eof_reached`. That sticky flag then surfaces as
-            // AVERROR_EOF from av_read_frame once the buffer drains the bytes
-            // pulled during probing (~10 s in), ending the producer pump for
-            // good even though the live feed is still streaming. Skipping the
-            // PTS-based duration estimate avoids the SEEK_END entirely, so the
-            // live source is never given a synthesized EOF.
+            // Live sources have no Content-Length; stream-info pass seeks SEEK_END,
+            // which latches pb->eof_reached and collapses av_read_frame ~10s in.
+            // skip_estimate_duration_from_pts avoids that SEEK_END entirely.
             av_dict_set(&opts, "skip_estimate_duration_from_pts", "1", 0)
         }
     }
 
-    /// Common stream probing after open.
     private func probeStreams(_ ctx: UnsafeMutablePointer<AVFormatContext>) throws {
         let findRet = avformat_find_stream_info(ctx, nil)
         guard findRet >= 0 else {
@@ -306,53 +272,36 @@ public final class Demuxer: @unchecked Sendable {
         #endif
     }
 
-    /// Duration in seconds (or 0 if unknown).
     var duration: Double {
         guard let ctx = formatContext else { return 0 }
         let dur = ctx.pointee.duration
         return dur > 0 ? Double(dur) / Double(AV_TIME_BASE) : 0
     }
 
-    /// AVFormatContext.bit_rate in bits-per-second, or 0 if unknown.
-    /// libavformat computes this from the container's reported size +
-    /// duration; for sources where the container doesn't expose either
-    /// (some live streams, malformed files) it falls back to 0. Callers
-    /// should fall back to a safe over-declared estimate when 0 is
-    /// returned. Used by `HLSVideoEngine.masterBandwidth /
-    /// masterAverageBandwidth` to populate the HLS master playlist's
-    /// BANDWIDTH and AVERAGE-BANDWIDTH attributes from real source
-    /// data instead of a hardcoded 5 Mbps default.
+    /// AVFormatContext.bit_rate in bps, or 0 if unknown. Used by
+    /// HLSVideoEngine.masterBandwidth to populate HLS BANDWIDTH attributes.
     var bitRate: Int64 {
         guard let ctx = formatContext else { return 0 }
         return ctx.pointee.bit_rate
     }
 
-    /// AVFormatContext.start_time in microseconds (AV_TIME_BASE units),
-    /// or 0 / AV_NOPTS_VALUE if unknown. Many MKV / TS sources have a
-    /// non-zero format start_time when re-muxed from broadcast or
-    /// edited from longer files; subtracting it from packet PTS yields
-    /// playback time relative to the start of the file's content.
+    /// AVFormatContext.start_time in AV_TIME_BASE units. Non-zero on re-muxed
+    /// MKV/TS; subtract from packet PTS for file-relative playback time.
     var formatStartTime: Int64 {
         guard let ctx = formatContext else { return 0 }
         return ctx.pointee.start_time
     }
 
-    /// Index of the best video stream, or -1 if none.
-    ///
-    /// Clamped: on failure `av_find_best_stream` returns the error code
-    /// `AVERROR_STREAM_NOT_FOUND` (-1381258232, FFERRTAG 0xF8 "STR"),
-    /// not -1. Callers compare against and log this value, so normalize
-    /// to the documented -1 instead of leaking what reads like garbage.
+    /// Index of the best video stream, or -1.
+    /// Clamped: av_find_best_stream returns AVERROR_STREAM_NOT_FOUND (-1381258232)
+    /// on failure, not -1; normalize to -1 to avoid garbage in logs.
     var videoStreamIndex: Int32 {
         guard let ctx = formatContext else { return -1 }
         return max(-1, av_find_best_stream(ctx, AVMEDIA_TYPE_VIDEO, -1, -1, nil, 0))
     }
 
-    /// True if `index` names an existing VIDEO stream. Used by the live
-    /// producer to detect an SSAI program change that introduces a new
-    /// video PID mid-stream (the ad creative is authored with a different
-    /// video PID than the program; libavformat creates a fresh stream for
-    /// it, so the producer's cached videoStreamIndex stops matching).
+    /// True if `index` names a video stream. Live producer uses this to detect
+    /// an SSAI program change that introduces a new video PID mid-stream.
     func isVideoStream(_ index: Int32) -> Bool {
         accessLock.lock(); defer { accessLock.unlock() }
         guard let ctx = formatContext, index >= 0, index < ctx.pointee.nb_streams,
@@ -361,27 +310,17 @@ public final class Demuxer: @unchecked Sendable {
     }
 
 
-    /// Index of the best audio stream, or -1 if none. Same
-    /// `AVERROR_STREAM_NOT_FOUND` clamp as `videoStreamIndex`.
-    ///
-    /// Beware: `av_find_best_stream` SKIPS audio streams whose codecpar
-    /// has no channels or no sample_rate, which is exactly the state a
-    /// live MPEG-TS probe leaves behind when `find_stream_info` gives
-    /// up before decoding an audio frame. Such a stream still appears
-    /// in `audioTrackInfos()` (codec_type-based); use
-    /// `firstAudioStreamIndexByType` as the fallback pick for that
-    /// shape.
+    /// Best audio stream index, or -1 (same AVERROR_STREAM_NOT_FOUND clamp as videoStreamIndex).
+    /// GOTCHA: av_find_best_stream skips streams with no channels/sample_rate (live MPEG-TS
+    /// probe may leave them that way). Use `firstAudioStreamIndexByType` as fallback.
     var audioStreamIndex: Int32 {
         guard let ctx = formatContext else { return -1 }
         return max(-1, av_find_best_stream(ctx, AVMEDIA_TYPE_AUDIO, -1, -1, nil, 0))
     }
 
-    /// First stream whose codec_type is audio, regardless of codecpar
-    /// completeness, or -1 if none. Fallback for the live-TS shape
-    /// described on `audioStreamIndex`: the stream exists and is listed
-    /// in `audioTrackInfos()`, but `av_find_best_stream` refuses it
-    /// because its codec parameters are empty; the engine's live AAC
-    /// codecpar repair fills them downstream.
+    /// First audio stream by codec_type regardless of codecpar completeness.
+    /// Fallback for live MPEG-TS where av_find_best_stream skips empty-codecpar
+    /// streams; the engine's live AAC codecpar repair fills them downstream.
     var firstAudioStreamIndexByType: Int32 {
         guard let ctx = formatContext else { return -1 }
         for i in 0..<Int(ctx.pointee.nb_streams) {
@@ -393,7 +332,6 @@ public final class Demuxer: @unchecked Sendable {
         return -1
     }
 
-    /// Extract metadata for all audio streams.
     func audioTrackInfos() -> [TrackInfo] {
         guard let ctx = formatContext else { return [] }
         var tracks: [TrackInfo] = []
@@ -406,7 +344,6 @@ public final class Demuxer: @unchecked Sendable {
         return tracks
     }
 
-    /// Extract metadata for all subtitle streams.
     func subtitleTrackInfos() -> [TrackInfo] {
         guard let ctx = formatContext else { return [] }
         var tracks: [TrackInfo] = []
@@ -419,11 +356,6 @@ public final class Demuxer: @unchecked Sendable {
         return tracks
     }
 
-    /// Container-level metadata (title/artist/album + embedded cover).
-    /// Reads the format-context metadata dictionary; cover art comes from
-    /// the stream flagged AV_DISPOSITION_ATTACHED_PIC (its `attached_pic`
-    /// packet holds the encoded image bytes). Returns an all-nil value
-    /// when nothing is present.
     func mediaMetadata() -> MediaMetadata {
         guard let ctx = formatContext else {
             return MediaMetadata(title: nil, artist: nil, album: nil, artworkData: nil)
@@ -438,8 +370,6 @@ public final class Demuxer: @unchecked Sendable {
         )
     }
 
-    /// Encoded bytes of the first attached-picture stream's cover art, or
-    /// nil when the container has no embedded artwork.
     private func attachedPictureData() -> Data? {
         guard let ctx = formatContext else { return nil }
         for i in 0..<Int(ctx.pointee.nb_streams) {
@@ -453,11 +383,8 @@ public final class Demuxer: @unchecked Sendable {
         return nil
     }
 
-    /// Build TrackInfo from an AVStream's metadata.
     private func trackInfo(from stream: UnsafeMutablePointer<AVStream>, index: Int) -> TrackInfo {
         let codecpar = stream.pointee.codecpar!
-
-        // Codec name
         let codecName: String
         if let codec = avcodec_find_decoder(codecpar.pointee.codec_id) {
             codecName = String(cString: codec.pointee.name)
@@ -465,11 +392,8 @@ public final class Demuxer: @unchecked Sendable {
             codecName = "unknown"
         }
 
-        // Language and title from stream metadata
         let language = metadataValue(stream.pointee.metadata, key: "language")
         let title = metadataValue(stream.pointee.metadata, key: "title")
-
-        // Build display name
         let name: String
         if let title = title, !title.isEmpty {
             name = title
@@ -482,28 +406,20 @@ public final class Demuxer: @unchecked Sendable {
         let isDefault = (stream.pointee.disposition & AV_DISPOSITION_DEFAULT) != 0
         let channels = Int(codecpar.pointee.ch_layout.nb_channels)
 
-        // Atmos detection mirrors the gate used by the audio engine
-        // selectAudioTrack path: EAC3 with profile 30 = JOC, which is
-        // what every Dolby-Atmos-on-streaming elementary stream is in
-        // practice. Lets the UI label the row "Atmos" instead of just
-        // its bed channel count.
+        // EAC3 profile 30 = JOC (Dolby Atmos on streaming). Lets UI label "Atmos".
         let isAtmos = (codecpar.pointee.codec_id == AV_CODEC_ID_EAC3)
             && codecpar.pointee.profile == 30
 
-        // ASS / SSA tracks carry their script header ([Script Info] +
-        // [V4+ Styles] + the [Events] format line) as codec extradata.
-        // Surface it so hosts that opt into raw ASS event lines
-        // (LoadOptions.preserveASSMarkup) can resolve style references.
+        // ASS/SSA codec extradata = script header ([Script Info] + [V4+ Styles] +
+        // [Events] format line). Surfaced for LoadOptions.preserveASSMarkup hosts.
         var assHeader: String? = nil
         let codecID = codecpar.pointee.codec_id
         if codecID == AV_CODEC_ID_ASS || codecID == AV_CODEC_ID_SSA,
            let extradata = codecpar.pointee.extradata,
            codecpar.pointee.extradata_size > 0 {
             let bytes = Data(bytes: extradata, count: Int(codecpar.pointee.extradata_size))
-            // Strip NUL bytes: MKV CodecPrivate is frequently
-            // NUL-terminated, and downstream consumers (libass parses
-            // C-string-style) silently stop at the first NUL, hiding
-            // anything a host appends after the header.
+            // MKV CodecPrivate is frequently NUL-terminated; strip NULs so libass
+            // (C-string-style parser) doesn't silently stop before host-appended content.
             assHeader = String(data: bytes, encoding: .utf8)?
                 .replacingOccurrences(of: "\0", with: "")
         }
@@ -520,12 +436,8 @@ public final class Demuxer: @unchecked Sendable {
         )
     }
 
-    /// Font files attached to the container (MKV attachment streams).
-    /// Payload bytes live in the attachment stream's codec extradata;
-    /// filename and MIME type in its stream metadata. Non-font
-    /// attachments (cover art lives on ATTACHED_PIC video streams and
-    /// never reaches here; chapters/XML attachments are filtered by
-    /// the MIME/extension check) are skipped.
+    /// MKV font attachments. Payload in codec extradata; filename/MIME in stream metadata.
+    /// Non-font attachments filtered by isFontPayload.
     func fontAttachmentInfos() -> [FontAttachment] {
         guard let ctx = formatContext else { return [] }
         var fonts: [FontAttachment] = []
@@ -554,14 +466,12 @@ public final class Demuxer: @unchecked Sendable {
         return fonts
     }
 
-    /// Read a metadata value from an AVDictionary.
     private func metadataValue(_ dict: OpaquePointer?, key: String) -> String? {
         guard let dict = dict else { return nil }
         guard let entry = av_dict_get(dict, key, nil, 0) else { return nil }
         return String(cString: entry.pointee.value)
     }
 
-    /// Access an AVStream by index.
     func stream(at index: Int32) -> UnsafeMutablePointer<AVStream>? {
         guard let ctx = formatContext, index >= 0, index < ctx.pointee.nb_streams else {
             return nil
@@ -569,28 +479,10 @@ public final class Demuxer: @unchecked Sendable {
         return ctx.pointee.streams[Int(index)]
     }
 
-    /// Mark every stream outside `keep` with `AVDISCARD_ALL` so the
-    /// demuxer skips parsing + queueing its packets at the lowest
-    /// level. For our 4K HDR HEVC sources with 4 PGS subtitle streams
-    /// (large per-frame bitmaps) and 2 audio streams the matroska
-    /// demuxer otherwise reads cluster blocks for all 7 streams every
-    /// time it serves a video packet, parses them, and queues them in
-    /// its per-stream packet queue waiting for someone to ask. Our
-    /// pump silently drops them via `continue` at the consumer side,
-    /// but by then the demuxer has already done the work and the
-    /// queues hold the packets until av_read_frame iterates them out
-    /// and our pump throws them away.
-    ///
-    /// With `discard = AVDISCARD_ALL` the demuxer drops the packet
-    /// before parsing it into an AVPacket, eliminating the alloc +
-    /// queue + free cycle for every subtitle bitmap and unused audio
-    /// frame. Counted against the long-form 4K HDR RSS leak this is
-    /// directly proportional: PGS bitmap rate × ~4 streams cuts to
-    /// zero.
-    ///
-    /// Call after `avformat_find_stream_info` (i.e. after open
-    /// returns) and before any `readPacket` calls. Safe to call
-    /// multiple times.
+    /// Sets AVDISCARD_ALL on streams outside `keep`. Without this, matroska reads
+    /// cluster blocks for all streams on every video packet and queues unused PGS
+    /// bitmaps and audio frames. AVDISCARD_ALL drops before AVPacket alloc, eliminating
+    /// that cycle. Call after open, before readPacket. Safe to call multiple times.
     func discardAllStreamsExcept(_ keep: Set<Int32>) {
         accessLock.lock()
         defer { accessLock.unlock() }
@@ -604,27 +496,11 @@ public final class Demuxer: @unchecked Sendable {
         }
     }
 
-    /// Enumerate the source's keyframe positions for the given stream
-    /// from libavformat's index, returning each entry's `timestamp`
-    /// field in the stream's native timebase.
-    ///
-    /// MKV / Matroska sources populate their index from the `Cues`
-    /// element, which is parsed lazily on the first seek. To get a
-    /// useful answer from this method on those sources, the caller
-    /// must have already issued a seek (the cue-prewarm in
-    /// `HLSVideoEngine.start()` does this). Sources that ship a
-    /// keyframe index in their header (MP4 `stss`, MPEG-TS pcr-based,
-    /// etc.) populate it during `avformat_find_stream_info` and are
-    /// ready immediately.
-    ///
-    /// Returns an empty array when the index is empty or the stream
-    /// index is invalid — callers should treat that as "no usable
-    /// index, fall back to a uniform-stride plan".
-    ///
-    /// FFmpeg's index entries are all keyframe seek points by
-    /// definition; the `AVINDEX_KEYFRAME` bit is checked defensively
-    /// in case a future libavformat version starts mixing
-    /// non-keyframe seek targets in.
+    /// Keyframe timestamps in stream native timebase from libavformat's index.
+    /// MKV populates from Cues lazily on first seek (cue-prewarm in
+    /// HLSVideoEngine.start() ensures it's ready). MP4 stss / MPEG-TS populate
+    /// during avformat_find_stream_info. Empty = no usable index, fall back to
+    /// uniform-stride plan. AVINDEX_KEYFRAME checked defensively.
     func indexedKeyframes(streamIndex: Int32) -> [Int64] {
         accessLock.lock()
         defer { accessLock.unlock() }
@@ -649,9 +525,6 @@ public final class Demuxer: @unchecked Sendable {
         return result
     }
 
-    /// Read the next packet from the container.
-    /// Returns the packet on success, nil at EOF.
-    /// Throws on read errors (network failure, corrupt data, etc).
     func readPacket() throws -> UnsafeMutablePointer<AVPacket>? {
         accessLock.lock()
         defer { accessLock.unlock() }
@@ -670,9 +543,7 @@ public final class Demuxer: @unchecked Sendable {
         return packet
     }
 
-    /// Seek to a position in seconds.
-    /// Uses avformat_seek_file instead of av_seek_frame, more robust
-    /// for MKV containers (av_seek_frame triggers assertion failures
+    /// Seek via avformat_seek_file (not av_seek_frame: assertion failures
     /// in matroskadec.c with nested elements).
     func seek(to seconds: Double) {
         accessLock.lock()
@@ -685,24 +556,13 @@ public final class Demuxer: @unchecked Sendable {
             EngineLog.emit("[Demuxer] Seek to \(seconds)s failed: \(ret)", category: .demux)
             #endif
         }
-        // Flush internal parser state after seek, prevents assertion
-        // failures in matroskadec.c when reading the next packet.
-        avformat_flush(ctx)
+        avformat_flush(ctx)  // prevents assertion failures in matroskadec.c
     }
 
-    /// Like `seek(to:)`, but aborts the underlying AVIO reads after `timeout`
-    /// seconds. Returns `true` if the seek completed, `false` if it was
-    /// aborted by the deadline (or otherwise failed).
-    ///
-    /// Needed for the VOD cue prewarm: on a source whose MKV Cues index is
-    /// missing or points past the end of the file (truncated / mis-muxed
-    /// remux), libavformat's matroska seek degrades from the expected "one or
-    /// two byte-range reads" into a sequential linear scan of roughly half the
-    /// file. On a 70+ GB remote source that is tens of minutes — a de-facto
-    /// hang. Bounding it lets the seek fail fast so the caller falls back to a
-    /// uniform-stride segment plan and playback can start immediately. Only
-    /// `AVIOReader` (URL-backed) honours the deadline; other providers run the
-    /// plain seek (local / custom sources don't exhibit this pathology).
+    /// Seek with AVIO read deadline. Returns true if completed; false if aborted.
+    /// Needed for VOD cue prewarm: missing/truncated MKV Cues causes matroska to
+    /// degrade from "1-2 byte-range reads" into a linear half-file scan on a remote
+    /// 70+ GB source (de-facto hang). Only AVIOReader honours the deadline.
     @discardableResult
     func seekBounded(to seconds: Double, timeout: TimeInterval) -> Bool {
         accessLock.lock()
@@ -714,35 +574,33 @@ public final class Demuxer: @unchecked Sendable {
         let timestamp = Int64(seconds * Double(AV_TIME_BASE))
         let ret = avformat_seek_file(ctx, -1, Int64.min, timestamp, Int64.max, 0)
         avformat_flush(ctx)
-        // matroska can return success with a partial index even after the
-        // read was aborted mid-scan, so the deadline flag — not `ret` — is the
-        // authoritative signal of whether the seek was capped.
+        // matroska may return success with a partial index after abort; deadline flag
+        // is authoritative, not ret.
         let capped = reader?.readDeadlineFired ?? false
         return ret >= 0 && !capped
     }
 
-    /// Fast, lock-free unblock: mark the AVIO reader closed so its read
-    /// callback returns -1 immediately and a suspended `av_read_frame`
-    /// (including one parked in the live reconnect loop) returns at once.
-    /// Frees no resources. Call this synchronously when cancelling a pump so
-    /// the pump can unwind without waiting on the (potentially slow) `close()`
-    /// teardown. Idempotent; `close()` calls it again before freeing.
+    /// Arm a wall-clock read deadline on the AVIO reader so a stalled HTTP read
+    /// (seek or readPacket) aborts instead of parking. Used by FrameExtractor still
+    /// extraction so a disposable scrub thumbnail bounds its decode and never freezes
+    /// the serial decode queue (issue #27). No-op for file:// / custom sources.
+    func beginReadDeadline(secondsFromNow seconds: TimeInterval) {
+        (avioProvider as? AVIOReader)?.beginReadDeadline(secondsFromNow: seconds)
+    }
+
+    /// Disarm the read deadline armed by `beginReadDeadline`.
+    func endReadDeadline() {
+        (avioProvider as? AVIOReader)?.endReadDeadline()
+    }
+
+    /// Fast lock-free unblock: AVIO read callback returns -1, av_read_frame returns
+    /// at once. No resource freeing. Call before close() when cancelling a pump.
     func markClosed() {
         avioProvider?.markClosed()
     }
 
-    /// Close the format context and release resources.
-    /// Thread-safe: waits for any in-progress readPacket() to finish
-    /// before freeing the format context. The AVIO reader is marked
-    /// closed first so its callback returns -1 immediately, unblocking
-    /// any suspended av_read_frame call.
     func close() {
-        // 1. Mark AVIO as closed, read callback returns -1 immediately.
-        //    This unblocks av_read_frame if the demux thread is suspended
-        //    inside a read (tvOS suspends threads in background).
-        avioProvider?.markClosed()
-
-        // 2. Wait for readPacket() to release the lock, then tear down.
+        avioProvider?.markClosed()  // unblocks av_read_frame (tvOS suspends threads in background)
         accessLock.lock()
         if formatContext != nil {
             avformat_close_input(&formatContext)

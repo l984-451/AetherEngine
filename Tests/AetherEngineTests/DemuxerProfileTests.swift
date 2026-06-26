@@ -19,4 +19,17 @@ struct DemuxerProfileTests {
         #expect(p.probesize < DemuxerOpenProfile.playback.probesize)
         #expect(p.maxAnalyzeDuration < DemuxerOpenProfile.playback.maxAnalyzeDuration)
     }
+
+    /// Issue #27 (Sodalite): a stalled still-extraction chunk read could ride a
+    /// ~35s syncRequest park times up to 3 retries times 2 URL passes, freezing the
+    /// scrub-preview. The disposable thumbnail fetch must cap its per-chunk budget
+    /// and retries far below the playback path.
+    @Test("stillExtraction caps the per-chunk request budget below playback")
+    func stillExtractionReadBudget() {
+        let still = DemuxerOpenProfile.stillExtraction
+        let playback = DemuxerOpenProfile.playback
+        #expect(still.avioRequestTimeout < playback.avioRequestTimeout)
+        #expect(still.avioMaxRetries < playback.avioMaxRetries)
+        #expect(still.avioMaxRetries >= 1)
+    }
 }

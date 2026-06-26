@@ -148,7 +148,6 @@ public struct AetherPlayerSurface: UIViewRepresentable {
     }
 
     public func updateUIView(_ uiView: AetherPlayerView, context: Context) {
-        // No-op. State updates flow through engine's @Published properties.
     }
 
     public static func dismantleUIView(_ uiView: AetherPlayerView, coordinator: ()) {

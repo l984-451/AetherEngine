@@ -4,22 +4,17 @@ import CoreVideo
 import Libavformat
 import Libavcodec
 
-/// Callback type for decoded video frames.
-///
-/// `hdr10PlusT35` carries the source-frame's HDR10+ dynamic metadata,
-/// already serialised to the ITU-T T.35 byte format Apple's
-/// `kCMSampleAttachmentKey_HDR10PlusPerFrameData` expects. Nil for
-/// non-HDR10+ streams.
-typealias DecodedFrameHandler = (CVPixelBuffer, CMTime, Data?) -> Void
+/// Decoded frame callback. `hdr10PlusT35` carries HDR10+ dynamic metadata serialised to ITU-T T.35 bytes
+/// (kCMSampleAttachmentKey_HDR10PlusPerFrameData format); nil for non-HDR10+ streams.
+typealias DecodedFrameHandler = @Sendable (CVPixelBuffer, CMTime, Data?) -> Void
 
-/// Common surface for the non-AVPlayer playback host's video decoder.
-/// Both `SoftwareVideoDecoder` (libavcodec, used for AV1 / VP9) and
-/// `HardwareVideoDecoder` (VTDecompressionSession, used for HEVC)
-/// conform; the host swaps the implementation per codec at load time
-/// without changing the demux-loop wiring.
-protocol VideoDecodingPipeline: AnyObject {
+/// Common video decoder protocol. SoftwareVideoDecoder (libavcodec, AV1/VP9) and
+/// HardwareVideoDecoder (VTDecompressionSession, HEVC) both conform; the host swaps per codec without rewiring the demux loop.
+// Sendable: both conformers (SoftwareVideoDecoder, HardwareVideoDecoder) are @unchecked Sendable
+// (internally lock-guarded), so `any VideoDecodingPipeline` is safe to capture in @Sendable closures.
+protocol VideoDecodingPipeline: AnyObject, Sendable {
     var onFrame: DecodedFrameHandler? { get set }
-    var onFirstHDR10PlusDetected: (() -> Void)? { get set }
+    var onFirstHDR10PlusDetected: (@Sendable () -> Void)? { get set }
     var skipUntilPTS: CMTime? { get set }
 
     func open(stream: UnsafeMutablePointer<AVStream>, onFrame: @escaping DecodedFrameHandler) throws
@@ -46,10 +41,7 @@ enum VideoDecoderError: Error, LocalizedError {
     }
 }
 
-/// FFmpeg-to-CoreVideo color metadata mapping shared by the SW and HW
-/// video decoders (and the HDR gates elsewhere). One source of truth:
-/// a new primaries/transfer case (P3-DCI, BT.601, ...) lands in every
-/// pipeline at once instead of drifting between hand-kept copies.
+/// FFmpeg-to-CoreVideo color metadata mapping shared by SW and HW decoders (single source of truth for primaries/transfer/matrix).
 enum ColorAttachments {
     static func primaries(_ v: AVColorPrimaries) -> CFString? {
         switch v {

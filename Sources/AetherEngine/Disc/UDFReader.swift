@@ -8,19 +8,22 @@ struct UDFEntry: Equatable {
     let icbPartRef: Int   // child (E)FE partition reference
 }
 
-/// Read-only UDF 2.50 reader for Blu-ray BDMV discs. Resolves the metadata
-/// partition (UDF 2.50) and fragmented-file allocation descriptors. Sector size
-/// 2048. Validates descriptor tag identifiers (not CRC). No external libs.
+/// Read-only UDF 2.50 reader for Blu-ray BDMV. Resolves metadata partition and
+/// fragmented-file allocation descriptors. Sector size 2048. Tag-id validated (not CRC).
 final class UDFReader {
+    /// Verbose volume-structure dump for `aetherctl disc-inspect --dump`. Off in playback.
+    nonisolated(unsafe) static var diagnostics = false
+    private func dbg(_ line: @autoclosure () -> String) {
+        if UDFReader.diagnostics { EngineLog.emit("[udf] \(line())", category: .demux) }
+    }
+
     private let reader: IOReader
     private let ss = 2048
 
-    // Physical partition: ref-index -> (physicalStartSector). For a metadata
-    // partition ref, we instead resolve through `metaMap`.
     private var physPartStart: [Int: Int] = [:]        // physical partition number -> start sector
     private struct PartMap { let isMetadata: Bool; let physicalPartNumber: Int; let metadataFileBlock: Int }
     private var partMaps: [PartMap] = []               // index = partition reference number
-    private var metaExtents: [(start: Int, blocks: Int)] = []  // metadata partition -> physical blocks (per phys partition start)
+    private var metaExtents: [(start: Int, blocks: Int)] = []  // metadata partition physical blocks
     private var fsdBlock = 0
     private var fsdPartRef = 0
     private var rootBlock = 0
@@ -33,8 +36,6 @@ final class UDFReader {
 
     // MARK: public API
 
-    /// List the entries of a directory given by path (e.g. ["BDMV","PLAYLIST"]).
-    /// Empty path = root directory.
     func list(path: [String]) throws -> [UDFEntry] {
         var (block, partRef) = (rootBlock, rootPartRef)
         for name in path {
@@ -47,7 +48,6 @@ final class UDFReader {
         return try readDirectory(block: block, partRef: partRef)
     }
 
-    /// Resolve a file entry's data extents to absolute byte offsets in the ISO.
     func extents(of entry: UDFEntry) throws -> [(offset: Int64, length: Int64)] {
         let fe = try readFileEntry(block: entry.icbBlock, partRef: entry.icbPartRef)
         return try fe.allocationExtents.map { ext in
@@ -56,28 +56,16 @@ final class UDFReader {
         }
     }
 
-    /// Partition reference used to resolve a single allocation descriptor.
-    /// long_ad carries its own partition reference. short_ad blocks are relative
-    /// to the FE's own partition, EXCEPT for metadata-resident FEs whose short_ad
-    /// blocks are physical-partition relative (mirrors the Metadata File's own
-    /// extents). For those, resolve against the underlying physical partition ref.
+    /// Partition ref for an allocation descriptor. long_ad carries its own ref.
+    /// short_ad has none, so it is relative to the FE's own recording partition.
+    /// For a metadata-partition FE that means metadata-virtual blocks (resolved via
+    /// metaExtents, the same mapping the FE was read through): directory data and small
+    /// files live inside the metadata partition. Large file data (m2ts) sits in the
+    /// physical partition and is referenced with long_ad (explicit physical part ref).
+    /// The Metadata File's own extents are physical, but those are read directly in
+    /// parseVolumeStructure, not through this path.
     private func extentPartRef(for fe: FE, ad: AllocExt) -> Int {
-        if let ref = ad.longPartRef { return ref }
-        // short_ad: FE's own partition, unless that partition is metadata.
-        if fe.partRef < partMaps.count, partMaps[fe.partRef].isMetadata {
-            return physicalPartRef(forMetadataRef: fe.partRef)
-        }
-        return fe.partRef
-    }
-
-    /// Find a Type-1 partition reference index that points at the physical
-    /// partition backing the given metadata partition reference.
-    private func physicalPartRef(forMetadataRef metaRef: Int) -> Int {
-        let physNum = partMaps[metaRef].physicalPartNumber
-        for (i, pm) in partMaps.enumerated() where !pm.isMetadata && pm.physicalPartNumber == physNum {
-            return i
-        }
-        return 0
+        ad.longPartRef ?? fe.partRef
     }
 
     // MARK: descriptor IO
@@ -115,22 +103,16 @@ final class UDFReader {
         for i in 0..<vdsSectors {
             let d = try readSector(vdsLoc + i)
             switch tagID(d) {
-            case 5: // Partition Descriptor
-                let pn = u16(d, 22), start = u32(d, 188)
-                physPartStart[pn] = start
-            case 6: // LVD
-                lvd = d
-            case 8: // Terminating
-                break
+            case 5: physPartStart[u16(d, 22)] = u32(d, 188)  // Partition Descriptor
+            case 6: lvd = d                                   // LVD
+            case 8: break                                     // Terminating
             default: break
             }
         }
         guard let lvd else { throw DiscError.malformed("no LVD") }
 
-        // FSD long_ad
-        fsdBlock = u32(lvd, 252); fsdPartRef = u16(lvd, 256)
-        // partition maps
-        let nMaps = u32(lvd, 268)
+        fsdBlock = u32(lvd, 252); fsdPartRef = u16(lvd, 256)  // FSD long_ad
+        let nMaps = u32(lvd, 268)  // partition maps
         let capMaps = min(nMaps, 64)
         var off = 440
         for _ in 0..<capMaps {
@@ -149,23 +131,27 @@ final class UDFReader {
             }
             off += len
         }
-        // Resolve the metadata partition's physical extents from its Metadata File.
+        // Metadata partition physical extents from its Metadata File (short_ad, physStart-relative).
         for pm in partMaps where pm.isMetadata {
             guard let physStart = physPartStart[pm.physicalPartNumber] else { continue }
             let metaFE = try readFileEntryRaw(sector: physStart + pm.metadataFileBlock)
-            // metadata file extents are short_ad, partition-relative to physStart
             metaExtents = metaFE.allocationExtents.map { (start: physStart + $0.block, blocks: $0.length / ss) }
         }
-        // root dir from FSD
-        let fsdSector = try resolve(block: fsdBlock, partRef: fsdPartRef)
+        dbg("vds loc=\(vdsLoc) len=\(vdsLen) sectors=\(vdsSectors)")
+        dbg("physPartStart=\(physPartStart)")
+        dbg("partMaps=\(partMaps.map { $0.isMetadata ? "meta(phys=\($0.physicalPartNumber),fileBlk=\($0.metadataFileBlock))" : "phys(\($0.physicalPartNumber))" })")
+        dbg("metaExtents=\(metaExtents)")
+        dbg("fsd block=\(fsdBlock) partRef=\(fsdPartRef)")
+        let fsdSector = try resolve(block: fsdBlock, partRef: fsdPartRef)  // root dir from FSD
         let fsd = try readSector(fsdSector)
+        dbg("fsd resolved sector=\(fsdSector) tag=\(tagID(fsd))")
         guard tagID(fsd) == 256 else { throw DiscError.malformed("no FSD") }
         rootBlock = u32(fsd, 404); rootPartRef = u16(fsd, 408)
+        dbg("root block=\(rootBlock) partRef=\(rootPartRef)")
     }
 
     // MARK: block resolution
 
-    /// Resolve a (block, partitionReference) to an absolute physical sector.
     private func resolve(block: Int, partRef: Int) throws -> Int {
         guard partRef < partMaps.count else { throw DiscError.malformed("partRef \(partRef)") }
         let pm = partMaps[partRef]
@@ -173,7 +159,7 @@ final class UDFReader {
             guard let start = physPartStart[pm.physicalPartNumber] else { throw DiscError.malformed("phys part") }
             return start + block
         }
-        // metadata partition: map virtual block -> physical via metaExtents
+        // metadata partition: virtual block -> physical via metaExtents
         var remaining = block
         for ext in metaExtents {
             if remaining < ext.blocks { return ext.start + remaining }
@@ -185,48 +171,72 @@ final class UDFReader {
     // MARK: file entry parsing
 
     private struct AllocExt { let block: Int; let length: Int; let longPartRef: Int? }
-    private struct FE { let fileType: Int; let isDir: Bool; let partRef: Int; let allocationExtents: [AllocExt] }
+    private struct FE { let partRef: Int; let allocationExtents: [AllocExt] }
 
     private func readFileEntry(block: Int, partRef: Int) throws -> FE {
         let sector = try resolve(block: block, partRef: partRef)
-        let raw = try readFileEntryRaw(sector: sector)
-        return FE(fileType: raw.fileType, isDir: raw.isDir, partRef: partRef, allocationExtents: raw.allocationExtents)
+        let raw = try readFileEntryRaw(sector: sector, recordingPartRef: partRef)
+        return FE(partRef: partRef, allocationExtents: raw.allocationExtents)
     }
 
-    /// Parse an (E)FE at a physical sector. Supports tag 261 (FE) and 266 (EFE),
+    /// Parse (E)FE at a physical sector. Tag 261 (FE) and 266 (EFE);
     /// short_ad (adType 0) and long_ad (adType 1) allocation descriptors.
-    private func readFileEntryRaw(sector: Int) throws -> FE {
+    /// `recordingPartRef` is the partition the FE is recorded in; it resolves a
+    /// short_ad allocation-extent continuation (extent type 3) to its sector. nil
+    /// for the bootstrap Metadata File read, where the partition map is not yet
+    /// resolvable and a continuation is not expected.
+    private func readFileEntryRaw(sector: Int, recordingPartRef: Int? = nil) throws -> FE {
         let d = try readSector(sector)
         let tid = tagID(d)
         guard tid == 261 || tid == 266 else { throw DiscError.malformed("not a file entry @\(sector): tag \(tid)") }
-        let fileType = Int(d[27])
-        let isDir = fileType == 4
         let adType = u16(d, 34) & 0x07
         let (lEAOff, lADOff, adBase): (Int, Int, Int) = tid == 266 ? (208, 212, 216) : (168, 172, 176)
         let lEA = u32(d, lEAOff)
         let lAD = u32(d, lADOff)
-        let start = adBase + lEA
         var exts: [AllocExt] = []
-        var p = start
-        let end = start + lAD
+        try parseAllocDescriptors(d, start: adBase + lEA, length: lAD, adType: adType,
+                                  recordingPartRef: recordingPartRef, into: &exts)
+        dbg("FE @\(sector): tag=\(tid) adType=\(adType) lEA=\(lEA) lAD=\(lAD) exts=\(exts.map { "(blk:\($0.block),len:\($0.length),ref:\($0.longPartRef.map(String.init) ?? "-"))" })")
+        return FE(partRef: 0, allocationExtents: exts)
+    }
+
+    /// Parse one run of allocation descriptors. Extent type (top 2 bits of the
+    /// length field) 0-2 are data extents; type 3 is a continuation pointer to an
+    /// Allocation Extent Descriptor (tag 258) holding the next run -- used when a
+    /// file's descriptors overflow the (E)FE. Follows the chain, bounded by depth.
+    private func parseAllocDescriptors(_ buf: [UInt8], start: Int, length: Int, adType: Int,
+                                       recordingPartRef: Int?, into exts: inout [AllocExt], depth: Int = 0) throws {
         let stride = adType == 1 ? 16 : 8
-        while p + stride <= min(end, d.count) {
-            let lenField = u32(d, p)
+        var p = start
+        let end = min(start + length, buf.count)
+        while p + stride <= end {
+            let lenField = u32(buf, p)
+            let extType = (lenField >> 30) & 0x3
             let len = lenField & 0x3fffffff
-            let blk = u32(d, p + 4)
+            let blk = u32(buf, p + 4)
+            let longRef: Int? = adType == 1 ? u16(buf, p + 8) : nil
+            if extType == 3 {
+                // Continuation: blk points to an AED with more descriptors. Bounded to
+                // avoid a crafted self-referential chain; one sector holds the AED.
+                guard depth < 16, len > 0, let pref = longRef ?? recordingPartRef,
+                      let contSector = try? resolve(block: blk, partRef: pref) else { break }
+                let aed = try readSector(contSector)
+                guard tagID(aed) == 258 else { break }              // Allocation Extent Descriptor
+                let aedLAD = u32(aed, 20)                            // LengthOfAllocationDescriptors @20 (16 tag + 4 prevLoc)
+                try parseAllocDescriptors(aed, start: 24, length: aedLAD, adType: adType,
+                                          recordingPartRef: recordingPartRef, into: &exts, depth: depth + 1)
+                break  // type 3 is always the final descriptor of the current run
+            }
             if len == 0 { break }
-            let longRef: Int? = adType == 1 ? u16(d, p + 8) : nil
             exts.append(AllocExt(block: blk, length: len, longPartRef: longRef))
             p += stride
         }
-        return FE(fileType: fileType, isDir: isDir, partRef: 0, allocationExtents: exts)
     }
 
     // MARK: directory parsing
 
     private func readDirectory(block: Int, partRef: Int) throws -> [UDFEntry] {
         let fe = try readFileEntry(block: block, partRef: partRef)
-        // Read all the directory's data bytes via its extents.
         let maxDirBytes = 8 * 1024 * 1024
         var data = [UInt8]()
         for ext in fe.allocationExtents {
@@ -241,11 +251,14 @@ final class UDFReader {
                 s += 1
             }
         }
-        // Walk FIDs.
+        dbg("readDirectory block=\(block) partRef=\(partRef): \(data.count) bytes, first16=\(data.prefix(16).map { String(format: "%02x", $0) }.joined(separator: " "))")
         var out: [UDFEntry] = []
         var p = 0
         while p + 38 <= data.count {
-            guard tagID(Array(data[p..<min(p+16, data.count)])) == 257 else { break }
+            guard tagID(Array(data[p..<min(p+16, data.count)])) == 257 else {
+                dbg("  FID parse stop at off=\(p): tag=\(tagID(Array(data[p..<min(p+16, data.count)]))) (expected 257)")
+                break
+            }
             let chars = Int(data[p+18])
             let lfi = Int(data[p+19])
             let icbBlock = u32(data, p+20+4)     // long_ad block @ ICB+4
@@ -256,8 +269,7 @@ final class UDFReader {
             let isDir = (chars & 0x02) != 0
             var name = ""
             if lfi > 0, nameOff + lfi <= data.count {
-                // dstring: first byte compression id (8 or 16)
-                let comp = data[nameOff]
+                let comp = data[nameOff]  // dstring: first byte = compression id (8 or 16)
                 let bytes = Array(data[(nameOff+1)..<(nameOff+lfi)])
                 name = comp == 16 ? String(decoding: utf16be(bytes), as: UTF16.self) : String(decoding: bytes, as: UTF8.self)
             }

@@ -3,22 +3,30 @@ import AetherEngine
 
 // MARK: - seektest: rapid-seek burst repro (issue #35)
 
-/// Drives a real AVPlayer (native loopback-HLS path) through a burst of
-/// rapid seeks and measures the producer-restart behavior, the longest
-/// "wedge" (state == .playing but the clock frozen), the final settle
-/// accuracy, and any non-monotonic clock jumps.
-///
-/// This is the headless macOS analogue of the device repro for #35: the
-/// restart machinery (`requestRestart` / `performRestart` / the segment
-/// provider's restart handler) is platform-agnostic, so the cascade-vs-
-/// coalesced difference is directly observable here via the engine log
-/// tallies, even though macOS AVPlayer's HLS tuning differs from tvOS.
+/// Headless macOS analogue of the #35 device repro: drives AVPlayer through a rapid-seek burst and tallies producer restarts vs. RestartCoalescer coalesces to measure cascade-vs-coalesced behavior.
 @MainActor
 private func seekTestRun(url: URL, seeks: Int, gapMs: Int, settleSeconds: Double) async -> Int32 {
-    // Tally the restart / coalesce log lines that distinguish the cascade
-    // (pre-#35) from the coalesced behavior (post-#35).
+    // Tally log lines distinguishing cascade (pre-#35) vs. RestartCoalescer behavior (post-#35).
     let tally = UncheckedBox<[String: Int]>([:])
-    EngineLog.handler = { line in
+    // #65 discriminator: collect the sequence of published host shifts (one per producer restart) and the raw
+    // producer gate-open shifts. Two distinct values across a burst => cross-epoch shift divergence (Root A).
+    let publishedShifts = UncheckedBox<[Double]>([])
+    let gateOpenShifts = UncheckedBox<[Int]>([])
+    // #65 ledger: largest |drift| (actual source content minus planned source per opened segment). A multi-second
+    // value POSITIVELY confirms a content-vs-clock offset (Root B). Near-zero across a real restart cascade
+    // redirects the 6s symptom to the producer wedge. parkCount = abnormal backpressure parks (VOD wedge signature).
+    let maxLedgerDriftAbs = UncheckedBox<Double>(0)
+    let ledgerCount = UncheckedBox<Int>(0)
+    let parkCount = UncheckedBox<Int>(0)
+    // EngineLog.handler fires from many threads concurrently (demuxer, producer, server, audio). Serialize the
+    // whole body: unsynchronized append to the Swift arrays below corrupts the heap (SIGTRAP) under load.
+    let handlerLock = NSLock()
+    // @Sendable so the closure is NOT inferred @MainActor from this @MainActor function: EngineLog invokes it
+    // synchronously from the HLSSegmentProducer.pump thread, and a MainActor-isolated body traps in Swift 6's
+    // executor check (_dispatch_assert_queue_fail) the moment it makes an isolation-crossing call (prefix(while:)).
+    EngineLog.handler = { @Sendable line in
+        handlerLock.lock()
+        defer { handlerLock.unlock() }
         let t = ISO8601DateFormatter.string(
             from: Date(), timeZone: .current,
             formatOptions: [.withTime, .withFractionalSeconds]
@@ -31,6 +39,29 @@ private func seekTestRun(url: URL, seeks: Int, gapMs: Int, settleSeconds: Double
         bump("coalesced",     "coalesced behind in-flight")
         bump("settleAdvance", "advancing to settled target")
         bump("abandon",       "abandoning it")
+        // "[AetherEngine] #65 VOD shift published: <X>s (prev ...". Parse the published seconds value.
+        if let r = line.range(of: "#65 VOD shift published: ") {
+            let tail = line[r.upperBound...]
+            if let sEnd = tail.range(of: "s "), let v = Double(tail[tail.startIndex..<sEnd.lowerBound]) {
+                publishedShifts.value.append(v)
+            }
+        }
+        // "[HLSSegmentProducer] video gate open: ... shift=<int>". Parse the raw producer shift (source ticks).
+        if let r = line.range(of: "shift="), line.contains("video gate open") {
+            let tail = line[r.upperBound...]
+            let digits = tail.prefix { $0 == "-" || $0.isNumber }
+            if let v = Int(digits) { gateOpenShifts.value.append(v) }
+        }
+        // "[HLSSegmentProducer] #65 ledger seg-... drift=<X>s ...". Track the largest magnitude content drift.
+        if line.contains("#65 ledger ") {
+            ledgerCount.value += 1
+            if let r = line.range(of: "drift=") {
+                let token = line[r.upperBound...].prefix { $0 == "-" || $0 == "." || $0.isNumber }
+                if let v = Double(token) { maxLedgerDriftAbs.value = max(maxLedgerDriftAbs.value, abs(v)) }
+            }
+        }
+        // "[HLSSegmentProducer] #65 backpressure PARK ...". Count abnormal parks (VOD wedge signature).
+        if line.contains("#65 backpressure PARK") { parkCount.value += 1 }
     }
 
     print("")
@@ -57,9 +88,7 @@ private func seekTestRun(url: URL, seeks: Int, gapMs: Int, settleSeconds: Double
         return 1
     }
 
-    // Wait for playback to begin AND for AVPlayer's item duration to
-    // propagate (it lags state == .playing by a beat, arriving via the
-    // host.$duration sink once the item is ready). Up to 15 s.
+    // Wait for state .playing AND duration > 0 (duration lags .playing via the host.$duration sink). Up to 15s.
     var waited = 0.0
     while (engine.state != .playing || engine.duration <= 0), waited < 15.0 {
         try? await Task.sleep(nanoseconds: 100_000_000)
@@ -72,18 +101,11 @@ private func seekTestRun(url: URL, seeks: Int, gapMs: Int, settleSeconds: Double
         print("VERDICT: seektest FAIL: duration too short (\(duration)s); need > 30s of seekable VOD")
         return 1
     }
-    // Let playback settle for a moment before the burst.
-    try? await Task.sleep(nanoseconds: 1_500_000_000)
+    try? await Task.sleep(nanoseconds: 1_500_000_000) // brief settle before burst
 
-    // ---- #37/#38 probe: single backward seek with a concurrent sampler ----
-    // A 20 ms sampler records (currentTime, isSeeking) across one backward
-    // seek. Pre-fix the engine clock bounces back through the pre-seek
-    // position before AVPlayer's seek physically lands (the 100 ms time
-    // observer overwrites the optimistic target with the stale clock);
-    // post-fix the host suppresses that stale publish so the clock holds the
-    // target, and isSeeking spans the real landing. Runs the sampler for a
-    // fixed window so it catches both the in-flight hold (post-fix, inside
-    // the await) and the post-return bounce (pre-fix, after the await).
+    // #37/#38 probe: single backward seek with a 20ms concurrent sampler.
+    // Pre-fix: clock bounces back through pre-seek position (100ms observer overwrites optimistic target).
+    // Post-fix: host suppresses stale publish so clock holds target; isSeeking spans real landing.
     let probeHi = duration * 0.85
     let probeLo = duration * 0.10
     await engine.seek(to: probeHi)
@@ -124,21 +146,12 @@ private func seekTestRun(url: URL, seeks: Int, gapMs: Int, settleSeconds: Double
         samples.append(Sample(
             wall: Date().timeIntervalSince(t0),
             ct: engine.currentTime,
-            // sourceTime tracks the rendered frame; ct - src is the published
-            // clock running ahead of the picture (issue #49 clockLead). On a
-            // fast headless AVPlayer the seek lands almost immediately, so this
-            // stays ~0 here; the metric exists to quantify the on-device
-            // rebuffer-stall window where it blows out.
-            src: engine.sourceTime,
+            src: engine.sourceTime, // ct - src = clockLead (issue #49); ~0 on headless, meaningful on device
             playing: engine.state == .playing
         ))
     }
 
-    // Back-and-forth scrub between a low and a high anchor. Backward jumps
-    // (hi -> lo) land outside the resident cache window and force a
-    // producer restart, which is exactly the cascade trigger. A small
-    // per-iteration offset keeps every target distinct so no two seeks
-    // dedupe to a no-op.
+    // Back-and-forth hi<->lo scrub: backward jumps (hi->lo) fall outside the cache window, forcing a producer restart. Per-iteration offset avoids seek deduplication.
     let lo = duration * 0.10
     let hi = duration * 0.85
     print(String(format: "  burst: %d seeks alternating ~%.1f <-> ~%.1f, gap=%dms", seeks, lo, hi, gapMs))
@@ -157,8 +170,6 @@ private func seekTestRun(url: URL, seeks: Int, gapMs: Int, settleSeconds: Double
         }
     }
 
-    // One final settle seek to mid-file, then sample the clock as it
-    // recovers.
     let finalTarget = (duration * 0.5).rounded()
     print(String(format: "  settle: final seek to %.1f, sampling %.1fs", finalTarget, settleSeconds))
     await engine.seek(to: finalTarget)
@@ -169,9 +180,7 @@ private func seekTestRun(url: URL, seeks: Int, gapMs: Int, settleSeconds: Double
         sample()
     }
 
-    // ---- Analysis ----
-    // Longest wedge: the longest contiguous wall-clock interval where the
-    // engine reported .playing but the clock did not advance (>= 0.05 s).
+    // Longest contiguous interval where state=.playing but clock did not advance by >= 0.05s.
     var maxWedge = 0.0
     var runStart: Double?
     for k in 1..<max(1, samples.count) {
@@ -188,10 +197,7 @@ private func seekTestRun(url: URL, seeks: Int, gapMs: Int, settleSeconds: Double
         maxWedge = max(maxWedge, last.wall - rs)
     }
 
-    // Non-monotonic jumps during the settle phase: the clock stepping
-    // BACKWARD by more than 1 s between consecutive samples (the #35
-    // "146.7 -> 271.9" signature is a forward jump, but any large
-    // unexpected step is suspect; we report both directions).
+    // Clock stepping backward by > 1s between samples, or large forward leaps; both reported.
     var backwardJumps = 0
     var maxForwardStep = 0.0
     for k in 1..<max(1, samples.count) {
@@ -200,8 +206,7 @@ private func seekTestRun(url: URL, seeks: Int, gapMs: Int, settleSeconds: Double
         maxForwardStep = max(maxForwardStep, step)
     }
 
-    // clockLead: how far the published clock (ct) runs ahead of the rendered
-    // frame (src) across the burst. Peak + post-settle residual (issue #49).
+    // clockLead (issue #49): peak and post-settle residual of ct ahead of rendered frame.
     var maxClockLead = 0.0
     for s in samples { maxClockLead = max(maxClockLead, s.ct - s.src) }
     let settleClockLead = (samples.last.map { $0.ct - $0.src }) ?? 0
@@ -232,12 +237,49 @@ private func seekTestRun(url: URL, seeks: Int, gapMs: Int, settleSeconds: Double
     print("  INTERPRETATION: a high 'full restarts' with ZERO 'coalesced' is the")
     print("  pre-#35 cascade. Post-#35 should show 'coalesced' > 0 and far fewer")
     print("  full restarts for the same burst; 'abandoned' should trend to 0.")
+
+    // #65 discriminator: did the producer shift VARY across the burst's restart epochs?
+    let pubShifts = publishedShifts.value
+    let rawShifts = gateOpenShifts.value
+    let distinctPub = Set(pubShifts.map { ($0 * 1000).rounded() / 1000 })
+    let distinctRaw = Set(rawShifts)
+    print("")
+    print("  --- #65 cross-epoch shift discriminator ---")
+    print("  producer gate-open shifts (raw ticks) = \(rawShifts)  distinct=\(distinctRaw.count)")
+    print(String(format: "  host shifts published (seconds)       = %@  distinct=%d",
+                 "[" + pubShifts.map { String(format: "%.3f", $0) }.joined(separator: ", ") + "]",
+                 distinctPub.count))
+    print("  clockLead settle = \(String(format: "%.2f", settleClockLead))s  (headless ~0 by design; #65 is presented-vs-clock, invisible to ct-src)")
+    print("  ledger segments opened = \(ledgerCount.value)  maxContentDrift = \(String(format: "%.3f", maxLedgerDriftAbs.value))s  (the POSITIVE Root-B signal)")
+    print("  abnormal backpressure parks (VOD wedge signature) = \(parkCount.value)")
+    if fullRestart == 0 {
+        print("  >> INCONCLUSIVE: 0 producer restarts. The file was fully produced before the burst, so")
+        print("     every seek hit the cache and the cross-epoch cascade never fired. Re-run with a LONGER")
+        print("     file (seek targets must land beyond the producer write head) to exercise #65.")
+    } else if maxLedgerDriftAbs.value >= 0.5 {
+        print("  >> ROOT B CONFIRMED (content-vs-clock): a segment was muxed with source content offset")
+        print("     \(String(format: "%.2f", maxLedgerDriftAbs.value))s from its planned/EXTINF position, so the presented frame leads the")
+        print("     clock by that much. Fix the content-drift source (off-plan seek landing / uniform-plan stride),")
+        print("     NOT a seam port. Grep '#65 ledger' for the exact seg/epoch.")
+    } else if distinctRaw.count > 1 || distinctPub.count > 1 {
+        print("  >> ROOT A (cross-epoch shift divergence): the producer published MORE THAN ONE shift across")
+        print("     the burst. Buffered bytes from a superseded epoch fold with the latest scalar -> picture")
+        print("     leads the clock. The live seam-history port is the fix.")
+    } else if parkCount.value > 0 {
+        print("  >> PRODUCER WEDGE: invariant shift AND ~zero ledger drift, but \(parkCount.value) abnormal backpressure")
+        print("     park(s). The 6s symptom is the frozen-clock/stall artifact, not a content offset. Fix the VOD")
+        print("     backpressure wedge (add a watchdog / re-base the producer onto AVPlayer's index), not the fold.")
+    } else {
+        print("  >> NO ENGINE-LEVEL DIVERGENCE REPRODUCED: invariant shift, ledger drift ~0, no wedge. The headless")
+        print("     harness did not surface #65 in any engine signal. The avBufAhead+zeros from #65's earlier diag")
+        print("     are consistent with healthy playback, so they do NOT confirm Root B on their own. Re-run with a")
+        print("     LONGER high-bitrate file, or rely on the reporter device trace ('#65 ledger' + 'PARK' lines).")
+    }
     print("")
     print("VERDICT: seektest DONE (comparison harness; compare tallies old vs new build)")
     return 0
 }
 
-/// Entry point for the `seektest` subcommand.
 func runSeekTest(url: URL, seeks: Int, gapMs: Int, settleSeconds: Double) -> Int32 {
     let box = UncheckedBox<Int32?>(nil)
     Task { @MainActor in

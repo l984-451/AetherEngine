@@ -2,9 +2,7 @@ import Foundation
 import os
 import AetherEngine
 
-/// Sendable one-shot holder for a blocking read's result. Written exactly once
-/// inside the bridging Task and read exactly once after the semaphore wait, so
-/// the `@unchecked Sendable` assertion holds.
+/// One-shot holder for a blocking read's result. Written once inside the bridging Task, read once after the semaphore wait; the DispatchSemaphore provides the happens-before edge that makes @unchecked Sendable safe.
 private final class ReadOutcome: @unchecked Sendable {
     var result: Result<Data, Error> = .success(Data())
 }
@@ -19,9 +17,22 @@ public final class SMBIOReader: IOReader, @unchecked Sendable {
     // per the IOReader contract; no lock needed.
     private var position: Int64 = 0
     private var didClose = false
-    // `inFlight` is written on the demux thread (read()) and read on a
-    // different thread (cancel()), so it needs its own lock.
-    private let inFlightLock = OSAllocatedUnfairLock<Task<Void, Never>?>(initialState: nil)
+    /// Per-read in-flight state, published so cancel() (a different thread) can both cancel the
+    /// background work and, crucially, unblock read()'s semaphore wait. AMSMB2's libsmb2 read is
+    /// not cancellation-aware (only an internal ~60s timeout resolves the continuation), so
+    /// task.cancel() alone could not wake the wait and teardown blocked up to 60s; cancel() now
+    /// signals the semaphore directly and read() aborts.
+    private final class Inflight: @unchecked Sendable {
+        let task: Task<Void, Never>
+        let semaphore: DispatchSemaphore
+        var cancelled = false
+        init(task: Task<Void, Never>, semaphore: DispatchSemaphore) {
+            self.task = task
+            self.semaphore = semaphore
+        }
+    }
+    // Written on the demux thread (read()), read/mutated on a different thread (cancel()); guarded.
+    private let inFlightLock = OSAllocatedUnfairLock<Inflight?>(initialState: nil)
 
     /// `AVSEEK_SIZE` from FFmpeg: return total size, do not move.
     private let avseekSize: Int32 = 65536
@@ -37,22 +48,30 @@ public final class SMBIOReader: IOReader, @unchecked Sendable {
         let want = Int(size)
 
         let semaphore = DispatchSemaphore(value: 0)
-        // `outcome` is written once inside the Task and read once after wait().
-        // It lives in a Sendable box (not a captured local var) so the Task's
-        // closure stays Sendable under strict concurrency; the semaphore
-        // provides the happens-before edge that makes the single write/read safe.
         let outcome = ReadOutcome()
         let task = Task { [source] in
             do { outcome.result = .success(try await source.read(at: offset, length: want)) }
             catch { outcome.result = .failure(error) }
             semaphore.signal()
         }
-        inFlightLock.withLock { $0 = task }
+        inFlightLock.withLock { $0 = Inflight(task: task, semaphore: semaphore) }
         semaphore.wait()
-        inFlightLock.withLock { $0 = nil }
+        // cancel() may have signalled to unblock teardown while the libsmb2 read is still running.
+        // In that case do NOT read `outcome`: the background Task may still be writing it (the
+        // semaphore's happens-before edge only covers the Task's own signal). Abort with -1 instead.
+        let wasCancelled = inFlightLock.withLock { state -> Bool in
+            let c = state?.cancelled ?? false
+            state = nil
+            return c
+        }
+        if wasCancelled { return -1 }
 
         switch outcome.result {
-        case .failure:
+        case .failure(let error):
+            // Log the underlying SMB error (auth failure, share gone, connection reset) before the
+            // -1 sentinel; without it a NAS bug report has nothing to go on. .verbose = Release-retrievable.
+            EngineLog.emit("[SMBIOReader] read failed at offset \(offset): \(error.localizedDescription)",
+                           category: .demux, level: .verbose)
             return -1
         case .success(let data):
             if data.isEmpty { return 0 } // EOF
@@ -78,8 +97,11 @@ public final class SMBIOReader: IOReader, @unchecked Sendable {
     }
 
     public func cancel() {
-        let task = inFlightLock.withLock { $0 }
-        task?.cancel()
+        inFlightLock.withLock { state in
+            state?.cancelled = true
+            state?.task.cancel()
+            state?.semaphore.signal()   // wake read()'s wait; the libsmb2 op drains in the background
+        }
     }
 
     public func makeIndependentReader() -> IOReader? {
