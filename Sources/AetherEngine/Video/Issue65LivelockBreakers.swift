@@ -23,7 +23,19 @@ struct BackpressureWedgeDetector {
     }
 
     /// Returns `true` once the consumer fetch target has been frozen for `breakThresholdSeconds`.
-    mutating func observe(currentTarget: Int) -> Bool {
+    ///
+    /// `wantsToPlay` is the play-intent guard (issue #65 pause false-positive). A paused or backgrounded
+    /// consumer issues no forward segment request by design, so its frozen fetch target is NOT a wedge: when
+    /// `wantsToPlay` is false the detector re-baselines to the current target and holds the stuck timer at
+    /// zero, so a pause of any length never trips and the window after resume starts fresh. The legit wedge
+    /// (AVPlayer wants to play but is starved, `timeControlStatus == .waitingToPlay`) keeps `wantsToPlay`
+    /// true and still trips. Defaults to true so existing callers and live keep their prior behaviour.
+    mutating func observe(currentTarget: Int, wantsToPlay: Bool = true) -> Bool {
+        guard wantsToPlay else {
+            if currentTarget > maxTargetSeen { maxTargetSeen = currentTarget }
+            stuckSeconds = 0
+            return false
+        }
         if currentTarget > maxTargetSeen {
             maxTargetSeen = currentTarget
             stuckSeconds = 0
@@ -68,4 +80,15 @@ final class AtomicDouble: @unchecked Sendable {
     init(_ initial: Double) { value = initial }
     func get() -> Double { lock.lock(); defer { lock.unlock() }; return value }
     func set(_ newValue: Double) { lock.lock(); value = newValue; lock.unlock() }
+}
+
+/// Thread-safe Bool mirror so the off-main producer pump can read whether AVPlayer currently wants to play
+/// (`timeControlStatus != .paused`), which the engine updates on the main actor. Lets the VOD backpressure
+/// wedge detector suspend while the consumer is paused (issue #65 pause false-positive).
+final class AtomicBool: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Bool
+    init(_ initial: Bool) { value = initial }
+    func get() -> Bool { lock.lock(); defer { lock.unlock() }; return value }
+    func set(_ newValue: Bool) { lock.lock(); value = newValue; lock.unlock() }
 }

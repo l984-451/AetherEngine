@@ -211,6 +211,9 @@ extension AetherEngine {
         }
         // #65: let the producer read AVPlayer's real position off-main when it re-anchors on a backpressure wedge.
         session.currentPlaybackPositionProvider = { [renderedPositionMirror] in renderedPositionMirror.get() }
+        // #65 pause false-positive: let the producer read AVPlayer's play intent off-main so its backpressure
+        // wedge detector suspends while the consumer is paused. Set before start() so makeProducer captures it.
+        session.playIntentProvider = { [playIntentMirror] in playIntentMirror.get() }
         session.onPlaylistShiftRebased = { [weak self] seconds, seamOutputSeconds in
             Task { @MainActor in
                 guard let self = self else { return }
@@ -355,6 +358,10 @@ extension AetherEngine {
         host.$timeControlStatus
             .sink { [weak self] status in
                 guard let self = self else { return }
+                // #65 pause false-positive: mirror AVPlayer's play intent for the off-main producer wedge detector.
+                // != .paused covers both .playing and .waitingToPlay, so a deep rebuffer (wants to play, starved)
+                // still reads as play-intent and can legitimately trip the breaker; only a real pause suspends it.
+                self.playIntentMirror.set(status != .paused)
                 // Reconcile state with external transport commands (AVKit bar, Control Center, hardware button); without this togglePlayPause() is a no-op (swallowed press). .waitingToPlayAtSpecifiedRate maps to .playing so the icon doesn't flicker on rebuffer.
                 // isBuffering only once playback has started (not during initial load spin-up).
                 let startedPlaying = self.state == .playing || self.state == .paused

@@ -318,6 +318,12 @@ public final class AetherEngine: ObservableObject {
     /// the $renderedTime sink. Read off-main by the producer when it re-anchors on a backpressure wedge.
     let renderedPositionMirror = AtomicDouble(0)
 
+    /// #65: thread-safe mirror of AVPlayer's play intent (`timeControlStatus != .paused`), updated on the main
+    /// actor by the $timeControlStatus sink. Read off-main by the producer to suspend its backpressure wedge
+    /// detector while the consumer is paused (a paused player issues no forward fetch, so its frozen fetch
+    /// target is not a wedge — pause false-positive). Starts true: VOD autostarts and the sink corrects it.
+    let playIntentMirror = AtomicBool(true)
+
     /// #65: how long a native VOD seek may stay pending before the engine checks for a wedge. A normal
     /// loopback seek lands in ~1-2s and slow-but-buffering seeks refill within it; only a starved seek
     /// (no forward buffer after the budget) is reconciled.
@@ -1315,6 +1321,7 @@ public final class AetherEngine: ObservableObject {
                 // returns at the guard below and lets the newer seek own the final state.
                 guard loadGeneration == gen, seekGeneration == seekGen else { return }
                 if let host = nativeHost,
+                   host.isEffectivelyPlaying, // #65: a paused seek lands while paused and is not a wedge; only reconcile a starved seek the player actually wants to play
                    seekIsWedged(renderedTime: host.renderedTime, bufferedEnd: host.bufferedEnd) {
                     // Genuine wedge: snap the clock back to AVPlayer's REAL rendered position (not the
                     // unreachable optimistic target) and re-anchor the producer there.

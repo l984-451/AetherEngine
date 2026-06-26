@@ -190,6 +190,12 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// position when a VOD backpressure wedge breaks (#65).
     var currentPlaybackPositionProvider: (@Sendable () -> Double?)?
 
+    /// Whether AVPlayer wants to play (`timeControlStatus != .paused`), readable off the main actor. Wired
+    /// by AetherEngine to a thread-safe mirror and threaded onto every producer so the VOD backpressure
+    /// wedge detector suspends while the consumer is paused (a paused player issues no forward fetch, so its
+    /// frozen fetch target is not a wedge — issue #65 pause false-positive).
+    var playIntentProvider: (@Sendable () -> Bool)?
+
     /// Deep copy of AVCodecParameters decoupled from the demuxer's lifetime. Raw pointers into
     /// AVStreams become use-after-free on live reopen (avformat_close_input frees them while the
     /// continuation producer still reads via saved configs). Freed after pump unwinds.
@@ -1184,6 +1190,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
             guard let self, let prod else { return }
             self.handlePumpFinished(prod, reason: reason)
         }
+        // #65: let the pump suspend its backpressure wedge detector while AVPlayer is paused (a paused
+        // consumer issues no forward fetch; its frozen fetch target is not a wedge). Threaded onto every
+        // producer (initial + restart) so the guard survives scrub/audio-switch rebuilds.
+        prod.wantsToPlayProvider = playIntentProvider
         // Thread native subtitle state onto every producer (initial + restart) so the init moov is
         // consistent and per-segment cue drain survives seek/audio-switch (#55). Set unconditionally:
         // empty set keeps byte-identical output and clears stale stores after clearSubtitle.

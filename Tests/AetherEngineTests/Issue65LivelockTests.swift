@@ -46,6 +46,50 @@ struct Issue65LivelockTests {
         #expect(d.observe(currentTarget: 54) == true)  // 3s -> wedge again
     }
 
+    // MARK: - BackpressureWedgeDetector pause guard (#65 pause false-positive)
+
+    @Test("A frozen target never trips while the consumer is paused, however long the pause")
+    func pausedConsumerNeverTrips() {
+        var d = BackpressureWedgeDetector(breakThresholdSeconds: 3, initialTarget: 24)
+        // Reporter case: the consumer is paused, so its fetch target is frozen by design. Far past the
+        // threshold this must stay healthy: a paused player issues no forward fetch, so it is not a wedge.
+        for _ in 0..<100 {
+            #expect(d.observe(currentTarget: 24, wantsToPlay: false) == false)
+        }
+    }
+
+    @Test("Resuming after a long pause starts a fresh window, not an instant trip")
+    func resumeAfterPauseStartsFresh() {
+        var d = BackpressureWedgeDetector(breakThresholdSeconds: 3, initialTarget: 24)
+        // Long pause with a frozen target: suspended, re-baselined every poll.
+        for _ in 0..<50 { #expect(d.observe(currentTarget: 24, wantsToPlay: false) == false) }
+        // On resume the target is still frozen, but the window restarts from zero (no carried-over stuck time).
+        #expect(d.observe(currentTarget: 24, wantsToPlay: true) == false) // 1s
+        #expect(d.observe(currentTarget: 24, wantsToPlay: true) == false) // 2s
+        #expect(d.observe(currentTarget: 24, wantsToPlay: true) == true)  // 3s -> wedge
+    }
+
+    @Test("A genuine starved wedge still trips while the player wants to play")
+    func wantsToPlayStillTrips() {
+        // The legit wedge (AVPlayer in .waitingToPlay, starved) keeps wantsToPlay true and must still fire.
+        var d = BackpressureWedgeDetector(breakThresholdSeconds: 3, initialTarget: 53)
+        #expect(d.observe(currentTarget: 53, wantsToPlay: true) == false)
+        #expect(d.observe(currentTarget: 53, wantsToPlay: true) == false)
+        #expect(d.observe(currentTarget: 53, wantsToPlay: true) == true)
+    }
+
+    @Test("A pause partway through a freeze defers the trip until play resumes")
+    func pauseMidFreezeDefersTrip() {
+        var d = BackpressureWedgeDetector(breakThresholdSeconds: 3, initialTarget: 53)
+        #expect(d.observe(currentTarget: 53, wantsToPlay: true) == false)  // 1s stuck
+        #expect(d.observe(currentTarget: 53, wantsToPlay: true) == false)  // 2s stuck
+        #expect(d.observe(currentTarget: 53, wantsToPlay: false) == false) // pause -> reset
+        #expect(d.observe(currentTarget: 53, wantsToPlay: false) == false) // still paused
+        #expect(d.observe(currentTarget: 53, wantsToPlay: true) == false)  // resume, 1s
+        #expect(d.observe(currentTarget: 53, wantsToPlay: true) == false)  // 2s
+        #expect(d.observe(currentTarget: 53, wantsToPlay: true) == true)   // 3s -> wedge
+    }
+
     // MARK: - seekIsWedged (Piece B)
 
     @Test("Empty forward buffer at the rendered position is a wedge")

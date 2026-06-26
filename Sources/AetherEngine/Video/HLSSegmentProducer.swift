@@ -434,6 +434,12 @@ final class HLSSegmentProducer: @unchecked Sendable {
 
     var onPumpFinished: (@Sendable (PumpExitReason) -> Void)?
 
+    /// #65: reads whether AVPlayer currently wants to play (`timeControlStatus != .paused`), off the main
+    /// actor. nil = assume wanting to play (preserves prior behaviour for tests + the live path). A paused
+    /// consumer issues no forward fetch, so the VOD backpressure wedge detector must suspend while this is
+    /// false instead of misreading the frozen fetch target as a wedge (issue #65 pause false-positive).
+    var wantsToPlayProvider: (@Sendable () -> Bool)?
+
     /// Ordinal-indexed cue stores for native mov_text subtitle tracks (#55). Empty = disabled.
     var subtitleCueStores: [NativeSubtitleCueStore] = []
 
@@ -719,17 +725,21 @@ final class HLSSegmentProducer: @unchecked Sendable {
             }
             parked += 1
             let cacheTarget = cache.targetIndex
+            // #65 pause false-positive: a paused/backgrounded VOD consumer issues no forward fetch, so its
+            // frozen fetch target is not a wedge. Gate the detector on play intent (nil provider = assume
+            // playing, unchanged for live + tests); the legit starved-but-wants-to-play wedge keeps tripping.
+            let wantsToPlay = wantsToPlayProvider?() ?? true
             if !isLive, parked >= nextLogAt {
                 nextLogAt += 10
                 EngineLog.emit(
                     "[HLSSegmentProducer] #65 backpressure PARK (\(context)) head=\(head) "
                     + "target=\(target) cacheTarget=\(cacheTarget) "
                     + "highStored=\(cache.highestStoredIndex) cached=\(cache.count) parked=\(parked)s "
-                    + "(no playback progress)",
+                    + (wantsToPlay ? "(no playback progress)" : "(consumer paused; wedge detection suspended)"),
                     category: .session
                 )
             }
-            if !isLive, wedgeDetector.observe(currentTarget: cacheTarget) {
+            if !isLive, wedgeDetector.observe(currentTarget: cacheTarget, wantsToPlay: wantsToPlay) {
                 markBackpressureWedgeBroken()
                 EngineLog.emit(
                     "[HLSSegmentProducer] #65 backpressure WEDGE BROKEN (\(context)) head=\(head) "
