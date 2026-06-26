@@ -10,6 +10,14 @@ the public-API contract.
 
 ## [Unreleased]
 
+## [4.5.4] — 2026-06-26
+
+### Fixed
+
+- **Resuming or seeking into a wide-interleave progressive MP4 desynced audio ~1 s ahead of video (#74 follow-up).** The 4.5.1 fix buffered pre-video-gate audio only at head-of-stream, so first-frame playback is in sync, but a mid-file seek/resume on a source that muxes audio ahead of video in file order still drifted. On a restart the demuxer lands before the video keyframe and scans forward to it; the audio that matches the keyframe is muxed earlier in the file, so it is read during that scan while the audio gate is still closed and was dropped. The post-gate restart-target filter then snapped the next (~1 s-later) audio onto the keyframe, putting audio ahead of picture (reporter trace: `audio gate open: actual=44112896 target=44064064 gapMs=1017.3`). The producer now buffers pre-gate audio on a VOD restart as well, not just head-of-stream, so the same restart-target filter selects the matching packet from the `[target, …]` window and the gate opens at `gapMs ≈ 0`. Live restart keeps the original drop (its program-boundary re-anchor handles audio separately); the buffer stays bounded by the existing 8 MB cap, and normal-interleave seeks are unaffected. Reported and root-caused by reckloon.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/4.5.4))
+
 ## [4.5.3] — 2026-06-26
 
 ### Fixed
