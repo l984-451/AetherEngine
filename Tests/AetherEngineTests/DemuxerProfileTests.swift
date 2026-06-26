@@ -32,4 +32,60 @@ struct DemuxerProfileTests {
         #expect(still.avioMaxRetries < playback.avioMaxRetries)
         #expect(still.avioMaxRetries >= 1)
     }
+
+    // MARK: - withProbeBudget (#68: caller-bounded probe budget)
+
+    @Test("withProbeBudget(nil, nil) leaves every field untouched")
+    func withProbeBudgetNilKeepsDefault() {
+        let base = DemuxerOpenProfile.playback
+        let p = base.withProbeBudget(probesize: nil, maxAnalyzeDuration: nil)
+        #expect(p.probesize == base.probesize)
+        #expect(p.maxAnalyzeDuration == base.maxAnalyzeDuration)
+        #expect(p.avioPrefetch == base.avioPrefetch)
+        #expect(p.avioChunkSize == base.avioChunkSize)
+        #expect(p.avioRequestTimeout == base.avioRequestTimeout)
+        #expect(p.avioMaxRetries == base.avioMaxRetries)
+    }
+
+    @Test("withProbeBudget overrides only probesize when maxAnalyzeDuration is nil")
+    func withProbeBudgetProbesizeOnly() {
+        let base = DemuxerOpenProfile.playback
+        let p = base.withProbeBudget(probesize: 4 * 1024 * 1024, maxAnalyzeDuration: nil)
+        #expect(p.probesize == 4 * 1024 * 1024)
+        #expect(p.maxAnalyzeDuration == base.maxAnalyzeDuration)
+    }
+
+    @Test("withProbeBudget overrides only maxAnalyzeDuration when probesize is nil")
+    func withProbeBudgetAnalyzeOnly() {
+        let base = DemuxerOpenProfile.playback
+        let p = base.withProbeBudget(probesize: nil, maxAnalyzeDuration: 5 * 1_000_000)
+        #expect(p.probesize == base.probesize)
+        #expect(p.maxAnalyzeDuration == 5 * 1_000_000)
+    }
+
+    @Test("withProbeBudget overrides both probe knobs but never disturbs AVIO tuning")
+    func withProbeBudgetBothKeepsAVIO() {
+        let base = DemuxerOpenProfile.playback
+        let p = base.withProbeBudget(probesize: 1 * 1024 * 1024, maxAnalyzeDuration: 1 * 1_000_000)
+        #expect(p.probesize == 1 * 1024 * 1024)
+        #expect(p.maxAnalyzeDuration == 1 * 1_000_000)
+        // The two probe knobs are the ONLY thing a caller may tweak; the AVIO
+        // tuning (prefetch / chunk size / read budget) must ride through unchanged.
+        #expect(p.avioPrefetch == base.avioPrefetch)
+        #expect(p.avioChunkSize == base.avioChunkSize)
+        #expect(p.avioRequestTimeout == base.avioRequestTimeout)
+        #expect(p.avioMaxRetries == base.avioMaxRetries)
+    }
+
+    @Test("withProbeBudget is receiver-agnostic and never promotes to playback AVIO")
+    func withProbeBudgetReceiverAgnostic() {
+        let still = DemuxerOpenProfile.stillExtraction
+        let p = still.withProbeBudget(probesize: 9, maxAnalyzeDuration: nil)
+        #expect(p.probesize == 9)
+        // Applied to .stillExtraction it must keep stillExtraction's AVIO knobs,
+        // not silently inherit the playback profile.
+        #expect(p.avioPrefetch == false)
+        #expect(p.avioChunkSize == still.avioChunkSize)
+        #expect(p.avioMaxRetries == still.avioMaxRetries)
+    }
 }

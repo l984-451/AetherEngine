@@ -167,7 +167,10 @@ extension AetherEngine {
             liveSourceCadenceHint: liveSourceCadenceHint,
             preopenedDemuxer: preopenedDemuxer,
             sourceReopenableByURL: !isCustomSource,
-            companionAudioReader: companionAudioReader
+            companionAudioReader: companionAudioReader,
+            // Caller-bounded probe budget (#68) for the fallback open / live reopen; the happy path reuses preopenedDemuxer.
+            probesize: loadedOptions.probesize,
+            maxAnalyzeDuration: loadedOptions.maxAnalyzeDuration
         )
         session.onFirstHDR10PlusDetected = { [weak self] in
             Task { @MainActor in self?.handleHDR10PlusDetected() }
@@ -434,14 +437,17 @@ extension AetherEngine {
         )
 
         // Reuse probe demuxer when present (avoids second avformat_open_input; also required for forward-only custom sources). Detach the open so @MainActor keeps ticking.
+        // Capture the caller's probe budget (#68) before the detach: loadedOptions is @MainActor-isolated and unreachable inside the closure. Only used on the fallback open (probe absent).
+        let probesize = loadedOptions.probesize
+        let maxAnalyzeDuration = loadedOptions.maxAnalyzeDuration
         try await Task.detached(priority: .userInitiated) {
-            [host, preopenedDemuxer, url, sourceHTTPHeaders, isLive, dvrWindowSeconds] in
+            [host, preopenedDemuxer, url, sourceHTTPHeaders, isLive, dvrWindowSeconds, probesize, maxAnalyzeDuration] in
             let dem: Demuxer
             if let pre = preopenedDemuxer {
                 dem = pre
             } else {
                 dem = Demuxer()
-                try dem.open(url: url, extraHeaders: sourceHTTPHeaders, isLive: isLive)
+                try dem.open(url: url, extraHeaders: sourceHTTPHeaders, profile: .playback.withProbeBudget(probesize: probesize, maxAnalyzeDuration: maxAnalyzeDuration), isLive: isLive)
             }
             try await host.load(
                 demuxer: dem,
@@ -493,14 +499,17 @@ extension AetherEngine {
         )
 
         // Reuse probe demuxer (required for custom sources; no URL to reopen). Detach so @MainActor keeps ticking.
+        // Caller's probe budget (#68) captured before the detach; only used on the fallback open (probe absent).
+        let probesize = loadedOptions.probesize
+        let maxAnalyzeDuration = loadedOptions.maxAnalyzeDuration
         try await Task.detached(priority: .userInitiated) {
-            [host, preopenedDemuxer, url, sourceHTTPHeaders] in
+            [host, preopenedDemuxer, url, sourceHTTPHeaders, probesize, maxAnalyzeDuration] in
             let dem: Demuxer
             if let pre = preopenedDemuxer {
                 dem = pre
             } else {
                 dem = Demuxer()
-                try dem.open(url: url, extraHeaders: sourceHTTPHeaders)
+                try dem.open(url: url, extraHeaders: sourceHTTPHeaders, profile: .playback.withProbeBudget(probesize: probesize, maxAnalyzeDuration: maxAnalyzeDuration))
             }
             try await host.load(
                 demuxer: dem,
@@ -631,6 +640,9 @@ extension AetherEngine {
         lastDetectedVideoCodec = preservedVideoCodec
 
         // Custom sources: no URL to reopen; rebuild on the retained reader. Demuxer opens at byte 0; loadSoftware/loadNative seek to startPosition.
+        // Preserve the caller's probe budget (#68) across the reopen so an audio/title switch doesn't re-incur the full find_stream_info cost the caller paid to avoid.
+        let reloadProfile = DemuxerOpenProfile.playback.withProbeBudget(
+            probesize: loadedOptions.probesize, maxAnalyzeDuration: loadedOptions.maxAnalyzeDuration)
         var customPreopened: Demuxer? = nil
         if isCustomSource, let reader = customReader {
             let hint = customFormatHint
@@ -640,7 +652,7 @@ extension AetherEngine {
                     let d = Demuxer()
                     // isLive preserved: a live custom source must not trigger SEEK_END on reopen.
                     // selectTitleID rebuilds the disc concat stream for the chosen title (#67).
-                    try d.open(reader: reader, formatHint: hint, isLive: isLiveReload, selectTitleID: titleToReopen)
+                    try d.open(reader: reader, formatHint: hint, profile: reloadProfile, isLive: isLiveReload, selectTitleID: titleToReopen)
                     return d
                 }.value
             } catch {
@@ -665,7 +677,7 @@ extension AetherEngine {
             do {
                 customPreopened = try await Task.detached(priority: .userInitiated) {
                     let d = Demuxer()
-                    try d.open(url: url, extraHeaders: headers, selectTitleID: titleToReopen)
+                    try d.open(url: url, extraHeaders: headers, profile: reloadProfile, selectTitleID: titleToReopen)
                     return d
                 }.value
             } catch {

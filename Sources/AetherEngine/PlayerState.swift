@@ -88,6 +88,12 @@ public struct LoadOptions: Sendable, Equatable {
     /// Declare a mov_text track in the init moov so text subtitles survive PiP / AirPlay / external display via AVMediaSelection. Bitmap codecs (PGS / DVB / DVD) excluded automatically. Default `false` (#55).
     public var prepareNativeSubtitles: Bool = false
 
+    /// Caller-bounded demux probe budget in bytes, mapped to `AVFormatContext.probesize` for the main playback open. nil keeps the engine default (50 MB). A smaller value speeds `find_stream_info` on slow remote sources whose sparse streams (PGS, mjpeg cover art) would otherwise read to the full budget. An over-tight budget fails OPEN, not closed: `find_stream_info` still returns success with a logged warning, so the session loads with late-resolving tracks silently missing rather than throwing a load error. The value is written to the context verbatim (FFmpeg's AVOption floor of 32 is bypassed), so validate track presence after load if you set this aggressively. Does NOT affect the subtitle side-demuxer, the routing `probe(url:)` API, or still extraction, all of which keep the full budget. Default nil (#68).
+    public var probesize: Int64?
+
+    /// Caller-bounded demux probe budget in microseconds, mapped to `AVFormatContext.max_analyze_duration` for the main playback open. nil keeps the engine default (60 s). Pass a positive value to set an explicit cap; do NOT pass `0` expecting "no cap": FFmpeg maps `0` to a container-dependent heuristic (~5-7 s for MPEG-TS, longer elsewhere) that is SHORTER than the engine's 60 s default. Same scope and fail-open trade-off as `probesize`. Default nil (#68).
+    public var maxAnalyzeDuration: Int64?
+
     /// ENGINE-INTERNAL: marks this load as a live REJOIN (`reloadAtCurrentPosition`). Not settable from the public initializer. When true, the native load path skips its explicit initial seek so AVPlayer picks edge-minus-holdback (see `LiveReloadPolicy`); without it the reloaded item can wedge in `waitingToPlay` against Jellyfin's re-served backlog. Meaningful only when `isLive` is true.
     var isLiveRejoin: Bool = false
 
@@ -104,7 +110,9 @@ public struct LoadOptions: Sendable, Equatable {
         dvrWindowSeconds: Double? = nil,
         nativeRemoteHLS: Bool = false,
         preserveASSMarkup: Bool = false,
-        prepareNativeSubtitles: Bool = false
+        prepareNativeSubtitles: Bool = false,
+        probesize: Int64? = nil,
+        maxAnalyzeDuration: Int64? = nil
     ) {
         self.omitCriteriaColorExtensions = omitCriteriaColorExtensions
         self.suppressDisplayCriteria = suppressDisplayCriteria
@@ -119,6 +127,8 @@ public struct LoadOptions: Sendable, Equatable {
         self.nativeRemoteHLS = nativeRemoteHLS
         self.preserveASSMarkup = preserveASSMarkup
         self.prepareNativeSubtitles = prepareNativeSubtitles
+        self.probesize = probesize
+        self.maxAnalyzeDuration = maxAnalyzeDuration
     }
 }
 

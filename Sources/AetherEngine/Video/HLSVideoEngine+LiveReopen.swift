@@ -76,7 +76,7 @@ extension HLSVideoEngine {
             registerReopenDemuxer(dem)  // register before blocking open so stop() can abort via markClosed
             defer { unregisterReopenDemuxer(dem) }
             do {
-                try dem.open(url: sourceURL, extraHeaders: sourceHTTPHeaders, isLive: true)
+                try dem.open(url: sourceURL, extraHeaders: sourceHTTPHeaders, profile: openProfile, isLive: true)
             } catch {
                 EngineLog.emit(
                     "[HLSVideoEngine] live reopen attempt \(attempt)/\(Self.liveReopenMaxAttempts) failed: \(error)",

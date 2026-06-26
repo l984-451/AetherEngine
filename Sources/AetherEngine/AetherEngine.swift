@@ -775,14 +775,18 @@ public final class AetherEngine: ObservableObject {
             // AetherEngine#10: a @MainActor async body without a suspension point blocks the main thread
             // despite the async signature; Task.detached.value introduces a real background hop.
             try await Task.detached(priority: .userInitiated) { [probe, source, options] in
+                // Caller-bounded find_stream_info budget (#68); nil keeps the .playback default. This probe
+                // demuxer is reused as the session demuxer, so the cap lands on the open that actually pays it.
+                let probeProfile = DemuxerOpenProfile.playback.withProbeBudget(
+                    probesize: options.probesize, maxAnalyzeDuration: options.maxAnalyzeDuration)
                 switch source {
                 case .url(let u):
                     // isLive configures the AVIOReader for endless-feed mode; must be set at open time because
                     // the probe demuxer is reused as the session demuxer (avformat_open_input runs only once).
-                    try probe.open(url: u, extraHeaders: options.httpHeaders, isLive: options.isLive, selectTitleID: discTitleID)
+                    try probe.open(url: u, extraHeaders: options.httpHeaders, profile: probeProfile, isLive: options.isLive, selectTitleID: discTitleID)
                 case .custom(let reader, let formatHint):
                     // isLive suppresses SEEK_END duration estimate on forward-only live readers; same open-time requirement.
-                    try probe.open(reader: reader, formatHint: formatHint, isLive: options.isLive, selectTitleID: discTitleID)
+                    try probe.open(reader: reader, formatHint: formatHint, profile: probeProfile, isLive: options.isLive, selectTitleID: discTitleID)
                 }
             }.value
             probeOpened = true

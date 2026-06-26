@@ -50,7 +50,7 @@ A scannable summary; the depth for each row lives in **[docs/formats.md](docs/fo
 | Frames | Off-playback `FrameExtractor`: `thumbnail` (scrub preview) + `snapshot` (frame-accurate) |
 | Metadata | `MediaMetadata` (title / artist / album / albumArtist + cover) parsed on load |
 | Seek | Producer restart for backward / far-forward; short forward scrubs ride the cached window |
-| Streaming | One long-lived forward-streaming connection, reconnect-on-drop; CDN-stutter resilient |
+| Streaming | One long-lived forward-streaming connection, reconnect-on-drop; CDN-stutter resilient; optional caller-bounded open-time probe budget (`LoadOptions.probesize` / `maxAnalyzeDuration`) to cut first-frame latency on sparse remote remuxes |
 | Live / DVR | Unbounded live + optional timeshift; direct HLS ingest with AES-128 clear-key and SSAI ad-pod handling |
 | Custom input | Play any byte source via the `IOReader` protocol (`load(source:)`) |
 | Network | SMB2/3 shares via the optional `AetherEngineSMB` product (NTLMv2 / guest, read-only) |

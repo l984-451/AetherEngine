@@ -277,10 +277,16 @@ public final class HLSVideoEngine: @unchecked Sendable {
         liveSourceCadenceHint: Double? = nil,
         preopenedDemuxer: Demuxer? = nil,
         sourceReopenableByURL: Bool = true,
-        companionAudioReader: IOReader? = nil
+        companionAudioReader: IOReader? = nil,
+        probesize: Int64? = nil,
+        maxAnalyzeDuration: Int64? = nil
     ) {
         self.sourceURL = url
         self.sourceHTTPHeaders = sourceHTTPHeaders
+        // Caller-bounded find_stream_info budget (#68); nil keeps the .playback default. Applied only to the
+        // fallback open / live reopen here; the happy path reuses the already-budgeted preopenedDemuxer.
+        self.openProfile = DemuxerOpenProfile.playback.withProbeBudget(
+            probesize: probesize, maxAnalyzeDuration: maxAnalyzeDuration)
         self.dvModeAvailable = dvModeAvailable
         self.displaySupportsHDR = displaySupportsHDR
         self.keepDvh1TagWithoutDV = keepDvh1TagWithoutDV
@@ -336,6 +342,11 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// Consumed in `start()`; unconsumed instances are closed by `stop()`.
     private var preopenedDemuxer: Demuxer?
 
+    /// Open profile carrying the caller-bounded probe budget (#68) for the fallback open and live reopen;
+    /// `.playback` unless the caller set `LoadOptions.probesize` / `maxAnalyzeDuration`. Read in the
+    /// `+LiveReopen` extension, so it cannot be file-private.
+    let openProfile: DemuxerOpenProfile
+
 
     // MARK: - Public API
 
@@ -350,7 +361,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         } else {
             dem = Demuxer()
             do {
-                try dem.open(url: sourceURL, extraHeaders: sourceHTTPHeaders, isLive: isLiveSession)
+                try dem.open(url: sourceURL, extraHeaders: sourceHTTPHeaders, profile: openProfile, isLive: isLiveSession)
             } catch {
                 throw HLSVideoEngineError.openFailed(reason: "\(error)")
             }

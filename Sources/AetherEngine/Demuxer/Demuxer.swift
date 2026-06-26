@@ -41,6 +41,19 @@ struct DemuxerOpenProfile: Sendable {
         avioRequestTimeout: 8,
         avioMaxRetries: 1
     )
+
+    /// A copy of `self` with only the open-time probe budget overridden (#68).
+    /// A non-nil `probesize` / `maxAnalyzeDuration` replaces the matching field;
+    /// nil keeps the receiver's value. The AVIO tuning (prefetch, chunk size,
+    /// per-chunk read budget, retries) always rides through untouched so a caller
+    /// can shrink find_stream_info on a slow remote source without disturbing the
+    /// streaming reader.
+    func withProbeBudget(probesize: Int64?, maxAnalyzeDuration: Int64?) -> DemuxerOpenProfile {
+        var copy = self
+        if let probesize { copy.probesize = probesize }
+        if let maxAnalyzeDuration { copy.maxAnalyzeDuration = maxAnalyzeDuration }
+        return copy
+    }
 }
 
 /// AVFormatContext wrapper. HTTP(S) uses custom AVIO via URLSession (no built-in
