@@ -251,17 +251,34 @@ extension AetherEngine {
         // Each preference is scanned across all tracks in order, so an earlier preference on a later
         // track still beats a later preference on an earlier track.
         for preferred in preferredLanguages {
-            if let match = tracks.first(where: { audioLanguageMatches($0.language, preferred) }) {
+            if let match = tracks.first(where: { languageMatches($0.language, preferred) }) {
                 return Int32(match.id)
             }
         }
         return nil
     }
 
-    /// Case-insensitive audio-language match across ISO 639-1 / 639-2 (B and T) / English name, e.g.
+    /// Resolve the subtitle track to auto-activate from `LoadOptions.preferredSubtitleLanguages`: the first
+    /// track whose language matches a preference (preferences scanned in order), else nil. Unlike audio there
+    /// is no explicit index override and no default fallback: nil means "keep subtitles off" (the default).
+    /// Pure and nonisolated; the engine calls this at the end of a successful load and, on a hit, activates
+    /// the track via the host-overlay path so the host need not language-match `subtitleTracks` itself (#73).
+    nonisolated static func selectSubtitleIndex(
+        tracks: [TrackInfo],
+        preferredLanguages: [String]
+    ) -> Int32? {
+        for preferred in preferredLanguages {
+            if let match = tracks.first(where: { languageMatches($0.language, preferred) }) {
+                return Int32(match.id)
+            }
+        }
+        return nil
+    }
+
+    /// Case-insensitive language match across ISO 639-1 / 639-2 (B and T) / English name, e.g.
     /// `"en" == "eng" == "english"`, `"de" == "deu" == "ger"`. Empty / nil track language never matches.
-    /// Pure and unit-tested (#72).
-    nonisolated static func audioLanguageMatches(_ trackLanguage: String?, _ preferred: String) -> Bool {
+    /// Shared by audio (#72) and subtitle (#73) language selection. Pure and unit-tested.
+    nonisolated static func languageMatches(_ trackLanguage: String?, _ preferred: String) -> Bool {
         guard let track = trackLanguage?.lowercased().trimmingCharacters(in: .whitespaces),
               !track.isEmpty else { return false }
         let want = preferred.lowercased().trimmingCharacters(in: .whitespaces)

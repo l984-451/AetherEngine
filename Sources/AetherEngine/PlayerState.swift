@@ -97,6 +97,20 @@ public struct LoadOptions: Sendable, Equatable {
     /// Ordered audio-language preference (ISO 639-1 / 639-2 codes or English names, e.g. `["en", "de"]`). When non-empty and no explicit `audioSourceStreamIndex` is passed to `load`, the engine resolves the first-frame audio track from its single internal probe: the first track whose language matches an entry (preferences scanned in order, case-insensitive, ISO 639-1/2 B+T and English-name synonyms), falling back to the container default when none match. This lets a host honor a saved language preference on the first frame from one open, instead of probing separately or reloading via `selectAudioTrack` after load (#72). An explicit `audioSourceStreamIndex` still wins. Default empty.
     public var preferredAudioLanguages: [String]
 
+    /// Ordered subtitle-language preference (ISO 639-1 / 639-2 codes or English names, e.g. `["en", "de"]`).
+    /// When non-empty, at the end of a successful load the engine activates the first subtitle track whose
+    /// language matches a preference (preferences scanned in order, case-insensitive, ISO 639-1/2 B+T and
+    /// English-name synonyms); no match leaves subtitles OFF (the default). This drives the host-overlay
+    /// path (`subtitleCues`, equivalent to a `selectSubtitleTrack` call) and publishes the resolved track
+    /// via `activeSubtitleTrackIndex`. Where `preferredAudioLanguages` saves a real cost (its track is muxed
+    /// into the loopback HLS at the first frame, so a late pick forces a pre-probe or reload), this is pure
+    /// convenience: subtitles are activated post-load by a side demuxer at no reload or pre-probe cost, so it
+    /// only spares a host from language-matching `subtitleTracks` itself. A later host `selectSubtitleTrack`
+    /// / `clearSubtitle` overrides
+    /// it. Independent of `prepareNativeSubtitles`, whose default selection stays host-driven via
+    /// `setNativeSubtitleSelected`. Default empty (#73).
+    public var preferredSubtitleLanguages: [String]
+
     /// ENGINE-INTERNAL: marks this load as a live REJOIN (`reloadAtCurrentPosition`). Not settable from the public initializer. When true, the native load path skips its explicit initial seek so AVPlayer picks edge-minus-holdback (see `LiveReloadPolicy`); without it the reloaded item can wedge in `waitingToPlay` against Jellyfin's re-served backlog. Meaningful only when `isLive` is true.
     var isLiveRejoin: Bool = false
 
@@ -116,7 +130,8 @@ public struct LoadOptions: Sendable, Equatable {
         prepareNativeSubtitles: Bool = false,
         probesize: Int64? = nil,
         maxAnalyzeDuration: Int64? = nil,
-        preferredAudioLanguages: [String] = []
+        preferredAudioLanguages: [String] = [],
+        preferredSubtitleLanguages: [String] = []
     ) {
         self.omitCriteriaColorExtensions = omitCriteriaColorExtensions
         self.suppressDisplayCriteria = suppressDisplayCriteria
@@ -134,6 +149,7 @@ public struct LoadOptions: Sendable, Equatable {
         self.probesize = probesize
         self.maxAnalyzeDuration = maxAnalyzeDuration
         self.preferredAudioLanguages = preferredAudioLanguages
+        self.preferredSubtitleLanguages = preferredSubtitleLanguages
     }
 }
 

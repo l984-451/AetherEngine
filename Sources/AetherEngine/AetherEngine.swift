@@ -179,6 +179,10 @@ public final class AetherEngine: ObservableObject {
     @Published public internal(set) var subtitleCues: [SubtitleCue] = []
     @Published public internal(set) var isLoadingSubtitles: Bool = false
     @Published public internal(set) var isSubtitleActive: Bool = false
+    /// Active primary embedded subtitle stream index (matches TrackInfo.id), or nil when subtitles are off or
+    /// a sidecar (not an embedded track) is active. Mirrors `activeAudioTrackIndex` so a host picker reflects
+    /// the track auto-selected by `LoadOptions.preferredSubtitleLanguages` (#73) as well as host `selectSubtitleTrack` calls.
+    @Published public internal(set) var activeSubtitleTrackIndex: Int?
 
     /// ASS script header ([Script Info] + [V4+ Styles] + [Events] Format line) for the primary sidecar, or nil.
     /// Populated when `LoadOptions.preserveASSMarkup` is set and the file is ASS/SSA; `subtitleCues` then carry
@@ -1131,6 +1135,10 @@ public final class AetherEngine: ObservableObject {
             state = .error("Failed to load: \(error.localizedDescription)")
             throw error
         }
+        // Honor a saved subtitle-language preference on the first frame (#73). Runs only on the successful
+        // video path (the audio-only branch returns earlier and renders no subtitles); a no-op when the
+        // preference list is empty, no track matches, or the host already activated one.
+        applyPreferredSubtitleSelection(startAnchor: startPosition, sourceDuration: sourceProbe?.durationSeconds)
         return sourceProbe
     }
 
@@ -1728,6 +1736,7 @@ public final class AetherEngine: ObservableObject {
         cancelSidecarTask()
         cancelEmbeddedSubtitleReader()
         activeEmbeddedSubtitleStreamIndex = -1
+        activeSubtitleTrackIndex = nil
         loadedSidecarURL = nil
         isSubtitleActive = false
         subtitleCues = []

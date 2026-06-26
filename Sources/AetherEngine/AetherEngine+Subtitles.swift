@@ -46,6 +46,13 @@ extension AetherEngine {
 
     /// Activate an embedded subtitle stream via a side Demuxer. Side demuxer is used because the main HLS pump races ~60-80 s ahead mid-playback and discards the subtitle packets; seeking the side demuxer to the playhead is cheaper than re-reading the main pump. Re-seeks on `engine.seek`. Supports text codecs (SubRip / ASS / SSA / WebVTT / mov_text) and bitmap codecs (PGS / DVB / DVD / XSUB).
     public func selectSubtitleTrack(index: Int) {
+        selectSubtitleTrack(index: index, startAt: sourceTime)
+    }
+
+    /// `selectSubtitleTrack(index:)` with an explicit source-PTS start anchor. The public form passes the live
+    /// `sourceTime`; the preferred-subtitle-language auto-select at load passes the resume position so the side
+    /// demuxer seeks to the playhead instead of burst-reading from byte 0 on a resumed mid-file load (#73).
+    func selectSubtitleTrack(index: Int, startAt: Double) {
         guard let url = loadedURL else { return }
         // Custom sources: side demuxer needs an independent cursor; no-op if reader cannot clone.
         var customClone: IOReader? = nil
@@ -60,10 +67,36 @@ extension AetherEngine {
         subtitleCues = []
         isLoadingSubtitles = true
         activeEmbeddedSubtitleStreamIndex = Int32(index)
+        activeSubtitleTrackIndex = index
 
         // Native mov_text rendition (#55, all-tracks) is fed by the dedicated multi-decode reader at load; this inline path only drives subtitleCues for the host overlay.
-        // sourceTime is the unified source-PTS playhead; pre-fold AVPlayer clock would land playlistShiftSeconds early ("subs 3-5 s late" repro on Cars with ~3.92 s shift).
-        startEmbeddedSubtitleTask(url: url, reader: customClone, formatHint: customFormatHint, streamIndex: Int32(index), startAt: sourceTime)
+        // startAt is the unified source-PTS playhead; pre-fold AVPlayer clock would land playlistShiftSeconds early ("subs 3-5 s late" repro on Cars with ~3.92 s shift).
+        startEmbeddedSubtitleTask(url: url, reader: customClone, formatHint: customFormatHint, streamIndex: Int32(index), startAt: startAt)
+    }
+
+    /// Apply `LoadOptions.preferredSubtitleLanguages` at the end of a successful load: activate the first
+    /// subtitle track whose language matches a preference (scanned in order), else leave subtitles off (the
+    /// default). Uses the host-overlay path (equivalent to a `selectSubtitleTrack` call); `startAnchor` is the
+    /// load's resume position so a mid-file resume seeks the side demuxer to the playhead instead of byte 0.
+    /// A no-op when the list is empty, no track matches, or the host already activated a subtitle. The resolved
+    /// index is published via `activeSubtitleTrackIndex`. Independent of `prepareNativeSubtitles`. (#73)
+    func applyPreferredSubtitleSelection(startAnchor: Double?, sourceDuration: Double?) {
+        guard !loadedOptions.preferredSubtitleLanguages.isEmpty, !isSubtitleActive else { return }
+        guard let index = Self.selectSubtitleIndex(
+            tracks: subtitleTracks,
+            preferredLanguages: loadedOptions.preferredSubtitleLanguages
+        ) else { return }
+        EngineLog.emit(
+            "[AetherEngine] preferred-subtitle auto-select stream=\(index) langs=\(loadedOptions.preferredSubtitleLanguages)",
+            category: .engine
+        )
+        // Bound the anchor to the probe duration (synchronously known here; the published `duration` is set
+        // asynchronously and is still 0 at this point). A stale resume > duration would otherwise seek the
+        // side demuxer past EOF and the auto-selected subtitle would silently never appear. Unknown duration
+        // (probe failure / live) leaves the anchor unclamped. Mirrors seek()'s clamp.
+        var anchor = max(0, startAnchor ?? 0)
+        if let duration = sourceDuration, duration > 0 { anchor = min(anchor, duration) }
+        selectSubtitleTrack(index: Int(index), startAt: anchor > 0 ? anchor : sourceTime)
     }
 
     /// Activate an embedded subtitle stream as the secondary companion track (issue #47). Text-only; bitmap codecs are rejected. Runs a second side demuxer concurrently.
@@ -426,6 +459,7 @@ extension AetherEngine {
         // Sidecar replaces any active embedded stream.
         cancelEmbeddedSubtitleReader()
         activeEmbeddedSubtitleStreamIndex = -1
+        activeSubtitleTrackIndex = nil
 
         loadedSidecarURL = url
         isSubtitleActive = true
@@ -505,6 +539,7 @@ extension AetherEngine {
         cancelSidecarTask()
         cancelEmbeddedSubtitleReader()
         activeEmbeddedSubtitleStreamIndex = -1
+        activeSubtitleTrackIndex = nil
         loadedSidecarURL = nil
         isSubtitleActive = false
         subtitleCues = []

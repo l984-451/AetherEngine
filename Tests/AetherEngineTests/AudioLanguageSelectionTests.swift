@@ -13,20 +13,20 @@ struct AudioLanguageSelectionTests {
 
     @Test("language matching is case-insensitive across ISO 639-1/2 and English names")
     func matches() {
-        #expect(AetherEngine.audioLanguageMatches("en", "en"))
-        #expect(AetherEngine.audioLanguageMatches("eng", "en"))
-        #expect(AetherEngine.audioLanguageMatches("EN", "eng"))
-        #expect(AetherEngine.audioLanguageMatches("german", "de"))
-        #expect(AetherEngine.audioLanguageMatches("ger", "deu"))
-        #expect(AetherEngine.audioLanguageMatches(" en ", "english"))
+        #expect(AetherEngine.languageMatches("en", "en"))
+        #expect(AetherEngine.languageMatches("eng", "en"))
+        #expect(AetherEngine.languageMatches("EN", "eng"))
+        #expect(AetherEngine.languageMatches("german", "de"))
+        #expect(AetherEngine.languageMatches("ger", "deu"))
+        #expect(AetherEngine.languageMatches(" en ", "english"))
     }
 
     @Test("language matching rejects mismatches and empty/nil inputs")
     func noMatch() {
-        #expect(!AetherEngine.audioLanguageMatches("en", "de"))
-        #expect(!AetherEngine.audioLanguageMatches(nil, "en"))
-        #expect(!AetherEngine.audioLanguageMatches("", "en"))
-        #expect(!AetherEngine.audioLanguageMatches("en", ""))
+        #expect(!AetherEngine.languageMatches("en", "de"))
+        #expect(!AetherEngine.languageMatches(nil, "en"))
+        #expect(!AetherEngine.languageMatches("", "en"))
+        #expect(!AetherEngine.languageMatches("en", ""))
     }
 
     @Test("explicit override wins when it names a real track")
