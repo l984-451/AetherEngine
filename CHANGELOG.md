@@ -10,6 +10,14 @@ the public-API contract.
 
 ## [Unreleased]
 
+## [4.5.3] — 2026-06-26
+
+### Fixed
+
+- **A rapid scrub burst could leave the loopback-HLS VOD producer permanently anchored away from the playhead (#79).** The 4.2.2 seek-deadline recovery reconciles the engine clock to AVPlayer's real rendered position and re-anchors the segment producer there. Under a sustained bidirectional scrub burst on a bridged-audio title that re-anchor was routed through the burst-coalescing restart path (#35), where a later coalesced scrub target overwrote it, so the producer settled at the stale scrub position (~3914 s) while the clock sat at the rendered position (~5577 s), a ~1660 s gap AVPlayer could never close, leaving it starved with no recovery. The recovery re-anchor is now *authoritative*: computed from AVPlayer's real position, it wins the coalescer's pending slot over any in-flight scrub target (a newer authoritative re-anchor still supersedes an older one), so the producer ends where the clock was reconciled to. The backpressure wedge breaker uses the same authoritative path; live segment-loss reopen is unaffected. Separately, when a restart found the old producer wedged in a blocking network read on the shared demuxer (which `stop()` cannot interrupt), the new producer queued behind that read for the full ~20 s connection-stall timeout (a ~25 s restart). On the single-demuxer VOD path the engine now opens a fresh demuxer, aborts the wedged read, and hands the fresh demuxer to the new producer, which also frees the wedged reader's buffers promptly instead of after 20 s. Thanks to reckloon for the frame-exact trace and the root-cause analysis.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/4.5.3))
+
 ## [4.5.2] — 2026-06-26
 
 ### Fixed
