@@ -608,6 +608,10 @@ public final class AetherEngine: ObservableObject {
     /// foreground reload restores it: resume if the user was watching, stay paused if they had paused.
     private var wasPlayingBeforeBackground = false
 
+    /// Playhead captured just before `stopInternal()` zeroes the clock in `teardownVideoForBackground()`.
+    /// `reloadAtCurrentPosition()` consumes and clears this so the foreground reload seeks to the right spot.
+    private var backgroundSavedPosition: Double? = nil
+
     private final class LifecycleObserverBag: @unchecked Sendable {
         private let lock = NSLock()
         private var tokens: [Any] = []
@@ -1260,7 +1264,10 @@ public final class AetherEngine: ObservableObject {
             return
         }
         guard let url = loadedURL else { return }
-        let pos = currentTime
+        // Use the pre-teardown snapshot when available; stopInternal zeroes clock.sourceTime so currentTime
+        // would be 0 after a background teardown, causing every resume to start at the beginning.
+        let pos = backgroundSavedPosition ?? currentTime
+        backgroundSavedPosition = nil
         // Snapshot the disc title before load()'s stopInternal wipes it, so a background-resumed disc image
         // keeps the title the user selected instead of reverting to the main title (#67).
         let titleID = activeDiscTitleID
@@ -1919,6 +1926,8 @@ public final class AetherEngine: ObservableObject {
     private func teardownVideoForBackground() async {
         let app = UIApplication.shared
         let bgTask = app.beginBackgroundTask(withName: "AetherEngine.bgVideoTeardown")
+        // Snapshot the playhead now — stopInternal unconditionally resets clock.sourceTime to 0.
+        backgroundSavedPosition = currentTime
         stopInternal(resetDisplayCriteria: false, keepNativeHost: true, keepCustomReader: true)
         // Session torn down; the willEnterForeground observer reloads + restores play state on return.
         state = .paused
