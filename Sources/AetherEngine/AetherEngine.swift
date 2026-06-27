@@ -608,6 +608,15 @@ public final class AetherEngine: ObservableObject {
     /// foreground reload restores it: resume if the user was watching, stay paused if they had paused.
     private var wasPlayingBeforeBackground = false
 
+    /// The user's last explicit play/pause intent. Set true by `play()` and by the start of a `load()`
+    /// (every load auto-starts playback); set false by `pause()`. Deliberately NOT driven by the native
+    /// `timeControlStatus` reconciliation: tvOS auto-pauses the AVPlayer when the app resigns active, which
+    /// flips `state` to `.paused` synchronously BEFORE the (Task-dispatched) didEnterBackground observer
+    /// runs. Capturing `state == .playing` there mis-reads an actively-watching user as "was paused", so the
+    /// foreground reload re-pauses them and forces a manual play that lands on the fragile reload+pause→resume
+    /// churn. This intent flag is the background capture's source of truth so a watching user auto-resumes.
+    private var userIntendsToPlay = false
+
     /// Playhead captured just before `stopInternal()` zeroes the clock in `teardownVideoForBackground()`.
     /// `reloadAtCurrentPosition()` consumes and clears this so the foreground reload seeks to the right spot.
     private var backgroundSavedPosition: Double? = nil
@@ -769,6 +778,9 @@ public final class AetherEngine: ObservableObject {
             ? LiveWindow(windowSeconds: options.nativeRemoteHLS ? .greatestFiniteMagnitude : options.dvrWindowSeconds)
             : nil
         state = .loading
+        // A load auto-starts playback, so it expresses play intent. The foreground reload of a session the
+        // user had paused immediately calls pause() afterwards, which clears this back to false.
+        userIntendsToPlay = true
         isBuffering = false
         clock.currentTime = 0
         clock.bufferedPosition = 0
@@ -1217,6 +1229,7 @@ public final class AetherEngine: ObservableObject {
     }
 
     public func play() {
+        userIntendsToPlay = true
         activeTransportHost?.play()
         if state == .paused || state == .loading {
             state = .playing
@@ -1225,6 +1238,7 @@ public final class AetherEngine: ObservableObject {
     }
 
     public func pause() {
+        userIntendsToPlay = false
         activeTransportHost?.pause()
         isBuffering = false
         if state == .playing {
@@ -1873,7 +1887,11 @@ public final class AetherEngine: ObservableObject {
                 guard let self = self else { return }
                 if self.audioAVPlayerActive || self.audioHost != nil { return }
                 guard self.state == .playing || self.state == .paused else { return }
-                self.wasPlayingBeforeBackground = (self.state == .playing)
+                // Source of truth is the user's intent, NOT `state`: tvOS has already auto-paused the AVPlayer
+                // by the time this Task-dispatched observer runs, so `state == .playing` reads false for an
+                // actively-watching user. userIntendsToPlay survives that reconciliation (only play()/pause()
+                // mutate it), so a watching user is restored to playing on foreground instead of being parked.
+                self.wasPlayingBeforeBackground = self.userIntendsToPlay
                 self.didTeardownForBackground = true
                 self.backgroundTeardownTask = Task { @MainActor in
                     await self.teardownVideoForBackground()
@@ -1900,9 +1918,16 @@ public final class AetherEngine: ObservableObject {
                 self.didTeardownForBackground = false
                 await self.backgroundTeardownTask?.value
                 self.backgroundTeardownTask = nil
+                let resumePos = self.backgroundSavedPosition ?? self.currentTime
+                EngineLog.emit(
+                    "[AetherEngine] foreground reload: wasPlaying=\(self.wasPlayingBeforeBackground) "
+                    + "resumePos=\(String(format: "%.2f", resumePos))s", category: .engine)
                 do {
                     try await self.reloadAtCurrentPosition()
                     if !self.wasPlayingBeforeBackground { self.pause() }
+                    EngineLog.emit(
+                        "[AetherEngine] foreground reload done: state=\(self.state) "
+                        + "currentTime=\(String(format: "%.2f", self.currentTime))s", category: .engine)
                 } catch {
                     EngineLog.emit("[AetherEngine] foreground reload failed: \(error)", category: .engine)
                 }
