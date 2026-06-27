@@ -90,10 +90,17 @@ enum DiscReader {
         extents: [(offset: Int64, length: Int64)]
     ) {
         guard let cacheKey else { return }
-        DiscRecognitionCache.store(
-            key: cacheKey, selectTitleID: selectTitleID,
-            DiscRecognition(formatHint: formatHint, titles: titles,
-                            selectedTitleIndex: selectedIndex, extents: extents))
+        let recognition = DiscRecognition(formatHint: formatHint, titles: titles,
+                                          selectedTitleIndex: selectedIndex, extents: extents)
+        DiscRecognitionCache.store(key: cacheKey, selectTitleID: selectTitleID, recognition)
+        // The probe opens with selectTitleID == nil (default title), but the rest of the engine
+        // references that same title by its resolved id (== selectedIndex): reloads and the subtitle
+        // side demuxer pass that concrete id, never nil. Alias the entry under the resolved index so
+        // the first side-demuxer open is a cache hit instead of a second full disc parse, which is the
+        // remaining startup "disc tray" re-open on a remote ISO (#76).
+        if selectTitleID != selectedIndex {
+            DiscRecognitionCache.store(key: cacheKey, selectTitleID: selectedIndex, recognition)
+        }
     }
 
     /// Read all bytes of an extent list into memory (small files only: mpls).

@@ -77,4 +77,18 @@ final class DiscRecognitionCacheTests: XCTestCase {
         _ = try XCTUnwrap(try DiscReader.wrap(r2, cacheKey: nil))
         XCTAssertGreaterThan(r2.readCount, 0, "a nil key opts out of caching entirely")
     }
+
+    /// The probe opens the disc with `selectTitleID == nil` (default title) and caches the recognition.
+    /// The rest of the engine then references that same title by its resolved id (== index 0): reloads
+    /// and the subtitle side demuxer pass that concrete id, not nil. The nil recognition must alias to
+    /// the resolved id so the first side-demuxer open is a cache hit, not a second full disc parse that
+    /// re-opens the "disc tray" at startup (#76).
+    func test_nilSelectionAliasesResolvedTitleSoSideDemuxerHits() throws {
+        let image = bdImage()
+        _ = try XCTUnwrap(try DiscReader.wrap(CountingIOReader(image), selectTitleID: nil, cacheKey: "disc://movie.iso"))
+
+        let r2 = CountingIOReader(image)
+        _ = try XCTUnwrap(try DiscReader.wrap(r2, selectTitleID: 0, cacheKey: "disc://movie.iso"))
+        XCTAssertEqual(r2.readCount, 0, "the resolved default title must hit the recognition the nil probe cached")
+    }
 }
