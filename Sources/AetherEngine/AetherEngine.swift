@@ -595,6 +595,19 @@ public final class AetherEngine: ObservableObject {
     /// A MainActor deinit can't touch non-Sendable stored state under Swift 6, hence the helper class.
     private let lifecycleObservers = LifecycleObserverBag()
 
+    /// True between a background video teardown and the matching foreground reload. The foreground
+    /// observer keys off this so it only reopens a session that was actually torn down (not an audio
+    /// backend that kept playing, nor a foreground that followed no background teardown).
+    private var didTeardownForBackground = false
+
+    /// Handle to the in-flight `teardownVideoForBackground()`. The foreground reload awaits it so the
+    /// reopen can never interleave with the teardown's 3.5 s socket-drain tail.
+    private var backgroundTeardownTask: Task<Void, Never>?
+
+    /// Pre-background play state, captured before teardown overwrites `state` with `.paused`. The
+    /// foreground reload restores it: resume if the user was watching, stay paused if they had paused.
+    private var wasPlayingBeforeBackground = false
+
     private final class LifecycleObserverBag: @unchecked Sendable {
         private let lock = NSLock()
         private var tokens: [Any] = []
@@ -1853,10 +1866,42 @@ public final class AetherEngine: ObservableObject {
                 guard let self = self else { return }
                 if self.audioAVPlayerActive || self.audioHost != nil { return }
                 guard self.state == .playing || self.state == .paused else { return }
-                await self.teardownVideoForBackground()
+                self.wasPlayingBeforeBackground = (self.state == .playing)
+                self.didTeardownForBackground = true
+                self.backgroundTeardownTask = Task { @MainActor in
+                    await self.teardownVideoForBackground()
+                }
             }
         }
         lifecycleObservers.append(bgObserver)
+
+        // Foreground counterpart to the teardown above. tvOS invalidates the AVIO connection and decode
+        // session across suspension, so a torn-down session stays parked at the pre-background playhead
+        // with no AVPlayer item — playback "loads but never resumes" without this reopen. Gated on
+        // didTeardownForBackground so it no-ops when nothing was torn down; awaits the teardown task so
+        // the reopen can't race its socket-drain tail; reloadAtCurrentPosition() itself no-ops if the
+        // session was dismissed meanwhile (stop() clears loadedURL). reloadAtCurrentPosition() lands in
+        // .playing, so it restores the pre-background state: resume if the user was watching, re-pause
+        // if they had paused.
+        let fgObserver = nc.addObserver(
+            forName: UIApplication.willEnterForegroundNotification,
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                guard let self = self else { return }
+                guard self.didTeardownForBackground else { return }
+                self.didTeardownForBackground = false
+                await self.backgroundTeardownTask?.value
+                self.backgroundTeardownTask = nil
+                do {
+                    try await self.reloadAtCurrentPosition()
+                    if !self.wasPlayingBeforeBackground { self.pause() }
+                } catch {
+                    EngineLog.emit("[AetherEngine] foreground reload failed: \(error)", category: .engine)
+                }
+            }
+        }
+        lifecycleObservers.append(fgObserver)
         #endif
     }
 
@@ -1875,7 +1920,7 @@ public final class AetherEngine: ObservableObject {
         let app = UIApplication.shared
         let bgTask = app.beginBackgroundTask(withName: "AetherEngine.bgVideoTeardown")
         stopInternal(resetDisplayCriteria: false, keepNativeHost: true, keepCustomReader: true)
-        // Session torn down; host will reload + repause on foreground return.
+        // Session torn down; the willEnterForeground observer reloads + restores play state on return.
         state = .paused
         // Wait for the loopback server's detached cleanup (<=3 s producer drain + socket shutdown) before releasing.
         try? await Task.sleep(nanoseconds: 3_500_000_000)
