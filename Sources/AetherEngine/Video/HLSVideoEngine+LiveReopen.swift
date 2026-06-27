@@ -4,9 +4,15 @@ extension HLSVideoEngine {
 
     func handlePumpFinished(_ prod: HLSSegmentProducer,
                                     reason: HLSSegmentProducer.PumpExitReason) {
+        // #65 (VOD only): a broken backpressure wedge means AVPlayer is stuck behind a parked producer.
+        // Re-anchor the producer on AVPlayer's real position so the segments it is starved for get produced.
+        if case .backpressureWedge = reason {
+            handleBackpressureWedge()
+            return
+        }
         guard isLiveSession else { return }
         switch reason {
-        case .stopRequested, .muxerFailed:
+        case .stopRequested, .muxerFailed, .backpressureWedge:
             return
         case .sourceReplay:
             // Server restarted stream from beginning (Jellyfin transcode respawn); URL reopen would replay stale content. Delegate to host for fresh negotiation.
@@ -65,6 +71,51 @@ extension HLSVideoEngine {
         }
     }
 
+    /// #65: re-base the producer onto AVPlayer's real (lagging) position after a VOD backpressure wedge.
+    /// The producer was parked 10 segments ahead of a frozen consumer target; re-anchoring to where AVPlayer
+    /// actually is puts the starved segments back into the producible window so AVPlayer can resume and land.
+    /// Capped so a truly dead AVPlayer (never resumes requesting) can't drive an endless restart storm.
+    func handleBackpressureWedge() {
+        guard let pos = currentPlaybackPositionProvider?() else {
+            EngineLog.emit(
+                "[HLSVideoEngine] #65 backpressure wedge but no AVPlayer position available; cannot re-anchor",
+                category: .session
+            )
+            return
+        }
+        restartLock.lock()
+        // Reset the storm counter when AVPlayer's position has advanced since the last wedge (real progress);
+        // a frozen position across consecutive wedges means AVPlayer never recovered, so we eventually give up.
+        if pos > lastWedgeReanchorPosition + 0.5 {
+            consecutiveWedgeReanchors = 0
+        }
+        lastWedgeReanchorPosition = pos
+        consecutiveWedgeReanchors += 1
+        let attempts = consecutiveWedgeReanchors
+        restartLock.unlock()
+
+        guard attempts <= Self.maxConsecutiveWedgeReanchors else {
+            EngineLog.emit(
+                "[HLSVideoEngine] #65 backpressure wedge re-anchor cap reached "
+                + "(\(attempts) consecutive at pos=\(String(format: "%.2f", pos))s); giving up (AVPlayer not resuming). "
+                + "Engine clock already reconciled by the seek-deadline path.",
+                category: .session
+            )
+            return
+        }
+
+        let idx = segmentIndexForPlaylistTime(pos)
+        EngineLog.emit(
+            "[HLSVideoEngine] #65 backpressure wedge: re-anchoring producer to AVPlayer position "
+            + "\(String(format: "%.2f", pos))s -> seg\(idx) (attempt \(attempts)/\(Self.maxConsecutiveWedgeReanchors))",
+            category: .session
+        )
+        // #79: re-anchor authoritatively. It is computed from AVPlayer's REAL position, so it must win the
+        // coalescer's pending slot over any stale in-flight scrub target (else the producer settles at the
+        // scrub target, not where the clock was reconciled to, and AVPlayer stays starved).
+        requestRestart(at: idx, authoritative: true)
+    }
+
     private func performLiveReopen(failedProducer: HLSSegmentProducer) async {
         for attempt in 1...Self.liveReopenMaxAttempts {
             guard currentProducerIs(failedProducer) else { return }
@@ -76,7 +127,7 @@ extension HLSVideoEngine {
             registerReopenDemuxer(dem)  // register before blocking open so stop() can abort via markClosed
             defer { unregisterReopenDemuxer(dem) }
             do {
-                try dem.open(url: sourceURL, extraHeaders: sourceHTTPHeaders, isLive: true)
+                try dem.open(url: sourceURL, extraHeaders: sourceHTTPHeaders, profile: openProfile, isLive: true)
             } catch {
                 EngineLog.emit(
                     "[HLSVideoEngine] live reopen attempt \(attempt)/\(Self.liveReopenMaxAttempts) failed: \(error)",

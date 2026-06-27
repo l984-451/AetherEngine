@@ -91,6 +91,31 @@ public struct LoadOptions: Sendable, Equatable {
     /// Declare a mov_text track in the init moov so text subtitles survive PiP / AirPlay / external display via AVMediaSelection. Bitmap codecs (PGS / DVB / DVD) excluded automatically. Default `false` (#55).
     public var prepareNativeSubtitles: Bool = false
 
+    /// Caller-bounded demux probe budget in bytes, mapped to `AVFormatContext.probesize` for the main playback open. nil keeps the engine default (50 MB). A smaller value speeds `find_stream_info` on slow remote sources whose sparse streams (PGS, mjpeg cover art) would otherwise read to the full budget. An over-tight budget fails OPEN, not closed: `find_stream_info` still returns success with a logged warning, so the session loads with late-resolving tracks silently missing rather than throwing a load error. The value is written to the context verbatim (FFmpeg's AVOption floor of 32 is bypassed), so validate track presence after load if you set this aggressively. The routing `probe(url:)` API and still extraction keep the full budget; the embedded subtitle side-demuxer caps its own probe (it only needs codec ids, not resolved sparse tracks) and tightens to this value when it is smaller (#76). Default nil (#68).
+    public var probesize: Int64?
+
+    /// Caller-bounded demux probe budget in microseconds, mapped to `AVFormatContext.max_analyze_duration` for the main playback open. nil keeps the engine default (60 s). Pass a positive value to set an explicit cap; do NOT pass `0` expecting "no cap": FFmpeg maps `0` to a container-dependent heuristic (~5-7 s for MPEG-TS, longer elsewhere) that is SHORTER than the engine's 60 s default. Same scope and fail-open trade-off as `probesize`. Default nil (#68).
+    public var maxAnalyzeDuration: Int64?
+
+    /// Ordered audio-language preference (ISO 639-1 / 639-2 codes or English names, e.g. `["en", "de"]`). When non-empty and no explicit `audioSourceStreamIndex` is passed to `load`, the engine resolves the first-frame audio track from its single internal probe: the first track whose language matches an entry (preferences scanned in order, case-insensitive, ISO 639-1/2 B+T and English-name synonyms), falling back to the container default when none match. This lets a host honor a saved language preference on the first frame from one open, instead of probing separately or reloading via `selectAudioTrack` after load (#72). An explicit `audioSourceStreamIndex` still wins. Default empty.
+    public var preferredAudioLanguages: [String]
+
+    /// Ordered subtitle-language preference (ISO 639-1 / 639-2 codes or English names, e.g. `["en", "de"]`).
+    /// When non-empty, at the end of a successful load the engine activates the best subtitle track whose
+    /// language matches a preference (preferences scanned in order, case-insensitive, ISO 639-1/2 B+T and
+    /// English-name synonyms; within the matched preference, full subtitles rank over SDH / forced /
+    /// commentary and text over bitmap, from container dispositions); no match leaves subtitles OFF (the
+    /// default). This drives the host-overlay
+    /// path (`subtitleCues`, equivalent to a `selectSubtitleTrack` call) and publishes the resolved track
+    /// via `activeSubtitleTrackIndex`. Where `preferredAudioLanguages` saves a real cost (its track is muxed
+    /// into the loopback HLS at the first frame, so a late pick forces a pre-probe or reload), this is pure
+    /// convenience: subtitles are activated post-load by a side demuxer at no reload or pre-probe cost, so it
+    /// only spares a host from language-matching `subtitleTracks` itself. A later host `selectSubtitleTrack`
+    /// / `clearSubtitle` overrides
+    /// it. Independent of `prepareNativeSubtitles`, whose default selection stays host-driven via
+    /// `setNativeSubtitleSelected`. Default empty (#73).
+    public var preferredSubtitleLanguages: [String]
+
     /// ENGINE-INTERNAL: marks this load as a live REJOIN (`reloadAtCurrentPosition`). Not settable from the public initializer. When true, the native load path skips its explicit initial seek so AVPlayer picks edge-minus-holdback (see `LiveReloadPolicy`); without it the reloaded item can wedge in `waitingToPlay` against Jellyfin's re-served backlog. Meaningful only when `isLive` is true.
     var isLiveRejoin: Bool = false
 
@@ -108,7 +133,11 @@ public struct LoadOptions: Sendable, Equatable {
         nativeRemoteHLS: Bool = false,
         preserveASSMarkup: Bool = false,
         advertiseSubtitleRenditions: Bool = false,
-        prepareNativeSubtitles: Bool = false
+        prepareNativeSubtitles: Bool = false,
+        probesize: Int64? = nil,
+        maxAnalyzeDuration: Int64? = nil,
+        preferredAudioLanguages: [String] = [],
+        preferredSubtitleLanguages: [String] = []
     ) {
         self.omitCriteriaColorExtensions = omitCriteriaColorExtensions
         self.suppressDisplayCriteria = suppressDisplayCriteria
@@ -124,6 +153,10 @@ public struct LoadOptions: Sendable, Equatable {
         self.preserveASSMarkup = preserveASSMarkup
         self.advertiseSubtitleRenditions = advertiseSubtitleRenditions
         self.prepareNativeSubtitles = prepareNativeSubtitles
+        self.probesize = probesize
+        self.maxAnalyzeDuration = maxAnalyzeDuration
+        self.preferredAudioLanguages = preferredAudioLanguages
+        self.preferredSubtitleLanguages = preferredSubtitleLanguages
     }
 }
 
@@ -250,19 +283,29 @@ public struct TrackInfo: Identifiable, Sendable, Equatable {
     /// 2=stereo, 6=5.1, 8=7.1. 0 for non-audio.
     public let channels: Int
     public let isDefault: Bool
+    /// Container disposition `FORCED` (subtitles meant to show without the user enabling subtitles, e.g.
+    /// foreign-dialogue or signs tracks). Drives the subtitle-language ranking in `selectSubtitleIndex`.
+    public let isForced: Bool
+    /// Container disposition `HEARING_IMPAIRED` (SDH / closed-caption tracks with sound descriptions).
+    public let isHearingImpaired: Bool
+    /// Container disposition `COMMENT` (director / cast commentary tracks). Applies to audio and subtitle.
+    public let isCommentary: Bool
     /// EAC3 with JOC profile (Dolby Atmos). Lets the UI surface "Atmos" instead of the bed channel count (typically 5.1).
     public let isAtmos: Bool
 
     /// ASS / SSA tracks only: `[Script Info]` + `[V4+ Styles]` + `[Events]` format line from codec extradata. Hosts rendering ASS styling themselves (see `LoadOptions.preserveASSMarkup`) need it to resolve style references. nil for all other track kinds.
     public let assHeader: String?
 
-    public init(id: Int, name: String, codec: String, language: String?, channels: Int = 0, isDefault: Bool, isAtmos: Bool = false, assHeader: String? = nil) {
+    public init(id: Int, name: String, codec: String, language: String?, channels: Int = 0, isDefault: Bool, isForced: Bool = false, isHearingImpaired: Bool = false, isCommentary: Bool = false, isAtmos: Bool = false, assHeader: String? = nil) {
         self.id = id
         self.name = name
         self.codec = codec
         self.language = language
         self.channels = channels
         self.isDefault = isDefault
+        self.isForced = isForced
+        self.isHearingImpaired = isHearingImpaired
+        self.isCommentary = isCommentary
         self.isAtmos = isAtmos
         self.assHeader = assHeader
     }

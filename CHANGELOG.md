@@ -10,6 +10,157 @@ the public-API contract.
 
 ## [Unreleased]
 
+## [4.6.3] — 2026-06-27
+
+### Fixed
+
+- **A remote ISO no longer recognizes the disc twice at startup (#76).** The 4.6.2 cache stopped the per-switch re-open, but the reporter still saw the disc open twice before playback began. The probe demuxer opens the source with no explicit title (`selectTitleID == nil`) and caches the recognition under that key, while the rest of the engine references that same title by its resolved id (the default resolves to title index 0, and `DiscTitle.id == index`): background reloads and the subtitle side demuxer pass the concrete id, never nil. The side demuxer's first open therefore missed the probe's cache entry and re-ran the full UDF / `.mpls` parse, the second "disc tray" open before the first cue. `DiscReader.storeRecognition` now aliases the entry under the resolved selected index when it differs from the requested id, so the nil-probe recognition is hit by the concrete-id lookup. Disc recognition runs once per session; the subtitle side demuxer still attaches its own (probe-capped) demuxer for the bitmap-subtitle stream, which is decoded out-of-band from a separate context by design, but no longer re-recognizes the disc in front of it.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/4.6.3))
+
+## [4.6.2] — 2026-06-27
+
+### Changed
+
+- **Subtitle and audio track switches on a remote ISO no longer re-open the source (#76).** Selecting a subtitle track, switching audio, or seeking re-opened a demuxer, and every open re-ran disc recognition: the UDF / ISO9660 directory parse plus a read of every `.mpls` (Blu-ray) or `.IFO` (DVD) over HTTP. On a disc with dozens of playlists that round-tripped many times per switch, which the reporter saw as the "disc tray" reopening on each subtitle change. Two changes remove it. (1) `DiscReader.wrap` now memoizes the parsed disc structure (title list + clip extents) per source URL and selected title, so a reopen rebuilds only the cheap concat reader and skips the directory re-parse; the main pump, the subtitle side demuxer, and the audio reload share one cache, so recognition runs once per session. (2) For URL sources the subtitle side demuxer is retained per source + title and reused across track switches and seeks: the open container is re-seeked to the new playhead and re-pointed at the new stream index, with no re-open or re-probe. A successor reader hands off from its predecessor before touching the shared demuxer, so they never read it concurrently. Custom sources (SMB) still open per switch but benefit from the recognition cache.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/4.6.2))
+
+## [4.6.1] — 2026-06-27
+
+### Fixed
+
+- **Hardened the 4.6.0 in-band CEA-608 closed-caption path (#77).** Two robustness fixes from post-merge review. (1) The `ClosedCaptionTap` decoded on the producer pump thread with no lock, on the assumption of a single pump. The restart path abandons an old pump after a 5 s join timeout (`HLSVideoEngine.performRestart`), so an abandoned pump can briefly overlap the new one calling into the same tap, racing the (not-thread-safe) `CEA608Decoder` and the cue buffer. The tap now guards its decode state with a lock, mirroring `NativeSubtitleCueStore` (#55); worst case during the rare overlap is a few garbled cues that self-correct on the next reset / EOC. (2) Seeking with closed captions active left the pre-seek caption on screen until the next caption decoded, because the CC seek path reset the tap but did not clear the mirrored cues. It now clears them immediately, symmetric with the side-demuxer subtitle path.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/4.6.1))
+
+## [4.6.0] — 2026-06-27
+
+### Added
+
+- **In-band CEA-608 closed captions from a demuxable caption track, rendered through the host overlay (#77).** A source whose only caption track is an embedded CEA-608 stream (`eia_608`, e.g. a QuickTime/MP4 `c608` track) previously could not render: FFmpegBuild ships no `ccaption` decoder, so the side-demuxer `EmbeddedSubtitleDecoder` open failed and the track sat active-but-blank (`subActive=true / subCues=0`). The engine now reads that caption track's `cc_data` off the segment producer's existing source connection: a read-only observer keeps the `eia_608` stream in the demuxer's keep-set, hands each of its packets to an external `ClosedCaptionTap`, then drops it (never muxed → the loopback-HLS segment output is byte-identical to the no-CC path). An in-house CEA-608 decoder (pop-on / roll-up / paint-on, PAC row addressing, mid-row codes, and the basic / special / extended West-European character sets; odd-parity validation, doubled-control suppression and the character / PAC tables validated against FFmpeg's `ccaption_dec.c`) turns the bytes into cues published on the same `subtitleCues` host-overlay path as every other side-decoded subtitle codec. Because the tap owns the cue buffer and rides the producer (re-threaded onto every restart via `makeProducer`), captions appear instantly on enable (no second demuxer, no extra connection) and survive seek / reload / wedge. The native `mov_text` rendition (#55) is untouched: CC is excluded from that path (it can't become `tx3g`) and rendered through the overlay like the bitmap subtitle codecs, so (as with those) it is host-overlay only (no PiP / AirPlay CC). First cut: 608 field-1 / channel CC1; CEA-708 (DTVCC) and field 2 are follow-ons. Thanks to DrHurt for the externalise-subtitles steer.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/4.6.0))
+
+## [4.5.7] — 2026-06-27
+
+### Fixed
+
+- **On macOS the video image slid off-center during a live window resize, snapping back centered once the drag ended (#80).** The hosted video `CALayer` was added as a sublayer with no autoresizing mask, so its frame only caught up on the next `layout()` pass, a frame behind the continuously-changing view `bounds` during the drag. Because an `NSView`'s backing layer is anchored bottom-left, that one-pass lag read as the image drifting off-center while resizing. The layer now gets a flexible autoresizing mask (`[.layerWidthSizable, .layerHeightSizable]`) in the AppKit branch, so Core Animation stretches it in lockstep with the superlayer's bounds on every frame; initialized to full bounds, it starts and stays full-bounds (and centered) throughout. AppKit-only branch, so iOS/tvOS are untouched, and no effect on decode, timing, or audio. Reported by reckloon from a downstream consumer (Ocelot).
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/4.5.7))
+
+## [4.5.6] — 2026-06-27
+
+### Fixed
+
+- **A video file silently degraded to the audio-only backend when its open-time probe lost to a transient origin error (#78).** When the probe open hit a rate-limit (a 429 whose body parsed as `AVERROR_INVALIDDATA`), the engine logged `probe failed (...); proceeding without criteria` and then routed a 4K HEVC VOD to the audio-only path: audio played, no picture for the rest of the session, Live state showing `Backend audio, resolution 0x0`. Root cause was a conflation of "probe failed" with "file has no video": on probe failure `hasVideoStream` was false not because the file lacked video but because we never looked, and `shouldUseAudioOnlyPath` read that as no-video and dispatched `audio dispatch: codec=0 -> FFmpeg`. Once connections recovered the demux open enumerated `stream[0] type=video codec=hevc 3840x2160` (the audio-only decision was already locked in). The audio-only path is now reserved for an explicit `audioOnly` request or a *successful* probe that genuinely found no video. A failed probe on a non-audioOnly URL source falls through to the native video path (custom and live sources already fail-fast on a failed probe), so `HLSVideoEngine` reopens the source and discovers the stream. Reported by the AetherPlayer community.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/4.5.6))
+
+## [4.5.5] — 2026-06-27
+
+### Fixed
+
+- **Selecting an embedded subtitle on a network ISO (Blu-ray / DVD over http) never showed cues, while the same disc worked from a local ISO (#76).** The embedded subtitle side-demuxer logged `embedded subtitle reader exited (cancelled=true) packetsRead=0`: it was superseded by a seek / title switch / re-select before it read a single packet. The open was glacially slow on a remote disc. It re-opened with the full 50 MB / 60 s probe, and the disc's sparse `hdmv_pgs_subtitle` streams never resolve codec parameters, so `find_stream_info` read to the full 50 MB over http chasing them (the #75 pattern). It then ran the MKV cue-index prewarm seek (`duration × 0.5`), a cold range read to the middle of a 32 GB ISO that buys nothing for a concat MPEG-TS / VOB disc. Together the open ran tens of seconds; locally both are instant, so it only failed over http. `EmbeddedSubtitleDecoder` needs only codec id / type (carried in the container header / MPEG-TS PMT and resolved by the open itself) and seeds bitmap canvas dims from the source video size, so the full chase is pure cost. The side-demuxer now caps its probe to 4 MB / 5 s (honouring an even tighter caller budget), skips the cue-index prewarm seek for disc sources, and opens the same BD/DVD title the user is watching rather than always title 0. Applied to both the inline reader and the native multi-decode (#55) reader. Reported by the AetherPlayer community.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/4.5.5))
+
+## [4.5.4] — 2026-06-26
+
+### Fixed
+
+- **Resuming or seeking into a wide-interleave progressive MP4 desynced audio ~1 s ahead of video (#74 follow-up).** The 4.5.1 fix buffered pre-video-gate audio only at head-of-stream, so first-frame playback is in sync, but a mid-file seek/resume on a source that muxes audio ahead of video in file order still drifted. On a restart the demuxer lands before the video keyframe and scans forward to it; the audio that matches the keyframe is muxed earlier in the file, so it is read during that scan while the audio gate is still closed and was dropped. The post-gate restart-target filter then snapped the next (~1 s-later) audio onto the keyframe, putting audio ahead of picture (reporter trace: `audio gate open: actual=44112896 target=44064064 gapMs=1017.3`). The producer now buffers pre-gate audio on a VOD restart as well, not just head-of-stream, so the same restart-target filter selects the matching packet from the `[target, …]` window and the gate opens at `gapMs ≈ 0`. Live restart keeps the original drop (its program-boundary re-anchor handles audio separately); the buffer stays bounded by the existing 8 MB cap, and normal-interleave seeks are unaffected. Reported and root-caused by reckloon.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/4.5.4))
+
+## [4.5.3] — 2026-06-26
+
+### Fixed
+
+- **A rapid scrub burst could leave the loopback-HLS VOD producer permanently anchored away from the playhead (#79).** The 4.2.2 seek-deadline recovery reconciles the engine clock to AVPlayer's real rendered position and re-anchors the segment producer there. Under a sustained bidirectional scrub burst on a bridged-audio title that re-anchor was routed through the burst-coalescing restart path (#35), where a later coalesced scrub target overwrote it, so the producer settled at the stale scrub position (~3914 s) while the clock sat at the rendered position (~5577 s), a ~1660 s gap AVPlayer could never close, leaving it starved with no recovery. The recovery re-anchor is now *authoritative*: computed from AVPlayer's real position, it wins the coalescer's pending slot over any in-flight scrub target (a newer authoritative re-anchor still supersedes an older one), so the producer ends where the clock was reconciled to. The backpressure wedge breaker uses the same authoritative path; live segment-loss reopen is unaffected. Separately, when a restart found the old producer wedged in a blocking network read on the shared demuxer (which `stop()` cannot interrupt), the new producer queued behind that read for the full ~20 s connection-stall timeout (a ~25 s restart). On the single-demuxer VOD path the engine now opens a fresh demuxer, aborts the wedged read, and hands the fresh demuxer to the new producer, which also frees the wedged reader's buffers promptly instead of after 20 s. Thanks to reckloon for the frame-exact trace and the root-cause analysis.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/4.5.3))
+
+## [4.5.2] — 2026-06-26
+
+### Fixed
+
+- **A user pause was misread as a backpressure wedge, deadlocking the loopback-HLS VOD path (#65).** The 4.2.2 wedge-breaker re-anchors the producer when the consumer's fetch target freezes. A paused AVPlayer freezes that target legitimately (it issues no forward fetch by design), so a pause longer than ~24 s on a bridged-audio loopback-HLS title (TrueHD, DTS-HD MA, or any codec that routes through the FLAC/EAC3 bridge) tripped the breaker. The re-anchor loop then ran against a player that cannot advance, exhausted its attempts, and left the producer re-anchored ahead of a buffer stranded behind the playhead, a state resume could not recover (force-quit required). Wedge detection now gates on play intent: it tracks `timeControlStatus` and suspends while the player is paused, so a pause of any length never trips it and the window after resume starts fresh. A genuine starved wedge (the player wants to play but is buffer-starved, `waitingToPlay`) still trips, and the seek-deadline reconcile gets the same pause guard so a paused scrub is not mistaken for a starved seek. Thanks to rrgomes and reckloon for the independent captures and the precise root-cause analysis.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/4.5.2))
+
+## [4.5.1] — 2026-06-26
+
+### Fixed
+
+- **Head-of-stream audio muxed ahead of video was dropped, causing a constant ~1 s A/V desync (#74).** On the native loopback-HLS path the producer's audio gate dropped every audio packet that arrived before the first video packet. On a wide-interleave source (audio muxed ~1 s ahead of video in file order, e.g. a progressive MP4 whose leading second of AAC precedes the first video packet) that discarded the entire leading second of real audio, so AVPlayer pulled the survivors forward into a constant ~1 s lag (the same file stays in sync in VLC / Infuse). The producer now buffers that pre-gate audio (bounded by an 8 MB cap) and replays it in DTS order once the video gate opens, so it flows through the normal target-filter / anchor / write path. Scoped to head-of-stream; restart and seek producers keep the original drop, where the post-gate shift already anchors their surviving audio. Thanks to reckloon for the report and the corrected root-cause analysis.
+
+- **An unresolvable cover-art stream made remote open read to the full probe budget (#75).** A remote MP4 carrying an embedded cover-art stream (mjpeg reported as 0x0) kept `avformat_find_stream_info` reading toward `probesize` (tens of MB pulled over the network) trying to resolve codec parameters that never resolve, even though the real H.264 + AAC streams were available almost immediately. Attached-picture streams are now reclassified to `AVMEDIA_TYPE_ATTACHMENT` before stream-info probing, so they resolve instantly and the probe stops once the real streams are known. Cover-art extraction is unaffected (it reads the attached picture plus the unchanged disposition). Thanks to reckloon for the report.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/4.5.1))
+
+## [4.5.0] — 2026-06-26
+
+### Added
+
+- **Subtitle-language pick ranks by container disposition; `TrackInfo` surfaces forced / SDH / commentary (#73).** `LoadOptions.preferredSubtitleLanguages` (4.4.0) activated the first track in a matching language. It now activates the *best* track within the first matching preference: full subtitles rank over SDH (`HEARING_IMPAIRED`), forced, and commentary (`COMMENT`), and text over bitmap, all from container dispositions; preference order still dominates rank. New `TrackInfo.isForced` / `isHearingImpaired` / `isCommentary` (read alongside the existing `isDefault`) surface those dispositions for audio and subtitle tracks, so a host can rank or filter `subtitleTracks` the same way. The pure `selectSubtitleIndex`, `subtitlePickRank`, and `isBitmapSubtitleCodec` helpers are exposed and unit-tested.
+
+### Fixed
+
+- **Bitmap subtitles leaked into the native `mov_text` rendition (#55).** With `prepareNativeSubtitles` set, two sites matched `TrackInfo.codec` (the libavcodec *decoder* name, e.g. `pgssub`) against an exact-match set of *descriptor* names (`hdmv_pgs_subtitle`, `dvb_subtitle`, `dvd_subtitle`, `xsub`), so PGS / DVB / DVD bitmap tracks were not excluded (only `xsub` matched by coincidence). They leaked into the `mov_text` trak table and the native-store-attach set, producing phantom entries in the `AVMediaSelection` legible group and a store/reader index mismatch. Both sites now use a shared decoder-name `isBitmapSubtitleCodec` classifier that agrees with the reader's enum classifier, so only true text tracks become native `mov_text` traks.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/4.5.0))
+
+## [4.4.0] — 2026-06-26
+
+### Added
+
+- **First-frame subtitle selection by language preference (#73).** A host with a saved subtitle-language preference had to read the post-load `subtitleTracks` and language-match `selectSubtitleTrack` itself. New `LoadOptions.preferredSubtitleLanguages` (ordered; ISO 639-1 / 639-2 codes or English names, e.g. `["en", "de"]`; default empty) lets the engine activate the first subtitle track whose language matches a preference (preferences scanned in order, case-insensitive, ISO 639-1/2 B+T and English-name synonyms) at the end of a successful load, mirroring the audio twin (`preferredAudioLanguages`, #72). No match leaves subtitles off (the default). The host-overlay path is used (equivalent to a `selectSubtitleTrack` call), the resolved track is published via the new `activeSubtitleTrackIndex` (parity with `activeAudioTrackIndex` so a picker reflects it), and the side demuxer is anchored at the resume position (clamped to the probe duration) instead of byte 0. Unlike `preferredAudioLanguages` (whose track is muxed into the loopback HLS at the first frame, so a late pick forces a pre-probe or reload), this is pure convenience: subtitles are activated post-load by a side demuxer at no reload or pre-probe cost, so it only spares a host from language-matching `subtitleTracks` itself. Independent of `prepareNativeSubtitles`, whose default selection stays host-driven via `setNativeSubtitleSelected`. Empty preferences is a behavioral no-op, so nothing changes until a host opts in. The audio half of #73 already shipped in 4.3.0. Thanks to reckloon for the request.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/4.4.0))
+
+## [4.3.0] — 2026-06-26
+
+### Added
+
+- **First-frame audio selection by language preference (#72).** A host that wants a saved audio-language preference honored on the first frame previously had to open the source an extra time to pick the track (an audio pre-probe) or reload via `selectAudioTrack` after load. Each extra open re-runs `avformat_open_input` + `find_stream_info` + the size probe, multiplying pre-first-frame latency and request volume against a remote source. New `LoadOptions.preferredAudioLanguages` (ordered; ISO 639-1 / 639-2 codes or English names, e.g. `["en", "de"]`; default empty) lets the engine resolve the audio track from its single internal probe: an explicit `audioSourceStreamIndex` still wins, else the first track matching a preference in order (case-insensitive, ISO 639-1/2 B+T and English-name synonyms), else the container default. The resolved index drives the played audio on both the native and software paths. Empty preferences with no override is a behavioral no-op, so nothing changes until a host opts in; a probe-failed source still honors an explicit override verbatim. The engine already reuses its single probe demuxer as the session demuxer, so honoring the preference here removes the remaining redundant open for the prefer-a-language case. Thanks to reckloon for the request and the staged-reuse framing.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/4.3.0))
+
+## [4.2.3] — 2026-06-26
+
+### Fixed
+
+- **Redundant open-time size probe on remote HTTP sources (#70).** `AVIOReader.open()` fired a dedicated `probeFileSize()` round-trip (a `Range: bytes=0-0` GET, falling back to HEAD) before opening the real data connection, even though that connection's own `Range: bytes=0-` request returns a 206 whose `Content-Range` already carries the total. On origins that omit a length for `bytes=0-0` the probe also paid a second HEAD round-trip, and that HEAD was the request some origins rate-limited (429), dropping an otherwise-fine source into seekless streaming mode. The playback path now derives the size from the first data connection's response (206 `Content-Range`, or `Content-Length` on a from-0 2xx), so the common case skips the probe entirely; live skips it too (its result was discarded anyway and it burned the Range timeout on transcode endpoints that reject Range). When the data connection resolves no size (a genuinely length-less origin, a transient 429, slow response headers, or a length only reachable via HEAD), the open falls back to the exact prior probe path on a separate connection and budget, so seekability is preserved whenever a size is reachable and only a truly length-less source streams. The size is now folded in under the connection's existing lock, and the remaining still-extraction probe switches `bytes=0-0` to `bytes=0-` for the same one-shot win. Thanks to reckloon for the diagnosis and the confirmed `bytes=0-` probe shape.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/4.2.3))
+
+## [4.2.2] — 2026-06-26
+
+### Fixed
+
+- **Loopback-HLS VOD scrub-burst livelock (#65).** A sustained bidirectional scrub burst on the native (loopback-HLS) direct-play path could deadlock playback: the engine clock latched at an optimistic seek target AVPlayer never physically reached, while the segment producer parked on backpressure with no VOD watchdog. The two halves waited on each other with no recovery floor, so the picture froze 30 to 40 seconds behind the reported clock and never recovered. Two coupled fixes give the path a recovery floor. The native VOD seek await is now bounded by a cadence budget: when a seek does not land and AVPlayer is genuinely starved (no forward buffer), the engine reconciles its clock to AVPlayer's real rendered position instead of the unreachable target and re-anchors the producer there, while a slow-but-buffering seek still awaits its real landing unchanged. And the VOD backpressure park now has the watchdog the live paths always had: a consumer fetch target frozen past a threshold breaks the park and re-anchors the producer on AVPlayer's real position (a slow-but-advancing consumer never trips it, and a storm guard bounds re-anchors if AVPlayer never resumes). Thanks to rrgomes for the frame-exact trace that pinned the root cause.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/4.2.2))
+
+## [4.2.1] — 2026-06-26
+
+### Fixed
+
+- **Persistent AVIOReader reconnect storm on a non-faststart / coarsely-interleaved remote MP4 (#69).** A remote MP4 with a trailing `moov` and track data tens of MB apart makes the demuxer ping-pong across distant file regions during `avformat_find_stream_info` / index parse. The persistent reader used to tear down and reopen its HTTP connection on every such non-sequential read, so the parse storm drove the origin into a 429 and playback never started. Those random-access reads now go through the existing pooled keep-alive session, cached as 4 MB aligned blocks in a small LRU (8 blocks, roughly 32 MB, VOD-only), so the streaming connection stays anchored and the storm collapses to the two legitimate reconnects (open plus the one seek to the moov). The sequential playback fast path never enters the cache, so it carries no overhead; only full-length blocks are cached, so a truncated range response cannot shadow the re-fetch of its uncovered tail; and once detour reads turn sequential past 8 MB the streaming connection re-anchors there, returning steady playback (and large backward scrubs) to the cheap sliding-window path. Thanks to reckloon for the detailed diagnosis and the validated detour-cache design.
+- **Reconnect loop under a sustained 429 (#71).** When an origin rate-limited essentially every request, the reader looped reconnecting (gen=N climbing) instead of failing cleanly: a 429 carried no `Retry-After` so the backoff was zero, and the random-access parse seeks kept resetting the unproductive-reconnect streak before it reached the give-up cap. A 429/503 now drives a separate rate-limit streak that the seek-driven reconnects do not reset and that only real read progress clears, so a throttled origin gives up cleanly after a bounded number of attempts, with exponential backoff that grows even when no `Retry-After` is present. The detour cache's miss-under-429 fallback backs off in place and retries the pooled fetch rather than opening a fresh connection, so it cannot re-enter the churn the cache removes.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/4.2.1))
+
+## [4.2.0] — 2026-06-26
+
+### Added
+
+- **Caller-bounded demux probe budget per `load()` (#68).** A large remote remux with sparse streams (HDMV PGS subtitles, an mjpeg cover attachment) makes `avformat_find_stream_info` read to the full internal probe budget (50 MB / 60 s) on every open, costing roughly 13-14 s before the first frame over a slow CDN even though the video and audio streams resolve almost immediately. That budget is tuned for local disk, where reading 50 MB is free, and a remote caller had no way to cap it. Two optional `LoadOptions` fields now let a caller cap the open-time probe, both defaulting to `nil` so nothing changes unless set: `probesize` (bytes, maps to `AVFormatContext.probesize`) and `maxAnalyzeDuration` (microseconds, maps to `AVFormatContext.max_analyze_duration`). The cap is applied to every main-playback open that runs `find_stream_info` (the routing probe that becomes the session demuxer, the software and audio fallback opens, the audio/title-switch reopens so a switch does not re-incur the cost, and the native HLS fallback open and live reopen) and only to those: the subtitle side-demuxer, the routing `probe(url:)` API, the Dolby Vision probe, still extraction, and the live companion-audio demuxer all keep the full budget because a complete probe is load-bearing there (sparse PGS / DVB track detection). An over-tight budget fails open (a late-resolving track is silently missing), not closed; `maxAnalyzeDuration: 0` is FFmpeg's shorter heuristic, not "no cap". Both trade-offs are documented on the fields. Internally, `DemuxerOpenProfile.withProbeBudget(probesize:maxAnalyzeDuration:)` overrides only the two probe knobs and leaves the AVIO tuning untouched.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/4.2.0))
+
 ## [4.1.0] — 2026-06-25
 
 ### Added

@@ -173,7 +173,10 @@ extension AetherEngine {
             // unless the active load set advertiseSubtitleRenditions).
             subtitleRenditions: subtitleRenditions.map {
                 (renditionID: $0.renditionID, name: $0.name, language: $0.language)
-            }
+            },
+            // Caller-bounded probe budget (#68) for the fallback open / live reopen; the happy path reuses preopenedDemuxer.
+            probesize: loadedOptions.probesize,
+            maxAnalyzeDuration: loadedOptions.maxAnalyzeDuration
         )
         session.onFirstHDR10PlusDetected = { [weak self] in
             Task { @MainActor in self?.handleHDR10PlusDetected() }
@@ -212,6 +215,11 @@ extension AetherEngine {
                 self.setNativeScrubSeek(inFlight: inFlight, target: target)
             }
         }
+        // #65: let the producer read AVPlayer's real position off-main when it re-anchors on a backpressure wedge.
+        session.currentPlaybackPositionProvider = { [renderedPositionMirror] in renderedPositionMirror.get() }
+        // #65 pause false-positive: let the producer read AVPlayer's play intent off-main so its backpressure
+        // wedge detector suspends while the consumer is paused. Set before start() so makeProducer captures it.
+        session.playIntentProvider = { [playIntentMirror] in playIntentMirror.get() }
         session.onPlaylistShiftRebased = { [weak self] seconds, seamOutputSeconds in
             Task { @MainActor in
                 guard let self = self else { return }
@@ -250,12 +258,13 @@ extension AetherEngine {
             }
         }
         // prepareNativeSubtitles + non-bitmap text tracks: flag gates allocateMuxer SubtitleConfig; must be set before start() (#55).
-        // TrackInfo.codec is the lower-case libavcodec name (e.g. "subrip", "ass"). Bitmap codecs excluded:
-        let bitmapCodecNames: Set<String> = [
-            "hdmv_pgs_subtitle", "dvb_subtitle", "dvd_subtitle", "xsub"
-        ]
         // Each text track becomes one mov_text track in the init moov (#55, all-tracks). Sidecar entries append at runtime; this table is embedded-only.
-        let textTracks = subtitleTracks.filter { !bitmapCodecNames.contains($0.codec) }
+        // Bitmap codecs excluded via the shared decoder-name classifier (a prior exact-match Set used descriptor
+        // names that never matched TrackInfo.codec's decoder names, so PGS/DVB/DVD leaked in as mov_text).
+        // Exclude in-band CEA-608/708 (#77): no demuxable packets to mux into mov_text; served by the CC tap.
+        let textTracks = subtitleTracks.filter {
+            !Self.isBitmapSubtitleCodec($0.codec) && !Self.isEmbeddedClosedCaptionCodec($0.codec)
+        }
         nativeSubtitleTrackTable = textTracks.map { track in
             NativeSubtitleTrackEntry(sourceStreamIndex: track.id, language: track.language)
         }
@@ -272,6 +281,9 @@ extension AetherEngine {
         }
         let hasTextSubtitleTrack = !nativeSubtitleTrackTable.isEmpty
         session.enableNativeSubtitleTrackForSession = loadedOptions.prepareNativeSubtitles && hasTextSubtitleTrack
+
+        // #77: arm the in-band CC tap before start() so the first producer keeps the CC stream.
+        setupClosedCaptionTapIfNeeded(session: session)
 
         // session.start() opens its own Demuxer + prewarm seek (~1-3 s on slow CDN); detach so @MainActor doesn't block.
         let playbackURL = try await Task.detached(priority: .userInitiated) { [session] in
@@ -338,6 +350,8 @@ extension AetherEngine {
         host.$renderedTime
             .sink { [weak self] value in
                 guard let self = self else { return }
+                // #65: mirror AVPlayer's rendered (playlist-axis) position for off-main wedge re-anchoring.
+                self.renderedPositionMirror.set(value)
                 let shift = self.liveShiftSeams.last(where: { value >= $0.activateAt })?.shift
                     ?? self.playlistShiftSeconds
                 self.clock.sourceTime = value + shift
@@ -356,6 +370,10 @@ extension AetherEngine {
         host.$timeControlStatus
             .sink { [weak self] status in
                 guard let self = self else { return }
+                // #65 pause false-positive: mirror AVPlayer's play intent for the off-main producer wedge detector.
+                // != .paused covers both .playing and .waitingToPlay, so a deep rebuffer (wants to play, starved)
+                // still reads as play-intent and can legitimately trip the breaker; only a real pause suspends it.
+                self.playIntentMirror.set(status != .paused)
                 // Reconcile state with external transport commands (AVKit bar, Control Center, hardware button); without this togglePlayPause() is a no-op (swallowed press). .waitingToPlayAtSpecifiedRate maps to .playing so the icon doesn't flicker on rebuffer.
                 // isBuffering only once playback has started (not during initial load spin-up).
                 let startedPlaying = self.state == .playing || self.state == .paused
@@ -440,14 +458,17 @@ extension AetherEngine {
         )
 
         // Reuse probe demuxer when present (avoids second avformat_open_input; also required for forward-only custom sources). Detach the open so @MainActor keeps ticking.
+        // Capture the caller's probe budget (#68) before the detach: loadedOptions is @MainActor-isolated and unreachable inside the closure. Only used on the fallback open (probe absent).
+        let probesize = loadedOptions.probesize
+        let maxAnalyzeDuration = loadedOptions.maxAnalyzeDuration
         try await Task.detached(priority: .userInitiated) {
-            [host, preopenedDemuxer, url, sourceHTTPHeaders, isLive, dvrWindowSeconds] in
+            [host, preopenedDemuxer, url, sourceHTTPHeaders, isLive, dvrWindowSeconds, probesize, maxAnalyzeDuration] in
             let dem: Demuxer
             if let pre = preopenedDemuxer {
                 dem = pre
             } else {
                 dem = Demuxer()
-                try dem.open(url: url, extraHeaders: sourceHTTPHeaders, isLive: isLive)
+                try dem.open(url: url, extraHeaders: sourceHTTPHeaders, profile: .playback.withProbeBudget(probesize: probesize, maxAnalyzeDuration: maxAnalyzeDuration), isLive: isLive)
             }
             try await host.load(
                 demuxer: dem,
@@ -499,14 +520,17 @@ extension AetherEngine {
         )
 
         // Reuse probe demuxer (required for custom sources; no URL to reopen). Detach so @MainActor keeps ticking.
+        // Caller's probe budget (#68) captured before the detach; only used on the fallback open (probe absent).
+        let probesize = loadedOptions.probesize
+        let maxAnalyzeDuration = loadedOptions.maxAnalyzeDuration
         try await Task.detached(priority: .userInitiated) {
-            [host, preopenedDemuxer, url, sourceHTTPHeaders] in
+            [host, preopenedDemuxer, url, sourceHTTPHeaders, probesize, maxAnalyzeDuration] in
             let dem: Demuxer
             if let pre = preopenedDemuxer {
                 dem = pre
             } else {
                 dem = Demuxer()
-                try dem.open(url: url, extraHeaders: sourceHTTPHeaders)
+                try dem.open(url: url, extraHeaders: sourceHTTPHeaders, profile: .playback.withProbeBudget(probesize: probesize, maxAnalyzeDuration: maxAnalyzeDuration))
             }
             try await host.load(
                 demuxer: dem,
@@ -637,16 +661,22 @@ extension AetherEngine {
         lastDetectedVideoCodec = preservedVideoCodec
 
         // Custom sources: no URL to reopen; rebuild on the retained reader. Demuxer opens at byte 0; loadSoftware/loadNative seek to startPosition.
+        // Preserve the caller's probe budget (#68) across the reopen so an audio/title switch doesn't re-incur the full find_stream_info cost the caller paid to avoid.
+        let reloadProfile = DemuxerOpenProfile.playback.withProbeBudget(
+            probesize: loadedOptions.probesize, maxAnalyzeDuration: loadedOptions.maxAnalyzeDuration)
         var customPreopened: Demuxer? = nil
         if isCustomSource, let reader = customReader {
             let hint = customFormatHint
             do {
                 let isLiveReload = loadedOptions.isLive
+                let discCacheKey = url.absoluteString
                 customPreopened = try await Task.detached(priority: .userInitiated) {
                     let d = Demuxer()
                     // isLive preserved: a live custom source must not trigger SEEK_END on reopen.
                     // selectTitleID rebuilds the disc concat stream for the chosen title (#67).
-                    try d.open(reader: reader, formatHint: hint, isLive: isLiveReload, selectTitleID: titleToReopen)
+                    // discCacheKey reuses the disc recognition cached at load so an audio switch on a
+                    // remote ISO does not re-parse the UDF directory / playlists (#76).
+                    try d.open(reader: reader, formatHint: hint, profile: reloadProfile, isLive: isLiveReload, selectTitleID: titleToReopen, discCacheKey: discCacheKey)
                     return d
                 }.value
             } catch {
@@ -671,7 +701,7 @@ extension AetherEngine {
             do {
                 customPreopened = try await Task.detached(priority: .userInitiated) {
                     let d = Demuxer()
-                    try d.open(url: url, extraHeaders: headers, selectTitleID: titleToReopen)
+                    try d.open(url: url, extraHeaders: headers, profile: reloadProfile, selectTitleID: titleToReopen)
                     return d
                 }.value
             } catch {

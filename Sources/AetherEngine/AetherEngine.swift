@@ -182,6 +182,10 @@ public final class AetherEngine: ObservableObject {
     @Published public internal(set) var subtitleCues: [SubtitleCue] = []
     @Published public internal(set) var isLoadingSubtitles: Bool = false
     @Published public internal(set) var isSubtitleActive: Bool = false
+    /// Active primary embedded subtitle stream index (matches TrackInfo.id), or nil when subtitles are off or
+    /// a sidecar (not an embedded track) is active. Mirrors `activeAudioTrackIndex` so a host picker reflects
+    /// the track auto-selected by `LoadOptions.preferredSubtitleLanguages` (#73) as well as host `selectSubtitleTrack` calls.
+    @Published public internal(set) var activeSubtitleTrackIndex: Int?
 
     /// ASS script header ([Script Info] + [V4+ Styles] + [Events] Format line) for the primary sidecar, or nil.
     /// Populated when `LoadOptions.preserveASSMarkup` is set and the file is ASS/SSA; `subtitleCues` then carry
@@ -312,6 +316,21 @@ public final class AetherEngine: ObservableObject {
 
     /// Loopback HLS-fMP4 engine. Non-nil between load and stop.
     var nativeVideoSession: HLSVideoEngine?
+
+    /// #65: thread-safe mirror of AVPlayer's rendered (playlist-axis) position, updated on the main actor by
+    /// the $renderedTime sink. Read off-main by the producer when it re-anchors on a backpressure wedge.
+    let renderedPositionMirror = AtomicDouble(0)
+
+    /// #65: thread-safe mirror of AVPlayer's play intent (`timeControlStatus != .paused`), updated on the main
+    /// actor by the $timeControlStatus sink. Read off-main by the producer to suspend its backpressure wedge
+    /// detector while the consumer is paused (a paused player issues no forward fetch, so its frozen fetch
+    /// target is not a wedge — pause false-positive). Starts true: VOD autostarts and the sink corrects it.
+    let playIntentMirror = AtomicBool(true)
+
+    /// #65: how long a native VOD seek may stay pending before the engine checks for a wedge. A normal
+    /// loopback seek lands in ~1-2s and slow-but-buffering seeks refill within it; only a starved seek
+    /// (no forward buffer after the budget) is reconciled.
+    static let nativeSeekReconcileBudgetSeconds: Double = 8.0
 
     /// Native AVPlayer + AVPlayerLayer host. Non-nil between load and stop.
     var nativeHost: NativeAVPlayerHost?
@@ -460,11 +479,20 @@ public final class AetherEngine: ObservableObject {
     /// Active embedded subtitle stream index, or -1. Used by seek to decide whether to re-arm the side demuxer.
     var activeEmbeddedSubtitleStreamIndex: Int32 = -1
 
+    /// #77: in-band CEA-608 tap state. The tap owns the cue buffer and publishes snapshots; `ccCueSnapshot`
+    /// is the latest, mirrored into `subtitleCues` while the CC track is active.
+    var closedCaptionTap: ClosedCaptionTap?
+    var ccCueSnapshot: [SubtitleCue] = []
+    var ccLastSnapshotSeq: Int = 0
+
     /// Secondary subtitle reader state mirrors (#47). Driven only through SubtitleChannel.secondary.
     var secondarySidecarTask: Task<Void, Never>?
     var secondaryEmbeddedSubtitleTask: Task<Void, Never>?
     var activeSecondaryEmbeddedSubtitleStreamIndex: Int32 = -1
     var secondarySubtitleSideDemuxer: Demuxer?
+    /// Identity ("url#titleID") of the retained secondary side demuxer, so a same-source track switch
+    /// reuses it instead of re-opening (#76 part 2). nil when none is retained.
+    var secondarySubtitleSideDemuxerKey: String?
 
     /// Source video dimensions from the probe. Used as a bitmap-subtitle canvas fallback before the first PCS
     /// is parsed. 0 before load or when source has no video (AetherEngine#28). Also available in SourceProbe.
@@ -486,6 +514,10 @@ public final class AetherEngine: ObservableObject {
     /// Active embedded subtitle side demuxer. Registered so cancel sites can markClosed(): Task cancellation
     /// alone is only observed between readPacket calls, so a blocked AVIO reconnect would otherwise survive stop().
     var activeSubtitleSideDemuxer: Demuxer?
+    /// Identity ("url#titleID") of the retained primary side demuxer. A subtitle track switch or a seek on
+    /// the same source reuses the open demuxer (skipping the network open + find_stream_info) when this
+    /// matches the request; a new load / title switch / clear tears it down and clears the key (#76 part 2).
+    var activeSubtitleSideDemuxerKey: String?
 
     /// One entry per native mov_text track in muxer-declaration order (#55). Built from probed subtitleTracks
     /// (non-bitmap, source order) at load; sidecar entries appended at runtime. sourceStreamIndex is nil for sidecars;
@@ -690,6 +722,11 @@ public final class AetherEngine: ObservableObject {
         // the SW dispatch branch releases it if this source routes software.
         let priorBackendWasNative = (playbackBackend == .native)
         stopInternal(keepNativeHost: priorBackendWasNative)
+        // Drop disc recognition memoized for the previous media. Track-switch reopens (audio / subtitle
+        // side demuxer) deliberately keep it so a remote ISO is parsed once per session (#76); only a
+        // genuinely new load clears it, which also keeps custom sources (shared placeholder URL) from
+        // bleeding one disc's structure into the next.
+        DiscReader.clearCache()
         // Capture generation; every suspension point re-checks for supersession.
         let gen = loadGeneration
         // For custom sources this is a synthetic placeholder; all I/O runs against the preopened probe demuxer.
@@ -779,14 +816,18 @@ public final class AetherEngine: ObservableObject {
             // AetherEngine#10: a @MainActor async body without a suspension point blocks the main thread
             // despite the async signature; Task.detached.value introduces a real background hop.
             try await Task.detached(priority: .userInitiated) { [probe, source, options] in
+                // Caller-bounded find_stream_info budget (#68); nil keeps the .playback default. This probe
+                // demuxer is reused as the session demuxer, so the cap lands on the open that actually pays it.
+                let probeProfile = DemuxerOpenProfile.playback.withProbeBudget(
+                    probesize: options.probesize, maxAnalyzeDuration: options.maxAnalyzeDuration)
                 switch source {
                 case .url(let u):
                     // isLive configures the AVIOReader for endless-feed mode; must be set at open time because
                     // the probe demuxer is reused as the session demuxer (avformat_open_input runs only once).
-                    try probe.open(url: u, extraHeaders: options.httpHeaders, isLive: options.isLive, selectTitleID: discTitleID)
+                    try probe.open(url: u, extraHeaders: options.httpHeaders, profile: probeProfile, isLive: options.isLive, selectTitleID: discTitleID)
                 case .custom(let reader, let formatHint):
                     // isLive suppresses SEEK_END duration estimate on forward-only live readers; same open-time requirement.
-                    try probe.open(reader: reader, formatHint: formatHint, isLive: options.isLive, selectTitleID: discTitleID)
+                    try probe.open(reader: reader, formatHint: formatHint, profile: probeProfile, isLive: options.isLive, selectTitleID: discTitleID)
                 }
             }.value
             probeOpened = true
@@ -871,15 +912,20 @@ public final class AetherEngine: ObservableObject {
         let sourceProbe: SourceProbe? = probeOpened
             ? Self.makeSourceProbe(demuxer: probe, displayURL: url)
             : nil
-        // Resolve the initial audio track: host override takes precedence; invalid override falls back to auto.
-        // nil when source has no audio (host can hide the picker without recomputing).
-        let resolvedInitialAudio: Int32
-        if let override = audioSourceStreamIndex,
-           probedAudioTracks.contains(where: { $0.id == Int(override) }) {
-            resolvedInitialAudio = override
-        } else {
-            resolvedInitialAudio = probedDefaultAudioIndex
-        }
+        // Resolve the initial audio track: an explicit host override wins, else the ordered language
+        // preference (#72) resolved from this single probe. selectedAudio is nil when neither applies,
+        // so the session keeps its own default pick (empty preferences + no override is a behavioural
+        // no-op). Passing selectedAudio into session start lets the host honor a saved language on the
+        // first frame without a separate pre-probe or a selectAudioTrack reload.
+        // On probe failure (probedAudioTracks empty) the override can't be validated, so honor it
+        // verbatim and let the reopened session re-validate it: an explicit audioSourceStreamIndex
+        // still wins (the contract), matching pre-#72 behavior where the raw override was passed through.
+        let selectedAudio = Self.selectAudioIndex(
+            tracks: probedAudioTracks,
+            override: audioSourceStreamIndex,
+            preferredLanguages: options.preferredAudioLanguages
+        ) ?? (probeOpened ? nil : audioSourceStreamIndex)
+        let resolvedInitialAudio = selectedAudio ?? probedDefaultAudioIndex
         activeAudioTrackIndex = resolvedInitialAudio >= 0 ? Int(resolvedInitialAudio) : nil
         let snappedRate = FrameRateSnap.snap(detectedRate ?? 0)
         EngineLog.emit("[AetherEngine] load url=\(url.absoluteString) source-format=\(detectedFormat) effective-format=\(effectiveFormat) rate=\(snappedRate.map { String(format: "%.3f", $0) } ?? "n/a")", category: .engine)
@@ -888,7 +934,7 @@ public final class AetherEngine: ObservableObject {
         //     Native sub-branch closes the probe and reopens via AVPlayer; FFmpeg sub-branch reuses the probe
         //     (required for custom sources).
         let hasVideoStream = probeOpened && probe.videoStreamIndex >= 0
-        if Self.shouldUseAudioOnlyPath(audioOnlyRequested: options.audioOnly, hasVideoStream: hasVideoStream) {
+        if Self.shouldUseAudioOnlyPath(audioOnlyRequested: options.audioOnly, probeOpened: probeOpened, hasVideoStream: hasVideoStream) {
             // Read codec before closing the probe; custom sources always use FFmpeg (AVPlayer can't consume a custom demuxer).
             let audioCodecID: AVCodecID = (probeOpened && resolvedInitialAudio >= 0)
                 ? (probe.stream(at: resolvedInitialAudio)?.pointee.codecpar.pointee.codec_id ?? AV_CODEC_ID_NONE)
@@ -943,6 +989,15 @@ public final class AetherEngine: ObservableObject {
                 throw error
             }
             return sourceProbe
+        }
+
+        // Reaching here with a failed probe means a non-audioOnly URL source whose open-time probe lost to a
+        // transient origin error (custom + live already fail-fast above). Don't degrade to audio-only (#78):
+        // dispatch native on codec NONE (the default switch arm) with a nil preopenedDemuxer so HLSVideoEngine
+        // reopens and discovers the real stream. Format/codec stay at their .sdr/NONE defaults; AVKit fires the
+        // criteria from the AVPlayerItem formatDescription once the reopened stream lands.
+        if !probeOpened {
+            EngineLog.emit("[AetherEngine] probe failed; falling through to the native video path (HLSVideoEngine will reopen and discover the stream) rather than degrading to audio-only", category: .engine)
         }
 
         // 2. Display-criteria handshake. Use effective format so a non-DV panel isn't asked to switch to dvh1.
@@ -1053,7 +1108,7 @@ public final class AetherEngine: ObservableObject {
                     url: url,
                     sourceHTTPHeaders: options.httpHeaders,
                     startPosition: startPosition,
-                    audioSourceStreamIndex: audioSourceStreamIndex,
+                    audioSourceStreamIndex: selectedAudio,
                     isLive: options.isLive,
                     dvrWindowSeconds: options.dvrWindowSeconds,
                     preopenedDemuxer: probeOpened ? probe : nil,
@@ -1080,7 +1135,7 @@ public final class AetherEngine: ObservableObject {
                     url: url,
                     sourceHTTPHeaders: options.httpHeaders,
                     startPosition: startPosition,
-                    audioSourceStreamIndex: audioSourceStreamIndex,
+                    audioSourceStreamIndex: selectedAudio,
                     keepDvh1TagWithoutDV: options.keepDvh1TagWithoutDV,
                     matchContentEnabled: options.matchContentEnabled,
                     panelIsInHDRMode: panelHDRAfterHandshake,
@@ -1126,6 +1181,10 @@ public final class AetherEngine: ObservableObject {
             state = .error("Failed to load: \(error.localizedDescription)")
             throw error
         }
+        // Honor a saved subtitle-language preference on the first frame (#73). Runs only on the successful
+        // video path (the audio-only branch returns earlier and renders no subtitles); a no-op when the
+        // preference list is empty, no track matches, or the host already activated one.
+        applyPreferredSubtitleSelection(startAnchor: startPosition, sourceDuration: sourceProbe?.durationSeconds)
         return sourceProbe
     }
 
@@ -1292,8 +1351,44 @@ public final class AetherEngine: ObservableObject {
         } else if let host = softwareHost {
             await host.seek(to: clockTarget)
         } else {
-            // Await real AVPlayer landing so isSeeking spans it (#37/#38).
-            await nativeHost?.seek(to: clockTarget)
+            // Await real AVPlayer landing so isSeeking spans it (#37/#38), but bound the wait (#65): a seek
+            // AVPlayer can never land (producer-wedge starvation) must not leave the optimistic clock latched
+            // forever. A normal/slow-but-buffering seek lands or keeps buffering well within the budget.
+            let landed = await nativeHost?.seek(to: clockTarget,
+                                                deadlineSeconds: Self.nativeSeekReconcileBudgetSeconds) ?? true
+            if !landed {
+                // Deadline expired. Only the surviving (winning) generation reconciles; a superseded seek
+                // returns at the guard below and lets the newer seek own the final state.
+                guard loadGeneration == gen, seekGeneration == seekGen else { return }
+                if let host = nativeHost,
+                   host.isEffectivelyPlaying, // #65: a paused seek lands while paused and is not a wedge; only reconcile a starved seek the player actually wants to play
+                   seekIsWedged(renderedTime: host.renderedTime, bufferedEnd: host.bufferedEnd) {
+                    // Genuine wedge: snap the clock back to AVPlayer's REAL rendered position (not the
+                    // unreachable optimistic target) and re-anchor the producer there.
+                    let avpReal = host.renderedTime
+                    nativeClockSeconds = avpReal
+                    clock.currentTime = avpReal + playlistShiftSeconds
+                    clock.sourceTime = avpReal + playlistShiftSeconds
+                    setProgrammaticSeek(inFlight: false, target: nil)
+                    // Hand state to AVPlayer's ACTUAL transport status, not the phantom .playing the normal
+                    // finalize forces nor the stuck .seeking we entered with: the $timeControlStatus sink is
+                    // gated on state already being .playing/.paused, so leaving .seeking would latch it there
+                    // forever even after the producer re-anchor recovers playback.
+                    state = (host.timeControlStatus == .paused) ? .paused : .playing
+                    isBuffering = host.timeControlStatus == .waitingToPlayAtSpecifiedRate
+                    reanchorProducerToPlaylistTime(avpReal)
+                    EngineLog.emit(
+                        "[AetherEngine] #65 seek did not land within \(Self.nativeSeekReconcileBudgetSeconds)s "
+                        + "and AVPlayer is starved (rendered=\(String(format: "%.2f", avpReal))s "
+                        + "buffered=\(String(format: "%.2f", host.bufferedEnd))s); reconciled clock to rendered "
+                        + "position and re-anchored producer",
+                        category: .engine
+                    )
+                    return
+                }
+                // Slow-but-buffering: preserve the #37/#38 await-real-landing contract.
+                await nativeHost?.seek(to: clockTarget)
+            }
         }
         // Guard: stop/load during the await tore the session down; writing clock state would publish a phantom.
         // A superseding seek owns the final state.
@@ -1305,22 +1400,32 @@ public final class AetherEngine: ObservableObject {
         // Re-arm the embedded subtitle side demuxer at the new playhead.
         if activeEmbeddedSubtitleStreamIndex >= 0, let url = loadedURL {
             let streamIdx = activeEmbeddedSubtitleStreamIndex
-            cancelEmbeddedSubtitleReader()
-            subtitleCues = []
-            // Custom sources: clone the reader; skip re-arm if the reader can't produce a clone (forward-only).
-            if isCustomSource {
-                if let clone = customReader?.makeIndependentReader() {
-                    startEmbeddedSubtitleTask(url: url, reader: clone, formatHint: customFormatHint, streamIndex: streamIdx, startAt: target)
-                }
+            // #77: in-band CC is fed by the producer CC tap, which rides the producer across the seek.
+            // Clear the on-screen caption now so a pre-seek cue can't linger (symmetric with the side-demuxer
+            // branch below), then tell the tap to drop stale decoder/cue state at this discontinuity; it
+            // republishes as the re-anchored producer re-pumps. No side demuxer to re-arm.
+            if activeSubtitleStreamIsClosedCaption(streamIdx) {
+                subtitleCues = []
+                ccCueSnapshot = []
+                closedCaptionTap?.requestReset()
             } else {
-                startEmbeddedSubtitleTask(url: url, reader: nil, formatHint: nil, streamIndex: streamIdx, startAt: target)
+                subtitleCues = []
+                // startEmbeddedSubtitleTask cancels + drains the prior reader, then reuses the open side demuxer
+                // and just re-seeks it to the new playhead (URL sources); no re-open on a seek (#76 part 2).
+                // Custom sources: clone the reader; skip re-arm if the reader can't produce a clone (forward-only).
+                if isCustomSource {
+                    if let clone = customReader?.makeIndependentReader() {
+                        startEmbeddedSubtitleTask(url: url, reader: clone, formatHint: customFormatHint, streamIndex: streamIdx, startAt: target)
+                    }
+                } else {
+                    startEmbeddedSubtitleTask(url: url, reader: nil, formatHint: nil, streamIndex: streamIdx, startAt: target)
+                }
             }
         }
 
         // Re-arm the secondary embedded subtitle track (#47).
         if activeSecondaryEmbeddedSubtitleStreamIndex >= 0, let url = loadedURL {
             let streamIdx = activeSecondaryEmbeddedSubtitleStreamIndex
-            cancelEmbeddedSubtitleReader(channel: .secondary)
             secondarySubtitleCues = []
             if isCustomSource {
                 if let clone = customReader?.makeIndependentReader() {
@@ -1334,6 +1439,20 @@ public final class AetherEngine: ObservableObject {
         // Seek has physically landed.
         state = .playing
         setProgrammaticSeek(inFlight: false, target: nil)
+    }
+
+    /// #65: re-base the loopback producer onto AVPlayer's real (playlist-axis) position after a seek-deadline
+    /// wedge reconcile, so the segments AVPlayer is starved for get produced. requestRestart does blocking
+    /// teardown (old.stop + waitForFinish up to 5s) and is designed to run off-main, so dispatch it detached.
+    private func reanchorProducerToPlaylistTime(_ seconds: Double) {
+        guard let session = nativeVideoSession else { return }
+        Task.detached {
+            let idx = session.segmentIndexForPlaylistTime(seconds)
+            // #79: authoritative re-anchor. `seconds` is AVPlayer's REAL rendered position (the clock was
+            // just reconciled to it), so it must win the coalescer over any stale in-flight scrub target.
+            // Without this a burst-tail scrub overrode it and the producer stayed ~1600s off the playhead.
+            session.requestRestart(at: idx, authoritative: true)
+        }
     }
 
     /// Deprecated alias. The engine clock is now unified onto source PTS; prefer `seek(to:)` in new code.
@@ -1678,6 +1797,7 @@ public final class AetherEngine: ObservableObject {
         cancelSidecarTask()
         cancelEmbeddedSubtitleReader()
         activeEmbeddedSubtitleStreamIndex = -1
+        activeSubtitleTrackIndex = nil
         loadedSidecarURL = nil
         isSubtitleActive = false
         subtitleCues = []

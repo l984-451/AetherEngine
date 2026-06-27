@@ -85,6 +85,7 @@ Sources/AetherEngine/
 ├── AetherEngine+Probe.swift                 Static probe machinery: probe(url:/source:), swDecodeProbe, format / frame-rate / codec-label detection
 ├── AetherEngine+Loading.swift               The per-backend loaders (remote-HLS, native, software, audio, audio-native) + reload
 ├── AetherEngine+Subtitles.swift             Embedded + sidecar subtitle pipeline (side demuxer task, cue apply / prune)
+├── AetherEngine+ClosedCaptions.swift        In-band CEA-608 closed captions: ClosedCaptionTap (read-only producer observer) + cue mirroring (#77)
 ├── AetherEngine+Live.swift                  Live window publishing, edge snap, resume clamp, scrub thumbnails
 ├── AetherEngine+Diagnostics.swift           Memory probe + live-telemetry bridge
 ├── PlaybackClock.swift                      engine.clock: the ~10 Hz ticking values (currentTime, sourceTime, bufferedPosition, progress, live-edge fields) as a separate ObservableObject
@@ -99,6 +100,8 @@ Sources/AetherEngine/
 │   ├── AudioOutput.swift                    SW path: AVSampleBufferAudioRenderer + Synchronizer (master clock)
 │   └── AudioPlaybackHost.swift              Audio-only path: FFmpeg demux + decode into AVSampleBufferAudioRenderer for codecs off the whitelist
 ├── Decoder/
+│   ├── CCDataParser.swift                   Parses the bare cc_data triplet stream from a demuxable CEA-608 caption track (#77)
+│   ├── CEA608Decoder.swift                  In-house CEA-608 line-21 decoder (field-1 / CC1), validated against FFmpeg ccaption_dec.c (#77)
 │   ├── DeinterlaceFilter.swift              SW path: persistent bwdif / yadif libavfilter graph, engages on the first interlaced frame
 │   ├── EmbeddedSubtitleDecoder.swift        Inline subtitle decode from demuxed packets
 │   ├── HardwareVideoDecoder.swift           SW path: VideoToolbox HW HEVC / AV1 decoder for sources routed away from AVPlayer
@@ -109,7 +112,7 @@ Sources/AetherEngine/
 │   ├── AVIOProvider.swift                   Internal seam over a custom-AVIO byte source; AVIOReader and CustomIOReaderBridge both plug into the Demuxer through it
 │   ├── AVIOReader.swift                     URLSession-backed avio_alloc_context, three modes: persistent forward-streaming connection with reconnect-on-drop (playback, incl. live), discrete Range chunks (still extraction), single sequential GET with backpressure (non-live sources without Content-Length). Optional read deadline bounds a degenerate matroska Cues seek
 │   ├── CustomIOReaderBridge.swift           Bridges a host-supplied IOReader into avio_alloc_context read / seek callbacks
-│   └── Demuxer.swift                        libavformat wrapper; seek + bounded seek (deadline-capped)
+│   └── Demuxer.swift                        libavformat wrapper; seek + bounded seek (deadline-capped); per-open `DemuxerOpenProfile` budgets `find_stream_info` (probesize / max_analyze_duration), caller-overridable on the main playback open via `LoadOptions.probesize` / `maxAnalyzeDuration`
 ├── Diagnostics/
 │   ├── EngineDiagnostics.swift              engine.diagnostics: timer-sampled values (liveTelemetry) as a separate ObservableObject
 │   ├── EngineLog.swift                      Gated OSLog emission with severity levels (.verbose suppressed from default + host handler)

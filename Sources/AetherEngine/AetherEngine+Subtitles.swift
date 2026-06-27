@@ -12,6 +12,13 @@ public enum SubtitleChannel: Sendable {
     case secondary
 }
 
+/// Result of acquiring a side demuxer for a subtitle reader: the open container plus whether it was reused
+/// from the retained slot (#76 part 2) or freshly created. Crosses the MainActor boundary out of the acquire.
+private struct SideDemuxerAcquisition: Sendable {
+    let demuxer: Demuxer
+    let reused: Bool
+}
+
 extension AetherEngine {
 
     // MARK: - Channel routing
@@ -30,6 +37,26 @@ extension AetherEngine {
         }
     }
 
+    func subtitleSideDemuxerKey(for channel: SubtitleChannel) -> String? {
+        switch channel {
+        case .primary:   return activeSubtitleSideDemuxerKey
+        case .secondary: return secondarySubtitleSideDemuxerKey
+        }
+    }
+
+    func setSubtitleSideDemuxerKey(_ key: String?, for channel: SubtitleChannel) {
+        switch channel {
+        case .primary:   activeSubtitleSideDemuxerKey = key
+        case .secondary: secondarySubtitleSideDemuxerKey = key
+        }
+    }
+
+    /// The reuse identity for a side demuxer: same source URL + disc title means the open container can be
+    /// reused across subtitle track switches and seeks (#76 part 2).
+    func subtitleSideDemuxerReuseKey(url: URL, titleID: Int?) -> String {
+        "\(url.absoluteString)#\(titleID ?? -1)"
+    }
+
     func setLoadingSubtitles(_ value: Bool, for channel: SubtitleChannel) {
         switch channel {
         case .primary:   isLoadingSubtitles = value
@@ -46,7 +73,31 @@ extension AetherEngine {
 
     /// Activate an embedded subtitle stream via a side Demuxer. Side demuxer is used because the main HLS pump races ~60-80 s ahead mid-playback and discards the subtitle packets; seeking the side demuxer to the playhead is cheaper than re-reading the main pump. Re-seeks on `engine.seek`. Supports text codecs (SubRip / ASS / SSA / WebVTT / mov_text) and bitmap codecs (PGS / DVB / DVD / XSUB).
     public func selectSubtitleTrack(index: Int) {
+        selectSubtitleTrack(index: index, startAt: sourceTime)
+    }
+
+    /// `selectSubtitleTrack(index:)` with an explicit source-PTS start anchor. The public form passes the live
+    /// `sourceTime`; the preferred-subtitle-language auto-select at load passes the resume position so the side
+    /// demuxer seeks to the playhead instead of burst-reading from byte 0 on a resumed mid-file load (#73).
+    func selectSubtitleTrack(index: Int, startAt: Double) {
         guard let url = loadedURL else { return }
+
+        // #77: in-band CEA-608/708 is fed by the always-on producer CC tap (set up at load), not a side
+        // demuxer. Selecting it just makes it the active track and mirrors the tap's cue snapshot. Tear down
+        // any running embedded reader first (no reuse: CC won't touch the side demuxer, so don't pin a remote
+        // connection open while it plays).
+        if let codec = subtitleTracks.first(where: { $0.id == index })?.codec,
+           Self.isEmbeddedClosedCaptionCodec(codec) {
+            cancelSidecarTask()
+            cancelEmbeddedSubtitleReader()
+            isSubtitleActive = true
+            activeEmbeddedSubtitleStreamIndex = Int32(index)
+            activeSubtitleTrackIndex = index
+            isLoadingSubtitles = false
+            subtitleCues = ccCueSnapshot
+            return
+        }
+
         // Custom sources: side demuxer needs an independent cursor; no-op if reader cannot clone.
         var customClone: IOReader? = nil
         if isCustomSource {
@@ -54,16 +105,44 @@ extension AetherEngine {
             customClone = clone
         }
         cancelSidecarTask()
-        cancelEmbeddedSubtitleReader()
 
         isSubtitleActive = true
         subtitleCues = []
         isLoadingSubtitles = true
         activeEmbeddedSubtitleStreamIndex = Int32(index)
+        activeSubtitleTrackIndex = index
 
+        // The prior embedded reader (if any) is cancelled and fully drained inside startEmbeddedSubtitleTask,
+        // which then reuses the already-open side demuxer for this switch instead of re-opening it (#76 part 2).
         // Native mov_text rendition (#55, all-tracks) is fed by the dedicated multi-decode reader at load; this inline path only drives subtitleCues for the host overlay.
-        // sourceTime is the unified source-PTS playhead; pre-fold AVPlayer clock would land playlistShiftSeconds early ("subs 3-5 s late" repro on Cars with ~3.92 s shift).
-        startEmbeddedSubtitleTask(url: url, reader: customClone, formatHint: customFormatHint, streamIndex: Int32(index), startAt: sourceTime)
+        // startAt is the unified source-PTS playhead; pre-fold AVPlayer clock would land playlistShiftSeconds early ("subs 3-5 s late" repro on Cars with ~3.92 s shift).
+        startEmbeddedSubtitleTask(url: url, reader: customClone, formatHint: customFormatHint, streamIndex: Int32(index), startAt: startAt)
+    }
+
+    /// Apply `LoadOptions.preferredSubtitleLanguages` at the end of a successful load: activate the best-ranked
+    /// subtitle track whose language matches a preference (scanned in order; see `selectSubtitleIndex`), else
+    /// leave subtitles off (the default). Uses the host-overlay path (equivalent to a `selectSubtitleTrack`
+    /// call); `startAnchor` is the
+    /// load's resume position so a mid-file resume seeks the side demuxer to the playhead instead of byte 0.
+    /// A no-op when the list is empty, no track matches, or the host already activated a subtitle. The resolved
+    /// index is published via `activeSubtitleTrackIndex`. Independent of `prepareNativeSubtitles`. (#73)
+    func applyPreferredSubtitleSelection(startAnchor: Double?, sourceDuration: Double?) {
+        guard !loadedOptions.preferredSubtitleLanguages.isEmpty, !isSubtitleActive else { return }
+        guard let index = Self.selectSubtitleIndex(
+            tracks: subtitleTracks,
+            preferredLanguages: loadedOptions.preferredSubtitleLanguages
+        ) else { return }
+        EngineLog.emit(
+            "[AetherEngine] preferred-subtitle auto-select stream=\(index) langs=\(loadedOptions.preferredSubtitleLanguages)",
+            category: .engine
+        )
+        // Bound the anchor to the probe duration (synchronously known here; the published `duration` is set
+        // asynchronously and is still 0 at this point). A stale resume > duration would otherwise seek the
+        // side demuxer past EOF and the auto-selected subtitle would silently never appear. Unknown duration
+        // (probe failure / live) leaves the anchor unclamped. Mirrors seek()'s clamp.
+        var anchor = max(0, startAnchor ?? 0)
+        if let duration = sourceDuration, duration > 0 { anchor = min(anchor, duration) }
+        selectSubtitleTrack(index: Int(index), startAt: anchor > 0 ? anchor : sourceTime)
     }
 
     /// Activate an embedded subtitle stream as the secondary companion track (issue #47). Text-only; bitmap codecs are rejected. Runs a second side demuxer concurrently.
@@ -75,13 +154,14 @@ extension AetherEngine {
             customClone = clone
         }
         cancelSidecarTask(channel: .secondary)
-        cancelEmbeddedSubtitleReader(channel: .secondary)
 
         isSecondarySubtitleActive = true
         secondarySubtitleCues = []
         isLoadingSecondarySubtitles = true
         activeSecondaryEmbeddedSubtitleStreamIndex = Int32(index)
 
+        // Prior secondary reader is cancelled + drained inside startEmbeddedSubtitleTask, then its side demuxer
+        // is reused for this switch (#76 part 2).
         startEmbeddedSubtitleTask(url: url, reader: customClone, formatHint: customFormatHint, streamIndex: Int32(index), startAt: sourceTime, channel: .secondary)
     }
 
@@ -92,12 +172,29 @@ extension AetherEngine {
         let headers = loadedOptions.httpHeaders
         // Secondary never drives libass; raw ASS event lines would leak into the overlay (issue #47).
         let preserveASS = (channel == .primary) ? loadedOptions.preserveASSMarkup : false
+        // #76: bound the open probe + open the title the user is watching. Captured on MainActor here
+        // (loadedOptions / activeDiscTitleID are MainActor-isolated, the reader is nonisolated).
+        let probesize = loadedOptions.probesize
+        let maxAnalyzeDuration = loadedOptions.maxAnalyzeDuration
+        let titleID = activeDiscTitleID
+        // Reuse only for URL sources: a custom source's cloned reader is single-cursor, so its side demuxer
+        // can't be shared across switches (#76 part 2). nil key disables reuse for the custom path.
+        let reuseKey = reader == nil ? subtitleSideDemuxerReuseKey(url: url, titleID: titleID) : nil
+        // Handoff: drain the predecessor before this reader touches the (possibly reused) side demuxer.
+        // The side demuxer serializes reads internally, but the old loop seeking / reading after the new one
+        // re-seeks would mis-order cues, so we wait for it to exit rather than markClosed it (markClosed is
+        // irreversible and would kill a demuxer we want to reuse) (#76 part 2).
+        let prior: Task<Void, Never>? = (channel == .primary) ? embeddedSubtitleTask : secondaryEmbeddedSubtitleTask
         let task = Task.detached(priority: .userInitiated) { [weak self] () -> Void in
+            prior?.cancel()
+            await prior?.value
+            if Task.isCancelled { reader?.close(); return }
             await self?.runEmbeddedSubtitleReader(
                 url: url, reader: reader, formatHint: formatHint,
                 headers: headers, streamIndex: streamIndex, startAt: startAt,
                 videoWidth: w, videoHeight: h, preserveASSMarkup: preserveASS,
-                channel: channel
+                callerProbesize: probesize, callerMaxAnalyzeDuration: maxAnalyzeDuration,
+                selectTitleID: titleID, channel: channel, reuseKey: reuseKey
             )
         }
         switch channel {
@@ -111,59 +208,109 @@ extension AetherEngine {
         url: URL, reader: IOReader?, formatHint: String?,
         headers: [String: String], streamIndex: Int32, startAt: Double,
         videoWidth: Int32, videoHeight: Int32, preserveASSMarkup: Bool = false,
-        channel: SubtitleChannel = .primary
+        callerProbesize: Int64? = nil, callerMaxAnalyzeDuration: Int64? = nil,
+        selectTitleID: Int? = nil,
+        channel: SubtitleChannel = .primary,
+        reuseKey: String? = nil
     ) async {
-        let demuxer = Demuxer()
-        // markClosed makes AVIO-blocked reads return promptly (Task.cancel() only fires between readPacket calls). Without it a stalled side demuxer survives track switches and keeps reconnecting into the next session.
-        // Stale-task guard: if already cancelled (A->B switch where B registered first), overwriting hijacks B's abort handle, leaving B's reader unabortable.
-        let registered = await MainActor.run { [weak self] () -> Bool in
-            guard !Task.isCancelled, let self else { return false }
-            self.setSubtitleSideDemuxer(demuxer, for: channel)
-            return true
+        // #76: cap find_stream_info so a remote disc's sparse PGS tracks don't drag the open to the
+        // full 50 MB budget (the reader would be superseded before it reads a packet).
+        let openProfile = DemuxerOpenProfile.subtitleSideDemuxer(
+            callerProbesize: callerProbesize, callerMaxAnalyzeDuration: callerMaxAnalyzeDuration)
+
+        // Acquire the side demuxer. For a URL source (reuseKey set, clone reader nil) reuse the demuxer retained
+        // for this exact source+title, so a track switch / seek skips the network open + find_stream_info
+        // entirely (#76 part 2). For a custom source (single-cursor clone) always open fresh and let the exit
+        // handler close it (original behavior). Runs on MainActor: the slot/key are MainActor state and the
+        // predecessor reader has already drained (handoff), so nothing else is touching the demuxer.
+        let acquired: SideDemuxerAcquisition? = await MainActor.run { [weak self] () -> SideDemuxerAcquisition? in
+            guard !Task.isCancelled, let self else { return nil }
+            if reader == nil, let reuseKey,
+               let retained = self.subtitleSideDemuxer(for: channel),
+               self.subtitleSideDemuxerKey(for: channel) == reuseKey {
+                return SideDemuxerAcquisition(demuxer: retained, reused: true)
+            }
+            // A demuxer retained for a different source/title (or a half-open one) is stale; the predecessor
+            // has drained, so tear it down before replacing it. markClosed makes any AVIO-blocked read return.
+            if let stale = self.subtitleSideDemuxer(for: channel) {
+                stale.markClosed()
+                stale.close()
+            }
+            let fresh = Demuxer()
+            self.setSubtitleSideDemuxer(fresh, for: channel)
+            self.setSubtitleSideDemuxerKey(nil, for: channel)  // set after a successful open
+            return SideDemuxerAcquisition(demuxer: fresh, reused: false)
         }
-        guard registered else {
+        guard let acquired else {
             reader?.close()
             return
         }
+        let demuxer = acquired.demuxer
+        let reused = acquired.reused
+
+        // Exit handler: keep the open demuxer for a superseding switch / seek to reuse (cancelled AND still the
+        // slot's demuxer AND a reusable URL source). Otherwise (EOF / decoder error, or a teardown that cleared
+        // the slot) close it and the backing clone. Runs after the read loop has fully exited, so the unlocked
+        // demuxer.stream(at:) in the loop never races a close.
         defer {
+            let cancelled = Task.isCancelled
             Task { @MainActor [weak self, weak demuxer] in
-                if let self, let demuxer, self.subtitleSideDemuxer(for: channel) === demuxer {
-                    self.setSubtitleSideDemuxer(nil, for: channel)
+                guard let demuxer else { reader?.close(); return }  // already released; Demuxer.deinit closed it
+                let stillSlot = self?.subtitleSideDemuxer(for: channel) === demuxer
+                if cancelled, stillSlot, reuseKey != nil {
+                    return
                 }
+                if let self, stillSlot {
+                    self.setSubtitleSideDemuxer(nil, for: channel)
+                    self.setSubtitleSideDemuxerKey(nil, for: channel)
+                }
+                demuxer.close()
+                reader?.close()
             }
-        }
-        do {
-            if let reader = reader {
-                try demuxer.open(reader: reader, formatHint: formatHint)
-            } else {
-                try demuxer.open(url: url, extraHeaders: headers)
-            }
-        } catch {
-            EngineLog.emit("[AetherEngine] embedded subtitle open failed: \(error)", category: .engine)
-            reader?.close()
-            await MainActor.run { [weak self] in
-                guard !Task.isCancelled else { return }  // Stale-task guard: cancelled track-switch must not clear successor's spinner.
-                self?.setLoadingSubtitles(false, for: channel)
-            }
-            return
-        }
-        // Side demuxer owns the clone reader; close after demuxer is torn down.
-        defer {
-            demuxer.close()
-            reader?.close()
         }
 
-        // MKV cue index lives at EOF; without this prewarm the playhead seek lands inaccurately (same technique HLSVideoEngine uses).
-        let duration = demuxer.duration
-        if duration > 0 {
-            demuxer.seek(to: duration * 0.5)
+        // Superseded during the handoff: release the just-acquired demuxer via the exit handler without paying
+        // for the open / seek.
+        if Task.isCancelled { return }
+
+        if !reused {
+            // markClosed makes AVIO-blocked reads return promptly (Task.cancel() only fires between readPacket calls). Without it a stalled side demuxer survives track switches and keeps reconnecting into the next session.
+            do {
+                if let reader = reader {
+                    try demuxer.open(reader: reader, formatHint: formatHint, profile: openProfile, selectTitleID: selectTitleID, discCacheKey: url.absoluteString)
+                } else {
+                    try demuxer.open(url: url, extraHeaders: headers, profile: openProfile, selectTitleID: selectTitleID)
+                }
+            } catch {
+                EngineLog.emit("[AetherEngine] embedded subtitle open failed: \(error)", category: .engine)
+                await MainActor.run { [weak self] in
+                    guard !Task.isCancelled else { return }  // Stale-task guard: cancelled track-switch must not clear successor's spinner.
+                    self?.setLoadingSubtitles(false, for: channel)
+                }
+                return  // exit handler tears down the half-open demuxer + clears the slot
+            }
+            // Streams are populated; mark the demuxer reusable for the next same-source switch / seek.
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                if self.subtitleSideDemuxer(for: channel) === demuxer {
+                    self.setSubtitleSideDemuxerKey(reuseKey, for: channel)
+                }
+            }
+
+            // MKV cue index lives at EOF; without this prewarm the playhead seek lands inaccurately (same technique HLSVideoEngine uses).
+            // Skip it for disc sources (#76): a concat MPEG-TS / VOB has no EOF cue index, so the seek buys nothing and a cold mid-disc range read is expensive on a remote ISO.
+            let duration = demuxer.duration
+            if duration > 0, !demuxer.isDiscSource {
+                demuxer.seek(to: duration * 0.5)
+            }
         }
 
         // Re-sample the live playhead after the slow open + prewarm: startAt was captured pre-open, and unpaused playback may have advanced several seconds, causing the first cues to arrive behind the playhead (tens-of-seconds delay in issue #52). `max` only seeks forward to catch up, never behind the anchor.
         let freshPlayhead = await MainActor.run { [weak self] in self?.sourceTime }
         let effectiveStart = max(startAt, freshPlayhead ?? startAt)
 
-        // -2 s lead-in: PGS/DVB/HDMV need their SETUP segments before the first END/EVENT (#52).
+        // -2 s lead-in: PGS/DVB/HDMV need their SETUP segments before the first END/EVENT (#52). On reuse this
+        // re-seeks the already-open container to the new playhead, which is the whole point (no re-open).
         let seekTo = max(0, effectiveStart - 2.0)
         demuxer.seek(to: seekTo)
 
@@ -404,7 +551,12 @@ extension AetherEngine {
         cues.removeAll { $0.endTime < cutoff }
     }
 
-    /// Cancel task + markClosed the demuxer. markClosed is required because Task.cancel() is only observed between reads; an AVIO-parked demuxer would otherwise survive teardown.
+    /// Teardown a subtitle reader: cancel the task + markClosed the demuxer + clear the reuse slot. markClosed
+    /// is required because Task.cancel() is only observed between reads; an AVIO-parked demuxer would otherwise
+    /// survive teardown. Clearing the slot makes the running loop's exit handler close the demuxer (or, if it
+    /// already exited and was retained for reuse, ARC + Demuxer.deinit close it). Used only by genuine teardown
+    /// sites (clear / sidecar / CC / stop); same-source switch and seek reuse the demuxer via the handoff in
+    /// startEmbeddedSubtitleTask instead (#76 part 2).
     func cancelEmbeddedSubtitleReader(channel: SubtitleChannel = .primary) {
         switch channel {
         case .primary:
@@ -412,11 +564,13 @@ extension AetherEngine {
             embeddedSubtitleTask = nil
             activeSubtitleSideDemuxer?.markClosed()
             activeSubtitleSideDemuxer = nil
+            activeSubtitleSideDemuxerKey = nil
         case .secondary:
             secondaryEmbeddedSubtitleTask?.cancel()
             secondaryEmbeddedSubtitleTask = nil
             secondarySubtitleSideDemuxer?.markClosed()
             secondarySubtitleSideDemuxer = nil
+            secondarySubtitleSideDemuxerKey = nil
         }
     }
 
@@ -426,6 +580,7 @@ extension AetherEngine {
         // Sidecar replaces any active embedded stream.
         cancelEmbeddedSubtitleReader()
         activeEmbeddedSubtitleStreamIndex = -1
+        activeSubtitleTrackIndex = nil
 
         loadedSidecarURL = url
         isSubtitleActive = true
@@ -505,6 +660,7 @@ extension AetherEngine {
         cancelSidecarTask()
         cancelEmbeddedSubtitleReader()
         activeEmbeddedSubtitleStreamIndex = -1
+        activeSubtitleTrackIndex = nil
         loadedSidecarURL = nil
         isSubtitleActive = false
         subtitleCues = []
@@ -565,10 +721,16 @@ extension AetherEngine {
         let h = sourceVideoHeight > 0 ? sourceVideoHeight : 1080
         let startAt = sourceTime
         let reader = customClone
+        // #76: same bounded-probe + active-title open as the inline reader.
+        let probesize = loadedOptions.probesize
+        let maxAnalyzeDuration = loadedOptions.maxAnalyzeDuration
+        let titleID = activeDiscTitleID
         nativeSubtitleReadersTask = Task.detached(priority: .utility) { [weak self] in
             await self?.runNativeSubtitleReaders(
                 url: url, reader: reader, formatHint: formatHint, headers: headers,
-                pairs: pairs, startAt: startAt, videoWidth: w, videoHeight: h
+                pairs: pairs, startAt: startAt, videoWidth: w, videoHeight: h,
+                callerProbesize: probesize, callerMaxAnalyzeDuration: maxAnalyzeDuration,
+                selectTitleID: titleID
             )
         }
     }
@@ -586,9 +748,13 @@ extension AetherEngine {
         url: URL, reader: IOReader?, formatHint: String?,
         headers: [String: String],
         pairs: [(streamIndex: Int32, store: NativeSubtitleCueStore)],
-        startAt: Double, videoWidth: Int32, videoHeight: Int32
+        startAt: Double, videoWidth: Int32, videoHeight: Int32,
+        callerProbesize: Int64? = nil, callerMaxAnalyzeDuration: Int64? = nil,
+        selectTitleID: Int? = nil
     ) async {
         let demuxer = Demuxer()
+        let openProfile = DemuxerOpenProfile.subtitleSideDemuxer(
+            callerProbesize: callerProbesize, callerMaxAnalyzeDuration: callerMaxAnalyzeDuration)
         let registered = await MainActor.run { [weak self] () -> Bool in
             guard !Task.isCancelled, let self else { return false }
             self.nativeSubtitleReadersDemuxer = demuxer
@@ -607,9 +773,9 @@ extension AetherEngine {
         }
         do {
             if let reader = reader {
-                try demuxer.open(reader: reader, formatHint: formatHint)
+                try demuxer.open(reader: reader, formatHint: formatHint, profile: openProfile, selectTitleID: selectTitleID, discCacheKey: url.absoluteString)
             } else {
-                try demuxer.open(url: url, extraHeaders: headers)
+                try demuxer.open(url: url, extraHeaders: headers, profile: openProfile, selectTitleID: selectTitleID)
             }
         } catch {
             EngineLog.emit("[AetherEngine] native subtitle readers open failed: \(error)", category: .engine)
@@ -621,9 +787,9 @@ extension AetherEngine {
             reader?.close()
         }
 
-        // Prewarm MKV cue index (lives at EOF), same as the inline reader.
+        // Prewarm MKV cue index (lives at EOF), same as the inline reader. Skip for disc sources (#76).
         let duration = demuxer.duration
-        if duration > 0 {
+        if duration > 0, !demuxer.isDiscSource {
             demuxer.seek(to: duration * 0.5)
         }
         let freshPlayhead = await MainActor.run { [weak self] in self?.sourceTime }

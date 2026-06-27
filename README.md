@@ -46,11 +46,11 @@ A scannable summary; the depth for each row lives in **[docs/formats.md](docs/fo
 | Dolby Atmos | EAC3+JOC stream-copied on every route (HDMI MAT 2.0, AirPods spatial, BT downmix) |
 | Surround | 5.1 / 7.1 with correct `AudioChannelLayout` |
 | Audio-only | `LoadOptions.audioOnly`: lean pipeline, no video machinery, system Now-Playing on tvOS / iOS |
-| Subtitles | Text (SRT / ASS / SSA / VTT / mov_text) inline, bitmap (PGS / DVB / DVD) as `CGImage`, sidecar files, opt-in raw ASS markup + fonts; opt-in native legible menu (all text tracks as language-tagged tx3g traks for PiP / AirPlay / external display, `LoadOptions.prepareNativeSubtitles`) |
+| Subtitles | Text (SRT / ASS / SSA / VTT / mov_text) inline, bitmap (PGS / DVB / DVD) as `CGImage`, in-band CEA-608 closed captions (`eia_608` demuxable track, field-1), sidecar files, opt-in raw ASS markup + fonts; opt-in native legible menu (all text tracks as language-tagged tx3g traks for PiP / AirPlay / external display, `LoadOptions.prepareNativeSubtitles`) |
 | Frames | Off-playback `FrameExtractor`: `thumbnail` (scrub preview) + `snapshot` (frame-accurate) |
 | Metadata | `MediaMetadata` (title / artist / album / albumArtist + cover) parsed on load |
 | Seek | Producer restart for backward / far-forward; short forward scrubs ride the cached window |
-| Streaming | One long-lived forward-streaming connection, reconnect-on-drop; CDN-stutter resilient |
+| Streaming | One long-lived forward-streaming connection, reconnect-on-drop; CDN-stutter resilient; optional caller-bounded open-time probe budget (`LoadOptions.probesize` / `maxAnalyzeDuration`) to cut first-frame latency on sparse remote remuxes |
 | Live / DVR | Unbounded live + optional timeshift; direct HLS ingest with AES-128 clear-key and SSAI ad-pod handling |
 | Custom input | Play any byte source via the `IOReader` protocol (`load(source:)`) |
 | Network | SMB2/3 shares via the optional `AetherEngineSMB` product (NTLMv2 / guest, read-only) |
@@ -152,7 +152,7 @@ Subtitle cues land in raw source PTS; render the overlay against `player.sourceT
 Install via Swift Package Manager:
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "4.1.0")
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "4.6.3")
 ```
 
 Two complementary samples ship in `Examples/`:
@@ -275,10 +275,10 @@ Browse all of this as a searchable site at **[aetherengine.superuser404.de](http
 AetherEngine uses [Semantic Versioning](https://semver.org). The public API surface — every `public` declaration in `Sources/AetherEngine/` — is the stability contract. **Major** removes / renames public symbols or breaks adopters; **Minor** adds public API or codec / format support; **Patch** fixes bugs with no public API change. `internal` types are not part of the contract.
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "4.1.0")
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "4.6.3")
 ```
 
-Pin to `.upToNextMinor(from: "4.1.0")` for stricter teams that prefer to opt into minor bumps explicitly.
+Pin to `.upToNextMinor(from: "4.6.3")` for stricter teams that prefer to opt into minor bumps explicitly.
 
 ## Requirements
 

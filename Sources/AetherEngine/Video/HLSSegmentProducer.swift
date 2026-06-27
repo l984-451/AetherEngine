@@ -301,6 +301,17 @@ final class HLSSegmentProducer: @unchecked Sendable {
     private static let liveAudioGateTimeoutSeconds: TimeInterval = 5
     private var pregateAudioDropCount: Int = 0
 
+    /// #74: head-of-stream audio that arrives before the first video packet, buffered (in read order)
+    /// while the video gate is still waiting, then replayed in DTS order once it opens. Each entry owns
+    /// its AVPacket. Without this the gate dropped the entire leading second of a wide-interleave source
+    /// (audio muxed ahead of video), leaving a constant ~1 s A/V desync. Bounded by a byte cap; above it
+    /// the original drop resumes.
+    private var pregateAudioBuffer: [(UnsafeMutablePointer<AVPacket>, PacketOrigin)] = []
+    private var pregateAudioBufferBytes: Int = 0
+    private var pregateAudioReplaySorted = false
+    private var pregateAudioOverflowLogged = false
+    private static let maxPregateAudioBufferBytes = 8 * 1024 * 1024
+
     /// Wall-clock of last finalized live segment; drives no-cut stall watchdog.
     private var lastLiveSegmentFinalizeAt: Date?
     /// Cutter-wedge timeout: pump reads at full rate but finalizes no segment (hostile SSAI ad pod).
@@ -326,10 +337,14 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// Max segments ahead of AVPlayer's highest fetched segment (cut from 20 to 10; 4K HEVC ~10 MB/seg = 200 MB old buffer).
     private static let bufferAheadSegments = 10
 
-    /// #65 stall diag: VOD has no watchdog to break a permanent backpressure park (every pump watchdog is
-    /// isLive-gated). Only log a park once it exceeds ~2 segment durations of zero playback progress, so normal
+    /// #65 stall diag: only log a park once it exceeds ~2 segment durations of zero playback progress, so normal
     /// backpressure (releases within one segment) stays silent and a real wedge surfaces its frozen tuple.
     private static let backpressureWedgeLogThresholdSeconds = 12
+
+    /// #65 watchdog: break a VOD backpressure park once the consumer fetch target has been frozen this long.
+    /// Set above the log threshold so the diag tuple surfaces first. The host then re-anchors the producer on
+    /// AVPlayer's real position; a slow-but-advancing consumer never trips the detector (see BackpressureWedgeDetector).
+    private static let backpressureWedgeBreakThresholdSeconds = 24
 
     private let pumpQueue = DispatchQueue(
         label: "AetherEngine.HLSSegmentProducer.pump",
@@ -339,6 +354,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
     private let stateLock = NSLock()
     private var pumpStarted = false
     private var shouldStop = false
+    /// #65: set when awaitBackpressureRelease breaks a frozen VOD park. runPumpLoop maps the resulting
+    /// muxer-nil exit to .backpressureWedge so the host re-anchors rather than treating it as a failure.
+    private var _backpressureWedgeBroken = false
 
     /// Video packet write counter; excludes bridge packets (different path). Read under packetCounterLock.
     private let packetCounterLock = NSLock()
@@ -395,6 +413,10 @@ final class HLSSegmentProducer: @unchecked Sendable {
         case sourceReplay
         /// Pump read packets but finalized no segment for stall window (hostile SSAI ad pod wedge).
         case segmentStall
+        /// VOD backpressure park frozen past the break threshold (consumer fetch target stuck, AVPlayer
+        /// wedged and issuing no forward request). Host re-anchors the producer on AVPlayer's real
+        /// position (#65). Live keeps its own watchdogs; this only fires on VOD.
+        case backpressureWedge
 
         var description: String {
             switch self {
@@ -405,17 +427,31 @@ final class HLSSegmentProducer: @unchecked Sendable {
             case .keyframeStarvation: return "keyframeStarvation"
             case .sourceReplay: return "sourceReplay"
             case .segmentStall: return "segmentStall"
+            case .backpressureWedge: return "backpressureWedge"
             }
         }
     }
 
     var onPumpFinished: (@Sendable (PumpExitReason) -> Void)?
 
+    /// #65: reads whether AVPlayer currently wants to play (`timeControlStatus != .paused`), off the main
+    /// actor. nil = assume wanting to play (preserves prior behaviour for tests + the live path). A paused
+    /// consumer issues no forward fetch, so the VOD backpressure wedge detector must suspend while this is
+    /// false instead of misreading the frozen fetch target as a wedge (issue #65 pause false-positive).
+    var wantsToPlayProvider: (@Sendable () -> Bool)?
+
     /// Ordinal-indexed cue stores for native mov_text subtitle tracks (#55). Empty = disabled.
     var subtitleCueStores: [NativeSubtitleCueStore] = []
 
     /// BCP-47 language tags parallel to subtitleCueStores; nil entry = no language box.
     var nativeSubtitleLanguages: [String?] = []
+
+    /// #77: in-band CC tap. When `closedCaptionStreamIndex >= 0` that source stream is kept (not
+    /// discarded) and each of its packets is handed to `closedCaptionObserver` (read-only) then dropped —
+    /// never muxed (output byte-identical). Set via init so it's in the keep-set; observer attached after.
+    var closedCaptionStreamIndex: Int32 = -1
+    var closedCaptionObserver: (@Sendable (UnsafePointer<AVPacket>, AVRational) -> Void)?
+    private var closedCaptionStreamTimeBase = AVRational(num: 1, den: 1)
 
     /// Must be set before first allocateMuxer call. Enables mov_text track declaration in init moov (#55).
     var enableNativeSubtitleTrack: Bool = false
@@ -483,6 +519,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
         videoFallbackDurationPts: Int64,
         audioFallbackDurationPts: Int64 = 0,
         restartTargetVideoDts: Int64 = Int64.min,
+        closedCaptionStreamIndex: Int32 = -1,
         desiredFirstVideoTfdtPts: Int64,
         desiredFirstAudioTfdtPts: Int64 = 0,
         segmentBoundaries: [Int64],
@@ -500,6 +537,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
             )
         }
         self.videoStreamIndex = videoStreamIndex
+        self.closedCaptionStreamIndex = closedCaptionStreamIndex   // #77: before the discard block below
         self.videoConfig = video
         self.convertP7Active = video.convertP7ToProfile81
         self.audioConfig = audio
@@ -524,7 +562,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
         // Discard streams we don't read (matroska queues PGS bitmaps, secondary audio -- heap churn).
         // Dual-demuxer: side audio index can alias a main-demuxer stream, so keep sets are split.
         if let side = sideAudioDemuxer {
-            demuxer.discardAllStreamsExcept([videoStreamIndex])
+            var keep: Set<Int32> = [videoStreamIndex]
+            if closedCaptionStreamIndex >= 0 { keep.insert(closedCaptionStreamIndex) }   // #77
+            demuxer.discardAllStreamsExcept(keep)
             if let audio = audio {
                 side.discardAllStreamsExcept([audio.sourceStreamIndex])
             }
@@ -533,7 +573,13 @@ final class HLSSegmentProducer: @unchecked Sendable {
             if let audio = audio {
                 keep.insert(audio.sourceStreamIndex)
             }
+            if closedCaptionStreamIndex >= 0 { keep.insert(closedCaptionStreamIndex) }   // #77
             demuxer.discardAllStreamsExcept(keep)
+        }
+        // #77: cache the CC stream's time_base for the observer's PTS conversion.
+        if closedCaptionStreamIndex >= 0 {
+            closedCaptionStreamTimeBase = demuxer.stream(at: closedCaptionStreamIndex)?.pointee.time_base
+                ?? AVRational(num: 1, den: 1)
         }
 
         let audioDesc = audio.map { a -> String in
@@ -671,8 +717,17 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// it) is distinguishable from healthy backpressure (cacheTarget climbing toward target). VOD only; live keeps
     /// its own watchdogs.
     private func awaitBackpressureRelease(target: Int, head: Int, context: String) -> Bool {
+        // Already broken on this session (e.g. a teardown-flush ensureMuxer call): stay broken, don't re-park.
+        if isBackpressureWedgeBroken() { return false }
         var parked = 0
         var nextLogAt = Self.backpressureWedgeLogThresholdSeconds
+        // #65 Piece A: a genuine VOD wedge is the consumer fetch target frozen past the break threshold.
+        // The detector resets whenever the target advances, so healthy backpressure (slow CDN, cold cache)
+        // keeps the target climbing and never trips. Live keeps its own pump watchdogs.
+        var wedgeDetector = BackpressureWedgeDetector(
+            breakThresholdSeconds: Self.backpressureWedgeBreakThresholdSeconds,
+            initialTarget: cache.targetIndex
+        )
         while !checkShouldStop() {
             if cache.awaitFetchHighWater(reaching: target, timeout: 1.0) {
                 if parked >= Self.backpressureWedgeLogThresholdSeconds {
@@ -686,18 +741,45 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 return true
             }
             parked += 1
+            let cacheTarget = cache.targetIndex
+            // #65 pause false-positive: a paused/backgrounded VOD consumer issues no forward fetch, so its
+            // frozen fetch target is not a wedge. Gate the detector on play intent (nil provider = assume
+            // playing, unchanged for live + tests); the legit starved-but-wants-to-play wedge keeps tripping.
+            let wantsToPlay = wantsToPlayProvider?() ?? true
             if !isLive, parked >= nextLogAt {
                 nextLogAt += 10
                 EngineLog.emit(
                     "[HLSSegmentProducer] #65 backpressure PARK (\(context)) head=\(head) "
-                    + "target=\(target) cacheTarget=\(cache.targetIndex) "
+                    + "target=\(target) cacheTarget=\(cacheTarget) "
                     + "highStored=\(cache.highestStoredIndex) cached=\(cache.count) parked=\(parked)s "
-                    + "(no playback progress; VOD has no watchdog to break this)",
+                    + (wantsToPlay ? "(no playback progress)" : "(consumer paused; wedge detection suspended)"),
                     category: .session
                 )
             }
+            if !isLive, wedgeDetector.observe(currentTarget: cacheTarget, wantsToPlay: wantsToPlay) {
+                markBackpressureWedgeBroken()
+                EngineLog.emit(
+                    "[HLSSegmentProducer] #65 backpressure WEDGE BROKEN (\(context)) head=\(head) "
+                    + "target=\(target) cacheTarget=\(cacheTarget) parked=\(parked)s; "
+                    + "exiting pump for host re-anchor on AVPlayer position",
+                    category: .session
+                )
+                return false
+            }
         }
         return false
+    }
+
+    private func markBackpressureWedgeBroken() {
+        stateLock.lock()
+        _backpressureWedgeBroken = true
+        stateLock.unlock()
+    }
+
+    private func isBackpressureWedgeBroken() -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return _backpressureWedgeBroken
     }
 
     /// Allocate (or re-allocate at SSAI program switch) the session's mp4 muxer.
@@ -1034,6 +1116,28 @@ final class HLSSegmentProducer: @unchecked Sendable {
         return packet.pointee.pts
     }
 
+    /// #74: whether a pre-video-gate audio packet should be buffered for in-DTS-order replay (instead of
+    /// dropped). Buffered while the gate is still waiting, only audio, only under the byte cap, for:
+    ///   - head-of-stream (any), and
+    ///   - VOD restart/seek.
+    /// The wide-interleave failure is the same at both: the matching audio is muxed ahead of the video in
+    /// file order, so on a seek it is read during the keyframe scan-forward (gate still closed) and was
+    /// dropped, leaving the post-gate restart-target filter to snap the next (~1 s-later) audio onto the
+    /// keyframe. Buffering it lets that same filter pick the matching packet from the [target, …] window.
+    /// Live restart still drops: its program-boundary re-anchor handles audio separately.
+    static func shouldBufferPregateAudio(
+        isAudioPkt: Bool,
+        audioWaitForVideo: Bool,
+        isHeadOfStream: Bool,
+        isLive: Bool,
+        bufferedBytes: Int,
+        packetSize: Int,
+        capBytes: Int
+    ) -> Bool {
+        guard isAudioPkt, audioWaitForVideo, isHeadOfStream || !isLive else { return false }
+        return bufferedBytes + max(packetSize, 0) <= capBytes
+    }
+
     /// Overwrite packed side-audio timestamps with the synthesized program clock.
     /// KNOWN LIMITATION: free-running clock does NOT follow a live video rebase; A/V sync is lost from that boundary on.
     private func stampPackedSideAudio(_ packet: UnsafeMutablePointer<AVPacket>) {
@@ -1128,10 +1232,28 @@ final class HLSSegmentProducer: @unchecked Sendable {
                     }
                 }
 
-                guard let (packet, origin) = try readNextSourcePacket() else {
-                    break readLoop
+                let packet: UnsafeMutablePointer<AVPacket>
+                let origin: PacketOrigin
+                if !audioWaitForVideo, !pregateAudioBuffer.isEmpty {
+                    // #74: once the video gate opens, drain the buffered head-of-stream audio in DTS
+                    // order before reading further source packets. These were already counted in
+                    // packetsRead when first read, so do not re-count them here.
+                    if !pregateAudioReplaySorted {
+                        pregateAudioBuffer.sort { Self.mergeOrderingTicks($0.0) < Self.mergeOrderingTicks($1.0) }
+                        pregateAudioReplaySorted = true
+                    }
+                    let entry = pregateAudioBuffer.removeFirst()
+                    packet = entry.0
+                    origin = entry.1
+                    pregateAudioBufferBytes -= Int(packet.pointee.size)
+                } else {
+                    guard let read = try readNextSourcePacket() else {
+                        break readLoop
+                    }
+                    packet = read.packet
+                    origin = read.origin
+                    packetsRead += 1
                 }
-                packetsRead += 1
                 var pktPtr: UnsafeMutablePointer<AVPacket>? = packet
                 defer { trackedPacketFree(&pktPtr) }
 
@@ -1196,6 +1318,12 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 } else {
                     isAudioPkt = (audioConfig.map { pktStreamIdx == $0.sourceStreamIndex }) ?? false
                 }
+                // #77: hand the in-band caption-track packet to the observer (read-only). It's a foreign
+                // packet (the eia_608/c608 caption stream) and is dropped below — never muxed.
+                if pktStreamIdx == closedCaptionStreamIndex, let observe = closedCaptionObserver {
+                    observe(packet, closedCaptionStreamTimeBase)
+                }
+
                 if packet.pointee.dts == Int64.min {
                     let anchor: Int64 = isVideoPkt ? lastVideoSourceDts
                                       : isAudioPkt ? lastAudioSourceDts
@@ -1215,6 +1343,39 @@ final class HLSSegmentProducer: @unchecked Sendable {
                             packet.pointee.pts = packet.pointee.dts
                         }
                     }
+                }
+
+                // #74: buffer pre-video-gate audio for in-DTS-order replay once the video gate opens
+                // (drained at the loop top), instead of dropping it at the audio gate. On wide-interleave
+                // sources (audio muxed ahead of video in file order) the old drop discarded the matching
+                // audio, leaving a constant ~1 s A/V desync. Bounded by a byte cap; over the cap the
+                // original gate drop below resumes. Applies to head-of-stream (any) and VOD restart/seek:
+                // on a seek the matching audio is read during the keyframe scan-forward (gate still
+                // closed), and buffering it lets the post-gate restart-target filter pick it from the
+                // [target, …] window. Live restart keeps the drop (program-boundary re-anchor handles it).
+                if Self.shouldBufferPregateAudio(
+                    isAudioPkt: isAudioPkt,
+                    audioWaitForVideo: audioWaitForVideo,
+                    isHeadOfStream: restartTargetVideoDts == Int64.min,
+                    isLive: isLive,
+                    bufferedBytes: pregateAudioBufferBytes,
+                    packetSize: Int(packet.pointee.size),
+                    capBytes: Self.maxPregateAudioBufferBytes
+                ) {
+                    pregateAudioBuffer.append((packet, origin))
+                    pregateAudioBufferBytes += Int(packet.pointee.size)
+                    pktPtr = nil  // ownership moves to the buffer; freed on replay or teardown
+                    continue
+                } else if isAudioPkt, audioWaitForVideo,
+                          restartTargetVideoDts == Int64.min || !isLive,
+                          !pregateAudioOverflowLogged {
+                    pregateAudioOverflowLogged = true
+                    EngineLog.emit(
+                        "[HLSSegmentProducer] pre-gate audio buffer hit the "
+                        + "\(Self.maxPregateAudioBufferBytes)-byte cap; dropping further leading audio "
+                        + "(wide interleave beyond cap)",
+                        category: .session
+                    )
                 }
                 // Live timeline rebase: a program boundary resets source dts to a small value.
                 // Per-frame monotonic gate would bump to lastValid+1, exceed reset pts, and DROP every subsequent packet.
@@ -1910,15 +2071,26 @@ final class HLSSegmentProducer: @unchecked Sendable {
             )
         }
 
-        // muxerFailed during stop() is teardown, not an error.
+        // muxerFailed from a backpressure break is a wedge (host re-anchors) or a stop (teardown), not a real failure.
         if case .muxerFailed = exitReason {
             stateLock.lock()
             let stopped = shouldStop
+            let wedged = _backpressureWedgeBroken
             stateLock.unlock()
             if stopped { exitReason = .stopRequested }
+            else if wedged { exitReason = .backpressureWedge }
         }
 
         freeMergeLookaheads()
+
+        // #74: free any head-of-stream audio still buffered (e.g. the video gate never opened on a
+        // corrupt or aborted source); replayed entries were already drained at the loop top.
+        for entry in pregateAudioBuffer {
+            var pkt: UnsafeMutablePointer<AVPacket>? = entry.0
+            trackedPacketFree(&pkt)
+        }
+        pregateAudioBuffer.removeAll()
+        pregateAudioBufferBytes = 0
 
         // Flush look-behind; fallback duration produces tail-correct trun for the final fragment.
         if let prev = pendingVideoPkt {

@@ -41,6 +41,38 @@ struct DemuxerOpenProfile: Sendable {
         avioRequestTimeout: 8,
         avioMaxRetries: 1
     )
+
+    /// A copy of `self` with only the open-time probe budget overridden (#68).
+    /// A non-nil `probesize` / `maxAnalyzeDuration` replaces the matching field;
+    /// nil keeps the receiver's value. The AVIO tuning (prefetch, chunk size,
+    /// per-chunk read budget, retries) always rides through untouched so a caller
+    /// can shrink find_stream_info on a slow remote source without disturbing the
+    /// streaming reader.
+    func withProbeBudget(probesize: Int64?, maxAnalyzeDuration: Int64?) -> DemuxerOpenProfile {
+        var copy = self
+        if let probesize { copy.probesize = probesize }
+        if let maxAnalyzeDuration { copy.maxAnalyzeDuration = maxAnalyzeDuration }
+        return copy
+    }
+
+    /// Open profile for the embedded subtitle side-demuxer (#76). `EmbeddedSubtitleDecoder`
+    /// needs only `codec_id` / `codec_type` (carried in the container header / MPEG-TS PMT,
+    /// resolved by `avformat_open_input` itself) and seeds bitmap (PGS/DVB/DVD) canvas dims
+    /// from the source video size, so the full 50 MB `find_stream_info` chase after sparse,
+    /// never-resolving subtitle streams is pure cost. On a remote disc that chase reads tens
+    /// of MB over HTTP (every PGS track keeps `has_codec_parameters` false to the budget cap,
+    /// the #75 pattern); the side reader is then superseded by a seek / title switch before it
+    /// reads a single packet, so subtitles never appear (works on a local ISO, where the open
+    /// is instant). Cap the probe to a subtitle-sized ceiling; honor an even tighter caller
+    /// budget (#68). Keeps the playback AVIO tuning (prefetch, chunk size, per-chunk timeout):
+    /// the reader does sustained paced reads, not a one-shot still fetch.
+    static func subtitleSideDemuxer(callerProbesize: Int64?, callerMaxAnalyzeDuration: Int64?) -> DemuxerOpenProfile {
+        let probeCeiling: Int64 = 4 * 1024 * 1024
+        let analyzeCeiling: Int64 = 5 * 1_000_000
+        let probesize = min(callerProbesize ?? probeCeiling, probeCeiling)
+        let analyze = min(callerMaxAnalyzeDuration ?? analyzeCeiling, analyzeCeiling)
+        return playback.withProbeBudget(probesize: probesize, maxAnalyzeDuration: analyze)
+    }
 }
 
 /// AVFormatContext wrapper. HTTP(S) uses custom AVIO via URLSession (no built-in
@@ -55,6 +87,10 @@ public final class Demuxer: @unchecked Sendable {
 
     private var avioProvider: AVIOProvider?
     private var openProfile: DemuxerOpenProfile = .playback
+
+    /// Number of attached-picture (cover-art) streams reclassified to ATTACHMENT before
+    /// stream-info probing on the most recent open. See `reclassifyAttachedPictures`. (#75)
+    private(set) var attachedPictureStreamsReclassified: Int = 0
 
     // Memory probe: compare against RSS growth; 0 for file:// sources.
     var avioBytesFetched: Int64 { avioProvider?.cumulativeBytesFetched ?? 0 }
@@ -79,6 +115,11 @@ public final class Demuxer: @unchecked Sendable {
         selectedDiscTitleIndex = info.selectedTitleIndex
     }
 
+    /// True once a disc structure (BD/DVD/UDF) was recognized at open. Disc sources concat
+    /// MPEG-TS / VOB clips and have no EOF cue index, so the MKV cue-index prewarm seek is
+    /// useless there and a cold mid-disc range read is expensive on a remote ISO (#76).
+    var isDiscSource: Bool { !discTitles.isEmpty }
+
     /// The disc's titles mapped to the public model (empty for non-disc sources).
     func discTitleInfos() -> [TitleInfo] { discTitles.map { $0.titleInfo() } }
     /// Chapters of the currently selected title (empty until BD/DVD chapters are populated).
@@ -102,7 +143,7 @@ public final class Demuxer: @unchecked Sendable {
             // Route a local DVD ISO through the disc adapter (FileIOReader keeps it
             // out of RAM). Falls back to the normal local open when not a disc.
             if url.isFileURL, let fileReader = FileIOReader(url: url),
-               let discInfo = try DiscReader.wrap(fileReader, selectTitleID: selectTitleID) {
+               let discInfo = try DiscReader.wrap(fileReader, selectTitleID: selectTitleID, cacheKey: url.absoluteString) {
                 adoptDiscInfo(discInfo)
                 let bridge = CustomIOReaderBridge(reader: discInfo.reader)
                 let inputFormat = av_find_input_format(discInfo.formatHint)
@@ -139,9 +180,9 @@ public final class Demuxer: @unchecked Sendable {
     /// no filename is available. `isLive` suppresses SEEK_END that latches EOF
     /// on forward-only readers (38ad60b). AetherEngine#36: DiscReader adapts
     /// DVD/BD ISOs to VOB/MPEGTS concat streams.
-    func open(reader: IOReader, formatHint: String? = nil, profile: DemuxerOpenProfile = .playback, isLive: Bool = false, selectTitleID: Int? = nil) throws {
+    func open(reader: IOReader, formatHint: String? = nil, profile: DemuxerOpenProfile = .playback, isLive: Bool = false, selectTitleID: Int? = nil, discCacheKey: String? = nil) throws {
         self.openProfile = profile
-        if let discInfo = try DiscReader.wrap(reader, selectTitleID: selectTitleID) {
+        if let discInfo = try DiscReader.wrap(reader, selectTitleID: selectTitleID, cacheKey: discCacheKey) {
             adoptDiscInfo(discInfo)
             let bridge = CustomIOReaderBridge(reader: discInfo.reader)
             let inputFormat = av_find_input_format(discInfo.formatHint)
@@ -166,7 +207,7 @@ public final class Demuxer: @unchecked Sendable {
         // the source is not a recognizable disc, fall through to the streaming reader.
         if !isLive, Self.isDiscImageURL(url),
            let discReader = HTTPDiscIOReader(url: url, extraHeaders: extraHeaders) {
-            if let discInfo = try DiscReader.wrap(discReader, selectTitleID: selectTitleID) {
+            if let discInfo = try DiscReader.wrap(discReader, selectTitleID: selectTitleID, cacheKey: url.absoluteString) {
                 adoptDiscInfo(discInfo)
                 let bridge = CustomIOReaderBridge(reader: discInfo.reader)
                 let inputFormat = av_find_input_format(discInfo.formatHint)
@@ -247,7 +288,35 @@ public final class Demuxer: @unchecked Sendable {
         }
     }
 
+    /// True for streams carrying a single cover-art still (e.g. mjpeg poster). FFmpeg flags these
+    /// with `AV_DISPOSITION_ATTACHED_PIC` at open, independent of codec type. (#75)
+    static func isAttachedPicture(disposition: Int32) -> Bool {
+        (disposition & AV_DISPOSITION_ATTACHED_PIC) != 0
+    }
+
+    /// Reclassify cover-art streams to `AVMEDIA_TYPE_ATTACHMENT` BEFORE `avformat_find_stream_info`.
+    /// An unresolvable cover (mjpeg with no decodable frame, reported size 0x0) otherwise keeps
+    /// `has_codec_parameters` false, so find_stream_info reads to the full probe budget (tens of MB
+    /// on a remote source) before giving up, dominating open. find_stream_info syncs codecpar into
+    /// its internal avctx unconditionally at setup, and `has_codec_parameters` returns true for an
+    /// ATTACHMENT stream with no width/pixfmt/decoder dependency, so the probe stops once the real
+    /// streams resolve. Cover extraction reads `attached_pic` + the unchanged disposition (queued at
+    /// open), so it is unaffected. Discard is deliberately left untouched: `AVDISCARD_ALL` would make
+    /// `avformat_queue_attached_pictures` skip the cover. (#75)
+    private func reclassifyAttachedPictures(_ ctx: UnsafeMutablePointer<AVFormatContext>) {
+        var count = 0
+        for i in 0..<Int(ctx.pointee.nb_streams) {
+            guard let stream = ctx.pointee.streams[i],
+                  let codecpar = stream.pointee.codecpar,
+                  Self.isAttachedPicture(disposition: stream.pointee.disposition) else { continue }
+            codecpar.pointee.codec_type = AVMEDIA_TYPE_ATTACHMENT
+            count += 1
+        }
+        attachedPictureStreamsReclassified = count
+    }
+
     private func probeStreams(_ ctx: UnsafeMutablePointer<AVFormatContext>) throws {
+        reclassifyAttachedPictures(ctx)
         let findRet = avformat_find_stream_info(ctx, nil)
         guard findRet >= 0 else {
             throw DemuxerError.streamInfoFailed(code: findRet)
@@ -388,6 +457,10 @@ public final class Demuxer: @unchecked Sendable {
         let codecName: String
         if let codec = avcodec_find_decoder(codecpar.pointee.codec_id) {
             codecName = String(cString: codec.pointee.name)
+        } else if let namePtr = avcodec_get_name(codecpar.pointee.codec_id) {
+            // No decoder built (e.g. eia_608): fall back to the codec-descriptor name so the track is
+            // identifiable. #77 routes in-band CEA-608/708 on this name ("eia_608").
+            codecName = String(cString: namePtr)
         } else {
             codecName = "unknown"
         }
@@ -403,7 +476,11 @@ public final class Demuxer: @unchecked Sendable {
             name = "Track \(index) (\(codecName))"
         }
 
-        let isDefault = (stream.pointee.disposition & AV_DISPOSITION_DEFAULT) != 0
+        let disposition = stream.pointee.disposition
+        let isDefault = (disposition & AV_DISPOSITION_DEFAULT) != 0
+        let isForced = (disposition & AV_DISPOSITION_FORCED) != 0
+        let isHearingImpaired = (disposition & AV_DISPOSITION_HEARING_IMPAIRED) != 0
+        let isCommentary = (disposition & AV_DISPOSITION_COMMENT) != 0
         let channels = Int(codecpar.pointee.ch_layout.nb_channels)
 
         // EAC3 profile 30 = JOC (Dolby Atmos on streaming). Lets UI label "Atmos".
@@ -431,6 +508,9 @@ public final class Demuxer: @unchecked Sendable {
             language: language,
             channels: channels,
             isDefault: isDefault,
+            isForced: isForced,
+            isHearingImpaired: isHearingImpaired,
+            isCommentary: isCommentary,
             isAtmos: isAtmos,
             assHeader: assHeader
         )

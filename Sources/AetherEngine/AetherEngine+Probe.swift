@@ -123,22 +123,6 @@ extension AetherEngine {
         return renditions
     }
 
-    /// True for image/bitmap subtitle codecs (PGS / DVB / DVD / XSUB), which
-    /// cannot be muxed into a native mov_text track and must be painted by the
-    /// host overlay. Mirrors `EmbeddedSubtitleDecoder.isBitmapCodec` against the
-    /// `avcodec_get_name` strings carried by `TrackInfo.codec` (aliases included).
-    nonisolated static func isBitmapSubtitleCodec(_ codec: String) -> Bool {
-        switch codec.lowercased() {
-        case "hdmv_pgs_subtitle", "pgssub", "pgs",
-             "dvb_subtitle", "dvbsub",
-             "dvd_subtitle", "dvdsub", "vobsub",
-             "xsub":
-            return true
-        default:
-            return false
-        }
-    }
-
     /// Map an FFmpeg subtitle codec name to a short, user-facing format label.
     nonisolated private static func subtitleFormatLabel(_ codec: String) -> String {
         switch codec.lowercased() {
@@ -318,9 +302,16 @@ extension AetherEngine {
         )
     }
 
-    /// Pure, nonisolated, and unit-testable: audio-only path when the host requested it OR the probe found no video stream.
-    nonisolated static func shouldUseAudioOnlyPath(audioOnlyRequested: Bool, hasVideoStream: Bool) -> Bool {
-        audioOnlyRequested || !hasVideoStream
+    /// Pure, nonisolated, and unit-testable: audio-only path when the host requested it OR a *successful* probe
+    /// genuinely found no video stream.
+    ///
+    /// A failed probe (`probeOpened == false`) must NOT route here. probeOpened false means we never looked, not
+    /// that there is no video; conflating the two silently degrades a real video file to the audio-only backend
+    /// when the open-time probe loses to a transient origin 429 (#78). On probe failure the caller falls through
+    /// to the native path so HLSVideoEngine reopens and discovers the stream (it demonstrably can).
+    nonisolated static func shouldUseAudioOnlyPath(audioOnlyRequested: Bool, probeOpened: Bool, hasVideoStream: Bool) -> Bool {
+        if audioOnlyRequested { return true }
+        return probeOpened && !hasVideoStream
     }
 
     /// Whitelist (not blacklist) of AVPlayer-native audio codecs: AAC, MP3, MP2, ALAC, AC-3/E-AC-3, LPCM, FLAC (native since iOS/tvOS 11). Anything else falls back to `AudioPlaybackHost` (FFmpeg).
@@ -344,6 +335,119 @@ extension AetherEngine {
             return false
         }
     }
+
+    // MARK: - Audio track selection (#72)
+
+    /// Resolve the audio stream index selected by an explicit host `override` or, failing that, the
+    /// ordered `preferredLanguages` policy. Returns nil when neither applies, so the caller keeps the
+    /// container / session default pick (i.e. an empty preference list with no override is a no-op,
+    /// behaviourally identical to before #72). Pure and nonisolated so a host can avoid a separate
+    /// audio pre-probe or a post-load `selectAudioTrack` reload (#72).
+    nonisolated static func selectAudioIndex(
+        tracks: [TrackInfo],
+        override: Int32?,
+        preferredLanguages: [String]
+    ) -> Int32? {
+        // Explicit host override wins, but only when it names a real audio track (else fall through).
+        if let override, tracks.contains(where: { $0.id == Int(override) }) {
+            return override
+        }
+        // Each preference is scanned across all tracks in order, so an earlier preference on a later
+        // track still beats a later preference on an earlier track.
+        for preferred in preferredLanguages {
+            if let match = tracks.first(where: { languageMatches($0.language, preferred) }) {
+                return Int32(match.id)
+            }
+        }
+        return nil
+    }
+
+    /// Resolve the subtitle track to auto-activate from `LoadOptions.preferredSubtitleLanguages`: within the
+    /// first preference (scanned in order) that has any language match, the best-ranked track by
+    /// `subtitlePickRank`; else nil. Preference order dominates rank, so an earlier preference always beats a
+    /// later one. Unlike audio there is no explicit index override and no default fallback: nil means "keep
+    /// subtitles off" (the default). Pure and nonisolated; the engine calls this at the end of a successful
+    /// load and, on a hit, activates the track via the host-overlay path so a host without container metadata
+    /// of its own need not language-match and rank `subtitleTracks` itself (#73).
+    nonisolated static func selectSubtitleIndex(
+        tracks: [TrackInfo],
+        preferredLanguages: [String]
+    ) -> Int32? {
+        for preferred in preferredLanguages {
+            let matches = tracks.filter { languageMatches($0.language, preferred) }
+            // min(by:) is stable, so equal-rank ties keep container order.
+            if let best = matches.min(by: { subtitlePickRank($0) < subtitlePickRank($1) }) {
+                return Int32(best.id)
+            }
+        }
+        return nil
+    }
+
+    /// Lower rank wins. The descriptor axis (full > SDH > forced > commentary, from container dispositions)
+    /// dominates; text-vs-bitmap is a tiebreaker (text preferred, since host styling only applies to text
+    /// cues). Sourced from `TrackInfo` disposition flags rather than title strings, so it is locale-robust.
+    /// Used by `selectSubtitleIndex` and exposed so a host can rank `subtitleTracks` the same way (#73).
+    nonisolated static func subtitlePickRank(_ track: TrackInfo) -> Int {
+        let descriptorRank: Int
+        if track.isCommentary {
+            descriptorRank = 3
+        } else if track.isForced {
+            descriptorRank = 2
+        } else if track.isHearingImpaired {
+            descriptorRank = 1
+        } else {
+            descriptorRank = 0
+        }
+        return descriptorRank * 2 + (isBitmapSubtitleCodec(track.codec) ? 1 : 0)
+    }
+
+    /// True when the codec is a bitmap (image) subtitle. `TrackInfo.codec` is the libavcodec DECODER name
+    /// (pgssub / dvdsub / dvbsub / xsub), not the descriptor name (hdmv_pgs_subtitle / dvb_subtitle / ...);
+    /// matched case-insensitively by substring so either form is tolerated. Bitmap subs cannot mux into
+    /// mov_text, so the native-subtitle rendition (#55) excludes them and only the host overlay renders them.
+    nonisolated static func isBitmapSubtitleCodec(_ codec: String) -> Bool {
+        let c = codec.lowercased()
+        return ["pgs", "hdmv", "dvb_sub", "dvbsub", "dvd_sub", "dvdsub", "vobsub", "xsub"]
+            .contains(where: { c.contains($0) })
+    }
+
+    /// True when the codec is an in-band CEA-608/708 caption track (`eia_608` / QuickTime `c608`). These
+    /// have no FFmpeg decoder, so they bypass the side-demuxer `EmbeddedSubtitleDecoder` and are served by
+    /// the producer CC tap, which parses their `cc_data` directly. (#77)
+    nonisolated static func isEmbeddedClosedCaptionCodec(_ codec: String) -> Bool {
+        let c = codec.lowercased()
+        return c == "eia_608" || c == "eia_708" || c == "cea708" || c == "cea_708"
+    }
+
+    /// Case-insensitive language match across ISO 639-1 / 639-2 (B and T) / English name, e.g.
+    /// `"en" == "eng" == "english"`, `"de" == "deu" == "ger"`. Empty / nil track language never matches.
+    /// Shared by audio (#72) and subtitle (#73) language selection. Pure and unit-tested.
+    nonisolated static func languageMatches(_ trackLanguage: String?, _ preferred: String) -> Bool {
+        guard let track = trackLanguage?.lowercased().trimmingCharacters(in: .whitespaces),
+              !track.isEmpty else { return false }
+        let want = preferred.lowercased().trimmingCharacters(in: .whitespaces)
+        guard !want.isEmpty else { return false }
+        if track == want { return true }
+        return languageSynonyms.contains { $0.contains(track) && $0.contains(want) }
+    }
+
+    /// ISO 639-1 / 639-2/T / 639-2/B equivalence classes (plus common English names); anything outside
+    /// falls back to strict equality. Mirrors the host-side table so engine-resolved selection matches
+    /// what hosts computed before #72.
+    nonisolated static let languageSynonyms: [Set<String>] = [
+        ["de", "deu", "ger", "german"], ["en", "eng", "english"], ["fr", "fra", "fre", "french"],
+        ["es", "spa", "spanish"], ["it", "ita", "italian"], ["ja", "jpn", "japanese"],
+        ["ko", "kor", "korean"], ["zh", "zho", "chi", "chinese"], ["pt", "por", "portuguese"],
+        ["ru", "rus", "russian"], ["nl", "nld", "dut", "dutch"], ["sv", "swe", "swedish"],
+        ["da", "dan", "danish"], ["no", "nor", "norwegian"], ["nb", "nob"], ["nn", "nno"],
+        ["fi", "fin", "finnish"], ["pl", "pol", "polish"], ["cs", "ces", "cze", "czech"],
+        ["hu", "hun", "hungarian"], ["tr", "tur", "turkish"], ["el", "ell", "gre", "greek"],
+        ["ar", "ara", "arabic"], ["he", "heb", "hebrew"], ["hi", "hin", "hindi"],
+        ["id", "ind", "indonesian"], ["th", "tha", "thai"], ["vi", "vie", "vietnamese"],
+        ["uk", "ukr", "ukrainian"], ["ro", "ron", "rum", "romanian"], ["sk", "slk", "slo", "slovak"],
+        ["hr", "hrv", "croatian"], ["bg", "bul", "bulgarian"], ["sr", "srp", "serbian"],
+        ["pt-br", "por"], ["pt-pt", "por"],
+    ]
 
     // MARK: - Decoder identity helpers
 

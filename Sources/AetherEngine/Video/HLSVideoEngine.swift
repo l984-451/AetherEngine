@@ -108,6 +108,11 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// nil entry = no language box for that track.
     var nativeSubtitleLanguagesForSession: [String?] = []
 
+    /// #77: in-band CC stream index + observer, re-threaded onto every producer so the tap survives
+    /// seek/reload/wedge. Set before start(). -1 / nil = no CC tap.
+    var closedCaptionStreamIndexForSession: Int32 = -1
+    var closedCaptionObserverForSession: (@Sendable (UnsafePointer<AVPacket>, AVRational) -> Void)?
+
     /// Request the native mov_text track in the init moov (#55). Call before `start()`.
     /// `aetherctl serve --native-subs N` uses this; a full session wires it automatically.
     public func requestNativeSubtitleTrack() {
@@ -135,8 +140,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// Call after `start()`. Returns per-track languages for logging.
     @discardableResult
     public func attachAllNativeSubtitleStores() -> [String?] {
-        let bitmap: Set<String> = ["hdmv_pgs_subtitle", "dvb_subtitle", "dvd_subtitle", "xsub"]
-        let text = (demuxer?.subtitleTrackInfos() ?? []).filter { !bitmap.contains($0.codec) }
+        // Decoder-name classifier: an exact-match Set of descriptor names here never matched TrackInfo.codec
+        // (the libavcodec decoder name), so bitmap tracks leaked into the native mov_text store set.
+        let text = (demuxer?.subtitleTrackInfos() ?? []).filter { !AetherEngine.isBitmapSubtitleCodec($0.codec) }
         let languages = text.map { $0.language }
         attachNativeSubtitleStores(count: text.count, languages: languages)
         return languages
@@ -187,6 +193,17 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// `playlistShiftSeconds` onto the source-PTS `seekTarget`.
     var onSeekStateChanged: (@Sendable (Bool, Double?) -> Void)?
 
+    /// AVPlayer's rendered (playlist-axis) position, readable off the main actor. Wired by AetherEngine
+    /// to a thread-safe mirror of the host clock. Used to re-anchor the producer on AVPlayer's REAL
+    /// position when a VOD backpressure wedge breaks (#65).
+    var currentPlaybackPositionProvider: (@Sendable () -> Double?)?
+
+    /// Whether AVPlayer wants to play (`timeControlStatus != .paused`), readable off the main actor. Wired
+    /// by AetherEngine to a thread-safe mirror and threaded onto every producer so the VOD backpressure
+    /// wedge detector suspends while the consumer is paused (a paused player issues no forward fetch, so its
+    /// frozen fetch target is not a wedge — issue #65 pause false-positive).
+    var playIntentProvider: (@Sendable () -> Bool)?
+
     /// Deep copy of AVCodecParameters decoupled from the demuxer's lifetime. Raw pointers into
     /// AVStreams become use-after-free on live reopen (avformat_close_input frees them while the
     /// continuation producer still reads via saved configs). Freed after pump unwinds.
@@ -235,6 +252,14 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// Coalesces burst seek restart requests (#35). Mutated only under `restartLock`.
     private var restartCoalescer = RestartCoalescer()
 
+    /// #65 wedge re-anchor storm guard (under `restartLock`). If AVPlayer never resumes requesting even
+    /// after we re-anchor the producer on its real position, the producer re-wedges at the same spot;
+    /// cap consecutive re-anchors to the same position so we stop spinning restarts (the clock is already
+    /// reconciled by the engine-seek deadline path, so the engine no longer lies even if we give up here).
+    var consecutiveWedgeReanchors = 0
+    var lastWedgeReanchorPosition = -Double.greatestFiniteMagnitude
+    static let maxConsecutiveWedgeReanchors = 5
+
     /// Bumped by `stop()` under `restartLock`. Restarts re-validate before installing the new
     /// producer; a mid-restart stop() wins and the restart unwinds.
     private var sessionEpoch: UInt64 = 0
@@ -281,11 +306,17 @@ public final class HLSVideoEngine: @unchecked Sendable {
         preopenedDemuxer: Demuxer? = nil,
         sourceReopenableByURL: Bool = true,
         companionAudioReader: IOReader? = nil,
-        subtitleRenditions: [(renditionID: String, name: String, language: String)] = []
+        subtitleRenditions: [(renditionID: String, name: String, language: String)] = [],
+        probesize: Int64? = nil,
+        maxAnalyzeDuration: Int64? = nil
     ) {
         self.subtitleRenditions = subtitleRenditions
         self.sourceURL = url
         self.sourceHTTPHeaders = sourceHTTPHeaders
+        // Caller-bounded find_stream_info budget (#68); nil keeps the .playback default. Applied only to the
+        // fallback open / live reopen here; the happy path reuses the already-budgeted preopenedDemuxer.
+        self.openProfile = DemuxerOpenProfile.playback.withProbeBudget(
+            probesize: probesize, maxAnalyzeDuration: maxAnalyzeDuration)
         self.dvModeAvailable = dvModeAvailable
         self.displaySupportsHDR = displaySupportsHDR
         self.keepDvh1TagWithoutDV = keepDvh1TagWithoutDV
@@ -341,6 +372,11 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// Consumed in `start()`; unconsumed instances are closed by `stop()`.
     private var preopenedDemuxer: Demuxer?
 
+    /// Open profile carrying the caller-bounded probe budget (#68) for the fallback open and live reopen;
+    /// `.playback` unless the caller set `LoadOptions.probesize` / `maxAnalyzeDuration`. Read in the
+    /// `+LiveReopen` extension, so it cannot be file-private.
+    let openProfile: DemuxerOpenProfile
+
 
     // MARK: - Public API
 
@@ -355,7 +391,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         } else {
             dem = Demuxer()
             do {
-                try dem.open(url: sourceURL, extraHeaders: sourceHTTPHeaders, isLive: isLiveSession)
+                try dem.open(url: sourceURL, extraHeaders: sourceHTTPHeaders, profile: openProfile, isLive: isLiveSession)
             } catch {
                 throw HLSVideoEngineError.openFailed(reason: "\(error)")
             }
@@ -1161,6 +1197,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             videoFallbackDurationPts: videoFallbackDurationPts,
             audioFallbackDurationPts: audioFallbackDurationPts,
             restartTargetVideoDts: videoTarget,
+            closedCaptionStreamIndex: closedCaptionStreamIndexForSession,
             desiredFirstVideoTfdtPts: desiredVideoTfdt,
             desiredFirstAudioTfdtPts: desiredAudioTfdt,
             segmentBoundaries: segmentBoundaries,
@@ -1181,12 +1218,17 @@ public final class HLSVideoEngine: @unchecked Sendable {
             guard let self, let prod else { return }
             self.handlePumpFinished(prod, reason: reason)
         }
+        // #65: let the pump suspend its backpressure wedge detector while AVPlayer is paused (a paused
+        // consumer issues no forward fetch; its frozen fetch target is not a wedge). Threaded onto every
+        // producer (initial + restart) so the guard survives scrub/audio-switch rebuilds.
+        prod.wantsToPlayProvider = playIntentProvider
         // Thread native subtitle state onto every producer (initial + restart) so the init moov is
         // consistent and per-segment cue drain survives seek/audio-switch (#55). Set unconditionally:
         // empty set keeps byte-identical output and clears stale stores after clearSubtitle.
         prod.enableNativeSubtitleTrack = enableNativeSubtitleTrackForSession
         prod.subtitleCueStores = nativeSubtitleCueStoresForSession
         prod.nativeSubtitleLanguages = nativeSubtitleLanguagesForSession
+        prod.closedCaptionObserver = closedCaptionObserverForSession   // #77
         return prod
     }
 
@@ -1239,9 +1281,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// Entry point from `VideoSegmentProvider` when AVPlayer requests a segment outside the LRU window.
     /// Coalesces burst seeks so only the in-flight restart + one final settled-target restart run (#35).
     /// init.mp4 is byte-deterministic for a fixed `StreamConfig` so AVPlayer's cached copy stays valid.
-    func requestRestart(at idx: Int) {
+    func requestRestart(at idx: Int, authoritative: Bool = false) {
         restartLock.lock()
-        let shouldRun = restartCoalescer.begin(idx)
+        let shouldRun = restartCoalescer.begin(idx, authoritative: authoritative)
         let seekTime = segmentStartSecondsLocked(idx) // under lock; segmentPlan guarded by restartLock (#38)
         restartLock.unlock()
         guard shouldRun else {
@@ -1278,6 +1320,22 @@ public final class HLSVideoEngine: @unchecked Sendable {
         return segmentPlan[idx].startSeconds
     }
 
+    /// Segment index whose plan span covers `seconds` on the AVPlayer/playlist axis (the same axis
+    /// `segmentStartSecondsLocked` uses). Last segment whose `startSeconds <= seconds`, clamped. Used to
+    /// re-anchor the producer on AVPlayer's real position after a backpressure wedge (#65). Thread-safe.
+    func segmentIndexForPlaylistTime(_ seconds: Double) -> Int {
+        restartLock.lock()
+        defer { restartLock.unlock() }
+        guard !segmentPlan.isEmpty else { return 0 }
+        var lo = 0
+        var hi = segmentPlan.count
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2
+            if segmentPlan[mid].startSeconds <= seconds { lo = mid + 1 } else { hi = mid }
+        }
+        return min(max(lo - 1, 0), segmentPlan.count - 1)
+    }
+
     // Driven exclusively through requestRestart(at:) so bursts coalesce (#35).
     private func performRestart(at idx: Int) {
         restartGate.lock()
@@ -1298,16 +1356,50 @@ public final class HLSVideoEngine: @unchecked Sendable {
 
         let restartStart = DispatchTime.now()
 
+        // The new producer reuses this demuxer unless we have to replace a wedged one (#79, below).
+        var activeDem = dem
+        var freshDemuxer: Demuxer?
         if let old {
             old.stop()
             let ok = old.waitForFinish(timeout: 5.0)
             if !ok {
-                EngineLog.emit(
-                    "[HLSVideoEngine] restart at idx=\(idx): old producer didn't exit within 5s, abandoning it "
-                    + "(its in-flight read shares the demuxer and may consume the first post-seek packet; "
-                    + "if the new session starts a GOP late, this is why)",
-                    category: .session
-                )
+                // #79: the old pump is wedged in a blocking network read on the SHARED demuxer; stop() can't
+                // unblock a socket read, so waitForFinish timed out. Reusing this demuxer makes the new
+                // producer's first post-seek read queue behind that stuck read for the full ~20s
+                // connStallTimeout (the reporter's ~25s restart), after which the abandoned reader also steals
+                // the first packet. markClosed() aborts the stuck read immediately (the existing thread-safe
+                // unblock) but dooms the demuxer, so open a FRESH one and hand it to the new producer. Open
+                // FIRST, abort only on success, so a reopen failure falls back to the prior abandon behaviour
+                // (no regression) rather than poisoning the only demuxer. Scoped to the VOD single-demuxer
+                // scrub case; the side-source / live-reopen paths keep their existing behaviour.
+                if !isLiveSession, sideAudioDemuxer == nil {
+                    let fresh = Demuxer()
+                    do {
+                        try fresh.open(url: sourceURL, extraHeaders: sourceHTTPHeaders, profile: openProfile, isLive: false)
+                        dem.markClosed() // abort the wedged read now that the replacement is ready
+                        freshDemuxer = fresh
+                        activeDem = fresh
+                        EngineLog.emit(
+                            "[HLSVideoEngine] restart at idx=\(idx): old producer wedged in a read past 5s; "
+                            + "aborted it and reopened a fresh demuxer (avoids the ~20s shared-read stall)",
+                            category: .session
+                        )
+                    } catch {
+                        fresh.close()
+                        EngineLog.emit(
+                            "[HLSVideoEngine] restart at idx=\(idx): old producer wedged; reopen failed (\(error)), "
+                            + "abandoning it and reusing the demuxer",
+                            category: .session
+                        )
+                    }
+                } else {
+                    EngineLog.emit(
+                        "[HLSVideoEngine] restart at idx=\(idx): old producer didn't exit within 5s, abandoning it "
+                        + "(its in-flight read shares the demuxer and may consume the first post-seek packet; "
+                        + "if the new session starts a GOP late, this is why)",
+                        category: .session
+                    )
+                }
             }
         }
 
@@ -1318,7 +1410,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         let absoluteTargetSeconds = Double(targetStartPts) * Double(videoTb.num) / Double(videoTb.den)
         // Seek outside restartLock (network-bound). Concurrent stop() calls markClosed() so the
         // seek fails fast instead of racing teardown.
-        dem.seek(to: absoluteTargetSeconds)
+        activeDem.seek(to: absoluteTargetSeconds)
         // Re-arm bridge PTS rebase so the encoder timeline starts from the new demuxer cursor.
         ab?.startSegment()
 
@@ -1326,12 +1418,17 @@ public final class HLSVideoEngine: @unchecked Sendable {
         restartLock.lock()
         guard sessionEpoch == epoch else {
             restartLock.unlock()
+            // #79: a reopened demuxer (replacing a wedged one) must not leak when stop() superseded us.
+            freshDemuxer?.close()
             EngineLog.emit(
                 "[HLSVideoEngine] restart at idx=\(idx): superseded by stop(), unwinding",
                 category: .session
             )
             return
         }
+        // #79: install the reopened demuxer only inside the validated section so makeProducer reads it and a
+        // concurrent teardown can't race a resurrected demuxer into a torn-down session.
+        if let freshDemuxer { demuxer = freshDemuxer }
         do {
             let newProd = try makeProducer(baseIndex: idx)
             producer = newProd
