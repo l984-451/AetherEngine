@@ -10,6 +10,14 @@ the public-API contract.
 
 ## [Unreleased]
 
+## [4.5.6] — 2026-06-27
+
+### Fixed
+
+- **A video file silently degraded to the audio-only backend when its open-time probe lost to a transient origin error (#78).** When the probe open hit a rate-limit (a 429 whose body parsed as `AVERROR_INVALIDDATA`), the engine logged `probe failed (...); proceeding without criteria` and then routed a 4K HEVC VOD to the audio-only path: audio played, no picture for the rest of the session, Live state showing `Backend audio, resolution 0x0`. Root cause was a conflation of "probe failed" with "file has no video": on probe failure `hasVideoStream` was false not because the file lacked video but because we never looked, and `shouldUseAudioOnlyPath` read that as no-video and dispatched `audio dispatch: codec=0 -> FFmpeg`. Once connections recovered the demux open enumerated `stream[0] type=video codec=hevc 3840x2160` (the audio-only decision was already locked in). The audio-only path is now reserved for an explicit `audioOnly` request or a *successful* probe that genuinely found no video. A failed probe on a non-audioOnly URL source falls through to the native video path (custom and live sources already fail-fast on a failed probe), so `HLSVideoEngine` reopens the source and discovers the stream. Reported by the AetherPlayer community.
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/4.5.6))
+
 ## [4.5.5] — 2026-06-27
 
 ### Fixed
