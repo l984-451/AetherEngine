@@ -500,6 +500,16 @@ final class HLSSegmentProducer: @unchecked Sendable {
         if cursor < window.end {
             out.append((MovTextSampleBuilder.emptySample(), cursor, window.end - cursor))
         }
+        // Terminator (the actual #186/#53 fix). FFmpeg's mp4 muxer derives each mov_text sample's stored
+        // duration from the DTS delta to the NEXT sample in the same fragment, ignoring our explicit
+        // pkt.duration for whichever sample is last in the fragment. With one segment == one fragment and
+        // typically one sample per track per window, EVERY real sample was "last in fragment", so movenc
+        // had no successor: it logged `Packet duration: -N / dts: N out of range` + `pts has no value` and
+        // wrote a corrupt tx3g trun. AVPlayer then rejected the whole init.mov (-11829/-12848), disabling
+        // video+audio → black screen. Appending a zero-length empty sample at window.end gives every real
+        // sample an in-fragment successor, so movenc derives correct durations. Verified: ffprobe decodes
+        // the loopback output with zero warnings; without it, 2 warnings per track per fragment.
+        out.append((MovTextSampleBuilder.emptySample(), window.end, 0))
         return out
     }
 
