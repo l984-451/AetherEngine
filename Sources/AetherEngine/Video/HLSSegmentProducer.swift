@@ -457,19 +457,44 @@ final class HLSSegmentProducer: @unchecked Sendable {
     var enableNativeSubtitleTrack: Bool = false
 
     /// Build a contiguous mov_text sample plan (gaps filled with empty samples) for the given window.
+    ///
+    /// mov_text in a fragmented mp4 (#55) is unforgiving: every sample must have a strictly-increasing
+    /// PTS and a strictly-positive duration, and consecutive samples must be exactly contiguous
+    /// (`sample[i].pts + sample[i].duration == sample[i+1].pts`). Real-world SRT — especially the
+    /// many auto-generated tracks in MKV rips — routinely violates the assumptions of a naive walk:
+    /// cues overlap (next.start < prev.end), repeat, or sit zero-length at a window edge. The old
+    /// implementation forwarded those straight through, producing zero/negative-duration samples and
+    /// backward PTS jumps. The fMP4 muxer then emitted `pts has no value` / `duration out of range`,
+    /// the tx3g track's trun was corrupt, and AVPlayer rejected the whole init.mov (-11829 / -12848,
+    /// disabling even the video+audio tracks → black screen, issue #186/#53).
+    ///
+    /// This builds the plan by walking a monotonic `cursor`: each cue is clamped to `[cursor, window.end)`
+    /// so overlaps truncate instead of going backward, gaps are filled with empty samples, and any
+    /// resulting span with duration <= 0 is dropped. The output is guaranteed monotonic, contiguous,
+    /// and positive-duration regardless of how degenerate the input cues are.
     static func movTextSamples(
         forWindow window: (start: Double, end: Double),
         cues: [(start: Double, end: Double, text: String)]
     ) -> [(payload: Data, pts: Double, duration: Double)] {
+        guard window.end > window.start else { return [] }
         var out: [(payload: Data, pts: Double, duration: Double)] = []
         var cursor = window.start
-        for c in cues {
-            let cs = max(c.start, window.start)
+        // Cues arrive sorted by start (NativeSubtitleCueStore.cuesInWindow), but never trust it:
+        // sort defensively so the monotonic walk holds even for malformed tracks.
+        for c in cues.sorted(by: { $0.start < $1.start }) {
+            // Clamp to the still-unfilled remainder of the window. An overlapping or already-passed
+            // cue collapses to start == cursor (no backward jump); a fully-passed cue is skipped below.
+            let cs = min(max(c.start, cursor), window.end)
             let ce = min(c.end, window.end)
             if cs > cursor {
+                // Gap before this cue: fill with an empty sample (positive span by construction).
                 out.append((MovTextSampleBuilder.emptySample(), cursor, cs - cursor))
+                cursor = cs
             }
-            out.append((MovTextSampleBuilder.sample(text: c.text), cs, max(0, ce - cs)))
+            // Drop degenerate cues (zero/negative visible span after clamping); a zero-duration
+            // mov_text sample is exactly what movenc rejects.
+            guard ce > cursor else { continue }
+            out.append((MovTextSampleBuilder.sample(text: c.text), cursor, ce - cursor))
             cursor = ce
         }
         if cursor < window.end {

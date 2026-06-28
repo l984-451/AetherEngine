@@ -507,13 +507,23 @@ final class MP4SegmentMuxer {
     @discardableResult
     func writePacket(_ packet: UnsafeMutablePointer<AVPacket>) -> Int32 {
         guard let ctx = formatContext else { return -1 }
-        let clean = timestampSanitizer.sanitize(
-            streamIndex: packet.pointee.stream_index,
-            pts: packet.pointee.pts,
-            dts: packet.pointee.dts
-        )
-        packet.pointee.pts = clean.pts
-        packet.pointee.dts = clean.dts
+        // The DTS-monotonicity sanitizer exists for A/V SSAI clock restarts; it bumps a non-increasing
+        // dts to last+1 and floors pts to dts. That is actively harmful for mov_text subtitle samples
+        // (#55), whose plan is already built strictly-monotonic and exactly-contiguous in
+        // HLSSegmentProducer.movTextSamples: a +1 dts bump there would break the
+        // `pts + duration == next.pts` contiguity that the explicit per-sample duration depends on,
+        // re-introducing the `duration out of range` corruption that disabled the whole moov (#186).
+        // Subtitle streams carry their own correct timing; pass them through untouched.
+        let isSubtitle = subtitleOutputStreamIndices.contains(packet.pointee.stream_index)
+        if !isSubtitle {
+            let clean = timestampSanitizer.sanitize(
+                streamIndex: packet.pointee.stream_index,
+                pts: packet.pointee.pts,
+                dts: packet.pointee.dts
+            )
+            packet.pointee.pts = clean.pts
+            packet.pointee.dts = clean.dts
+        }
 
         // #64 mid-segment flush bound: cap libavformat's interleaver RAM on a very long segment
         // (degenerate sparse-keyframe plan, or an audio stream that decodes to nothing) by emitting a
