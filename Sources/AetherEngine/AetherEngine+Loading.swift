@@ -280,7 +280,10 @@ extension AetherEngine {
             return NativeSubtitleTrack(ordinal: ordinal, language: entry.language, displayName: name)
         }
         let hasTextSubtitleTrack = !nativeSubtitleTrackTable.isEmpty
-        session.enableNativeSubtitleTrackForSession = loadedOptions.prepareNativeSubtitles && hasTextSubtitleTrack
+        // DIAGNOSTIC (diag/no-subtitle-inject): force #55 mov_text injection OFF to isolate
+        // whether malformed subtitle muxing is what AVPlayer rejects (-11829/-12848). REVERT before merge.
+        session.enableNativeSubtitleTrackForSession = false
+        _ = (loadedOptions.prepareNativeSubtitles && hasTextSubtitleTrack)
 
         // #77: arm the in-band CC tap before start() so the first producer keeps the CC stream.
         setupClosedCaptionTapIfNeeded(session: session)
