@@ -156,6 +156,20 @@ final class NativeAVPlayerHost {
                    let underlying = nsErr.userInfo[NSUnderlyingErrorKey] as? NSError {
                     EngineLog.emit("[NativeAVPlayerHost] #\(sid) item.error.underlying=\(underlying.domain)/\(underlying.code) '\(underlying.localizedDescription)'", category: .engine)
                 }
+                // DBG (#186): dump the FULL NSError userInfo chain — CoreMedia/AVFoundation often hide the
+                // real reason (which atom/track it rejected) in keys beyond localizedDescription.
+                if let nsErr = nsErr {
+                    for (k, v) in nsErr.userInfo {
+                        EngineLog.emit("[NativeAVPlayerHost] #\(sid) DBG err.userInfo[\(k)]=\(v)", category: .engine)
+                    }
+                    var u = nsErr.userInfo[NSUnderlyingErrorKey] as? NSError
+                    var depth = 1
+                    while let cur = u, depth < 6 {
+                        EngineLog.emit("[NativeAVPlayerHost] #\(sid) DBG underlying[\(depth)]=\(cur.domain)/\(cur.code) '\(cur.localizedDescription)' userInfo=\(cur.userInfo)", category: .engine)
+                        u = cur.userInfo[NSUnderlyingErrorKey] as? NSError
+                        depth += 1
+                    }
+                }
                 // Poll full errorLog on .failed (notification observer misses synchronous entries during replaceCurrentItem).
                 if let log = item.errorLog() {
                     EngineLog.emit("[NativeAVPlayerHost] #\(sid) errorLog dump: \(log.events.count) events", category: .engine)

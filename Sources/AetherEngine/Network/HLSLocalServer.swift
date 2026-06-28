@@ -691,6 +691,7 @@ final class HLSLocalServer: @unchecked Sendable {
         EngineLog.emit("[HLSLocalServer] -> 200 \(path) bytes=\(data.count) type=\(contentType)",
                        category: .hlsServer, level: .verbose)
 
+        debugDumpServed(path: path, data: data)
         guard writeAll(fd: fd, data: headerData, path: "\(path) [header]") else {
             return false
         }
@@ -709,6 +710,7 @@ final class HLSLocalServer: @unchecked Sendable {
         EngineLog.emit("[HLSLocalServer] -> 200 \(path) bytes=\(fileSize) type=\(contentType) [filestream]",
                        category: .hlsServer, level: .verbose)
 
+        debugDumpServedFile(path: path, fileURL: fileURL)
         guard writeAll(fd: fd, data: headerData, path: "\(path) [header]") else {
             return false
         }
@@ -753,6 +755,45 @@ final class HLSLocalServer: @unchecked Sendable {
         if hasData { return .serve }
         if index >= 0, segmentCount > 0, index < segmentCount { return .retryLater }
         return .notFound
+    }
+
+    /// DEBUG (#186): when UserDefault `AetherDumpSegments` is true, persist the exact bytes we serve for
+    /// `/init.mp4` and the first few `/seg{N}.mp4` to <Documents>/AetherDump/ so the failing init/segment
+    /// can be pulled off-device and probed. Gated + capped (first 3 segments) so it never ships cost.
+    static let dumpSegmentsEnabled: Bool = UserDefaults.standard.bool(forKey: "AetherDumpSegments")
+    private func debugDumpServed(path: String, data: Data) {
+        guard Self.dumpSegmentsEnabled else { return }
+        let name = path.hasPrefix("/") ? String(path.dropFirst()) : path
+        // Only init + first 3 segments; skip the rest.
+        if name.hasPrefix("seg") {
+            let idx = Int(name.dropFirst(3).dropLast(4)) ?? 99
+            if idx > 2 { return }
+        } else if name != "init.mp4" {
+            return
+        }
+        guard let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else { return }
+        let dir = docs.appendingPathComponent("AetherDump", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let out = dir.appendingPathComponent(name)
+        try? data.write(to: out)
+        EngineLog.emit("[HLSLocalServer] DBG dumped \(name) (\(data.count)B) -> \(out.path)", category: .hlsServer)
+    }
+
+    /// File-backed variant: copy the on-disk segment into the dump dir.
+    private func debugDumpServedFile(path: String, fileURL: URL) {
+        guard Self.dumpSegmentsEnabled else { return }
+        let name = path.hasPrefix("/") ? String(path.dropFirst()) : path
+        if name.hasPrefix("seg") {
+            let idx = Int(name.dropFirst(3).dropLast(4)) ?? 99
+            if idx > 2 { return }
+        }
+        guard let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else { return }
+        let dir = docs.appendingPathComponent("AetherDump", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let out = dir.appendingPathComponent(name)
+        try? FileManager.default.removeItem(at: out)
+        try? FileManager.default.copyItem(at: fileURL, to: out)
+        EngineLog.emit("[HLSLocalServer] DBG dumped \(name) (file) -> \(out.path)", category: .hlsServer)
     }
 
     /// Blocking send loop. Uses withUnsafeBytes so mmap-backed Data stays mmap-backed (kernel page-faults in only the bytes copied to the socket send buffer, no heap accumulation).
