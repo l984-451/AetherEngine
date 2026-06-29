@@ -159,6 +159,26 @@ final class MP4SegmentMuxer {
     /// Dynamic: 1 without audio, 2 with audio, then +1 per additional subtitle track.
     private(set) var subtitleOutputStreamIndices: [Int32] = []
 
+    /// Default tx3g sample-description payload for a mov_text track (#186/#53). FFmpeg's mp4 muxer
+    /// (mov_write_tx3g_tag) builds the tx3g SampleEntry body — displayFlags, justification, colors,
+    /// the default-text BoxRecord, the StyleRecord, and the `ftab` font table — from the stream's
+    /// `extradata`. With NO extradata it writes only the bare 16-byte SampleEntry stub (size+type+
+    /// 6 reserved + dataRefIdx) and nothing else. ffmpeg/ffprobe tolerate the stub, but CoreMedia
+    /// validates the full tx3g structure and rejects the entire moov as "damaged" (AVFoundation
+    /// -11829 / CoreMedia -12848), disabling even the video+audio tracks → black screen + 🚫.
+    /// This is the exact 68-byte tail FFmpeg itself emits for a mov_text track (extracted from an
+    /// `ffmpeg -c:s mov_text` output: the 84-byte tx3g entry minus its 16-byte SampleEntry base):
+    /// displayFlags=0, justification 0/0, bgColor 0, BoxRecord {0,0,0,0}, StyleRecord
+    /// {startChar 0, endChar 0, fontID 1, face 0, size 0x10, color white}, ftab(1 entry "Arial"), btrt.
+    static let movTextSampleDescriptionExtradata: [UInt8] = [
+        0x00, 0x00, 0x00, 0x00, 0x01, 0xff, 0x00, 0x00, 0x00, 0xff, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+        0x00, 0x10, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x12, 0x66, 0x74,
+        0x61, 0x62, 0x00, 0x01, 0x00, 0x01, 0x05, 0x41, 0x72, 0x69, 0x61, 0x6c,
+        0x00, 0x00, 0x00, 0x14, 0x62, 0x74, 0x72, 0x74, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x15, 0x00, 0x00, 0x00, 0x15,
+    ]
+
     private let splitter: FragmentSplitter
 
     // MARK: - Init
@@ -417,6 +437,24 @@ final class MP4SegmentMuxer {
             subStream.pointee.codecpar.pointee.codec_id = AV_CODEC_ID_MOV_TEXT
             subStream.pointee.time_base = cfg.timeBase
             subStream.pointee.disposition = 0
+            // tx3g sample-description payload (#186/#53): without extradata, movenc writes only the
+            // bare 16-byte tx3g SampleEntry stub; CoreMedia rejects the whole moov as damaged
+            // (-11829/-12848) → black screen. Supply the default tx3g body (BoxRecord/StyleRecord/ftab)
+            // via av_malloc'd extradata (FFmpeg frees it; needs AV_INPUT_BUFFER_PADDING_SIZE pad), and
+            // set a non-zero text-box size via width/height so the BoxRecord/tkhd dimensions are sane.
+            let ed = Self.movTextSampleDescriptionExtradata
+            let edSize = ed.count
+            if let buf = av_malloc(edSize + Int(AV_INPUT_BUFFER_PADDING_SIZE)) {
+                ed.withUnsafeBytes { src in
+                    memcpy(buf, src.baseAddress, edSize)
+                }
+                memset(buf.advanced(by: edSize), 0, Int(AV_INPUT_BUFFER_PADDING_SIZE))
+                subStream.pointee.codecpar.pointee.extradata = buf.assumingMemoryBound(to: UInt8.self)
+                subStream.pointee.codecpar.pointee.extradata_size = Int32(edSize)
+            }
+            // tx3g default text box / track dimensions. AVPlayer wants a non-degenerate region.
+            subStream.pointee.codecpar.pointee.width = 1920
+            subStream.pointee.codecpar.pointee.height = 1080
             if let iso = iso639_2(fromBCP47: cfg.language) {
                 iso.withCString { cStr in
                     _ = av_dict_set(&subStream.pointee.metadata, "language", cStr, 0)
