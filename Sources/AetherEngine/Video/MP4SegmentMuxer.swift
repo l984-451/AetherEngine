@@ -449,7 +449,7 @@ final class MP4SegmentMuxer {
             let ed = Self.movTextSampleDescriptionExtradata
             let edSize = ed.count
             if let buf = av_malloc(edSize + Int(AV_INPUT_BUFFER_PADDING_SIZE)) {
-                ed.withUnsafeBytes { src in
+                _ = ed.withUnsafeBytes { src in
                     memcpy(buf, src.baseAddress, edSize)
                 }
                 memset(buf.advanced(by: edSize), 0, Int(AV_INPUT_BUFFER_PADDING_SIZE))
@@ -985,4 +985,3 @@ private func mp4SegmentMuxerSinkWrite(
     muxer.receive(buf, count: Int(size))
     return size
 }
-

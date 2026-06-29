@@ -85,7 +85,7 @@ public struct LoadOptions: Sendable, Equatable {
     /// Emit raw ASS event lines (`ReadOrder,Layer,Style,...,Text` including override tags) instead of plain-text extraction. Opt-in for hosts that render ASS styling themselves; pair with `TrackInfo.assHeader`. Only affects ASS / SSA codecs. Default `false` (AetherEngine#30).
     public var preserveASSMarkup: Bool
 
-    /// When `true`, advertise each of the source's subtitle tracks as a decoy (empty, cue-less) WebVTT rendition in the generated HLS master playlist, so AVKit's native subtitle picker lists them. The engine does NOT decode or paint cues for these renditions; the host renders the actual subtitle cues itself (via `subtitleCues`). Purely a picker-population hook. Default `false`: when off, the playlists are byte-identical to a build without this feature. The host correlates a picked rendition back to an engine subtitle track via `AetherEngine.subtitleRenditions`. Complementary to `prepareNativeSubtitles` (#55): that path muxes a native mov_text track for TEXT subs only; this decoy path populates the picker for ALL tracks incl. PGS/DVB/DVD, rendered via the host overlay. (Rivulet fork-only.)
+    /// When `true`, advertise each of the source's subtitle tracks as a decoy (empty, cue-less) WebVTT rendition in the generated HLS master playlist, so AVKit's native subtitle picker lists them. The engine does NOT decode or paint cues for these renditions by itself; the host maps a picked rendition through `AetherEngine.subtitleRenditions` and renders the actual cues from `subtitleCues`. Default `false`: when off, the playlists are byte-identical to a build without this feature. This remains useful with `prepareNativeSubtitles` because AVPlayer does not expose in-segment mov_text tracks as picker options on this HLS path. (Rivulet fork-only.)
     public var advertiseSubtitleRenditions: Bool
 
     /// Declare a mov_text track in the init moov so text subtitles survive PiP / AirPlay / external display via AVMediaSelection. Bitmap codecs (PGS / DVB / DVD) excluded automatically. Default `false` (#55).
@@ -311,7 +311,7 @@ public struct TrackInfo: Identifiable, Sendable, Equatable {
     }
 }
 
-/// A decoy subtitle rendition advertised in the generated HLS master playlist so AVKit's native subtitle picker lists it (see `LoadOptions.advertiseSubtitleRenditions`). Published on `AetherEngine.subtitleRenditions`; the engine paints no cues for it, it exists only to populate the picker and let the host correlate the picked option back to an engine subtitle `TrackInfo`. (Rivulet fork-only.)
+/// A decoy subtitle rendition advertised in the generated HLS master playlist so AVKit's native subtitle picker lists it (see `LoadOptions.advertiseSubtitleRenditions`). Published on `AetherEngine.subtitleRenditions`; the rendition bytes are empty, and the host uses this mapping to render the selected engine subtitle `TrackInfo` through its overlay. (Rivulet fork-only.)
 public struct SubtitleRendition: Sendable, Equatable {
     /// Path-safe identifier the master playlist uses (`"sub<trackIndex>"`). The loopback server serves `/subs_<renditionID>.m3u8` + `.vtt`.
     public let renditionID: String

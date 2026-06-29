@@ -49,8 +49,7 @@ extension AetherEngine {
     /// its declared name, then "Subtitle N"); `language` is the ISO code
     /// (fallback "und").
     nonisolated static func makeSubtitleRenditions(
-        from tracks: [TrackInfo],
-        bitmapOnly: Bool = false
+        from tracks: [TrackInfo]
     ) -> [SubtitleRendition] {
         // The native picker lists each rendition by its NAME, and AVKit
         // collapses entries sharing NAME + LANGUAGE. Build a consistent,
@@ -64,14 +63,6 @@ extension AetherEngine {
         var renditions: [SubtitleRendition] = []
         var usedNameCounts: [String: Int] = [:]
         for (offset, track) in tracks.enumerated() {
-            // When the native mov_text path (#55, prepareNativeSubtitles) is
-            // active it already lists every TEXT track in AVKit's picker, so
-            // the decoy path advertises ONLY bitmap tracks (PGS / DVB / DVD /
-            // XSUB) — the codecs the native path excludes — to avoid
-            // double-listing while keeping image subs selectable (the host
-            // overlay paints them). When `bitmapOnly` is false the behavior is
-            // unchanged: every track is advertised.
-            if bitmapOnly && !isBitmapSubtitleCodec(track.codec) { continue }
             let language = track.language?.trimmingCharacters(in: .whitespaces)
             let langCode = (language?.isEmpty == false) ? language! : "und"
             let localizedLang = (langCode != "und")
