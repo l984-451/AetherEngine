@@ -891,12 +891,21 @@ final class HLSLocalServer: @unchecked Sendable {
 
         // Decoy SUBTITLES renditions (Rivulet fork-only). Emitted BEFORE the STREAM-INF per Apple's convention (media renditions precede the variants that reference their GROUP-ID). Each points at a fixed empty WebVTT playlist the server serves at /subs_<id>.m3u8.
         for r in renditions {
-            lines.append(
-                "#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\","
-                + "NAME=\"\(r.name)\",LANGUAGE=\"\(r.language)\","
-                + "DEFAULT=NO,AUTOSELECT=NO,FORCED=NO,"
-                + "URI=\"subs_\(r.renditionID).m3u8\""
-            )
+            var attrs = [
+                "TYPE=SUBTITLES",
+                "GROUP-ID=\"subs\"",
+                "NAME=\"\(r.name)\"",
+            ]
+            if r.language != "und" {
+                attrs.append("LANGUAGE=\"\(r.language)\"")
+            }
+            attrs.append(contentsOf: [
+                "DEFAULT=NO",
+                "AUTOSELECT=NO",
+                "FORCED=NO",
+                "URI=\"subs_\(r.renditionID).m3u8\"",
+            ])
+            lines.append("#EXT-X-MEDIA:\(attrs.joined(separator: ","))")
         }
 
         // EXT-X-STREAM-INF attribute order per Apple's HLS Authoring Spec Appendixes: BANDWIDTH, AVERAGE-BANDWIDTH, CODECS, SUPPLEMENTAL-CODECS, RESOLUTION/FRAME-RATE/VIDEO-RANGE, HDCP-LEVEL/CLOSED-CAPTIONS.
@@ -1048,4 +1057,3 @@ enum HLSLocalServerError: Error, CustomStringConvertible {
         }
     }
 }
-

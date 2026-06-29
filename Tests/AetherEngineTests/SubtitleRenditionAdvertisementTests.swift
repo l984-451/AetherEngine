@@ -43,6 +43,20 @@ final class SubtitleRenditionAdvertisementTests: XCTestCase {
         XCTAssertEqual(renditions[0].name, "Subtitle 1 (SRT)")
     }
 
+    func test_genericTrackTitleIsNotUsedAsDisplayName() {
+        let renditions = AetherEngine.makeSubtitleRenditions(from: [
+            TrackInfo(id: 2, name: "Track 2 (srt)", codec: "subrip", language: nil, isDefault: false),
+            TrackInfo(id: 3, name: "Subtitle 3", codec: "subrip", language: nil, isDefault: false),
+            TrackInfo(id: 4, name: "Track 4 (pgs)", codec: "hdmv_pgs_subtitle", language: nil, isDefault: false),
+        ])
+
+        XCTAssertEqual(renditions.map(\.name), [
+            "Subtitle 1 (SRT)",
+            "Subtitle 2 (SRT)",
+            "Subtitle 3 (PGS)",
+        ])
+    }
+
     func test_hlsLanguageTagCanonicalizesCommonContainerCodes() {
         XCTAssertEqual(AetherEngine.hlsLanguageTag(from: "eng"), "en")
         XCTAssertEqual(AetherEngine.hlsLanguageTag(from: "deu"), "de")

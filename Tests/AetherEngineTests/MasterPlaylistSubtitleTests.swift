@@ -81,6 +81,18 @@ final class MasterPlaylistSubtitleTests: XCTestCase {
         XCTAssertTrue(text.contains(#"URI="subs_sub0.m3u8""#))
     }
 
+    func testUnknownLanguageRenditionOmitsLanguageAttribute() {
+        let provider = StubProvider(
+            codecs: "hvc1.2.4.L150.90",
+            renditions: [(renditionID: "sub2", name: "Subtitle 1 (SRT)", language: "und")]
+        )
+        let text = HLSLocalServer.buildMasterPlaylistText(provider: provider)
+
+        XCTAssertTrue(text.contains(#"NAME="Subtitle 1 (SRT)""#))
+        XCTAssertTrue(text.contains(#"URI="subs_sub2.m3u8""#))
+        XCTAssertFalse(text.contains("LANGUAGE="))
+    }
+
     func testMasterIsBareWhenNotAdvertisingAndNoVideoMetadata() {
         // Feature off + no video variant metadata: byte-identical to the
         // pre-feature bare playlist (no subtitle lines, no STREAM-INF).

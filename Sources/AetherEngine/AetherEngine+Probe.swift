@@ -87,6 +87,7 @@ extension AetherEngine {
                 || echoesLanguageName
                 || lowerLocalizedFormat.map { lowerTitle == $0 } ?? false
                 || lowerTitle == format.lowercased()
+                || isGenericSubtitleTitle(lowerTitle, format: format)
                 || (lowerTitle.hasPrefix(lowerLang + " (") && lowerTitle.hasSuffix(")"))
                 || (!lowerSourceLang.isEmpty && lowerTitle.hasPrefix(lowerSourceLang + " (") && lowerTitle.hasSuffix(")"))
             let distinguisher = isEcho ? nil : title
@@ -153,6 +154,27 @@ extension AetherEngine {
             return value.uppercased()
         }
         return value
+    }
+
+    nonisolated private static func isGenericSubtitleTitle(_ lowerTitle: String, format: String) -> Bool {
+        let normalized = lowerTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard normalized.hasPrefix("track ") || normalized.hasPrefix("subtitle ") else {
+            return false
+        }
+
+        let remainderStart = normalized.hasPrefix("track ")
+            ? normalized.index(normalized.startIndex, offsetBy: "track ".count)
+            : normalized.index(normalized.startIndex, offsetBy: "subtitle ".count)
+        var remainder = normalized[remainderStart...]
+        while remainder.first?.isNumber == true {
+            remainder.removeFirst()
+        }
+
+        let suffix = remainder.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lowerFormat = format.lowercased()
+        return suffix.isEmpty
+            || suffix == lowerFormat
+            || suffix == "(\(lowerFormat))"
     }
 
     /// Map an FFmpeg subtitle codec name to a short, user-facing format label.
