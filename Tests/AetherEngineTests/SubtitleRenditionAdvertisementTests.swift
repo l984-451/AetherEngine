@@ -21,6 +21,36 @@ final class SubtitleRenditionAdvertisementTests: XCTestCase {
         XCTAssertEqual(Set(renditions.map(\.trackIndex)), [2, 3, 4, 5])
     }
 
+    func test_iso639TwoLanguagesAreEmittedAsBCP47ForAVKit() {
+        let renditions = AetherEngine.makeSubtitleRenditions(from: [
+            TrackInfo(id: 2, name: "ENG (srt)", codec: "subrip", language: "eng", isDefault: true),
+            TrackInfo(id: 3, name: "German", codec: "subrip", language: "ger", isDefault: false),
+            TrackInfo(id: 4, name: "Portuguese", codec: "subrip", language: "pt-BR", isDefault: false),
+        ])
+
+        XCTAssertEqual(renditions.map(\.language), ["en", "de", "pt-BR"])
+        XCTAssertEqual(renditions[0].name, "English (SRT)")
+        XCTAssertEqual(renditions[1].name, "German (SRT)")
+        XCTAssertEqual(renditions[2].name, "Portuguese (SRT)")
+    }
+
+    func test_unknownLanguageFallsBackToUnd() {
+        let renditions = AetherEngine.makeSubtitleRenditions(from: [
+            TrackInfo(id: 2, name: "", codec: "subrip", language: nil, isDefault: false),
+        ])
+
+        XCTAssertEqual(renditions[0].language, "und")
+        XCTAssertEqual(renditions[0].name, "Subtitle 1 (SRT)")
+    }
+
+    func test_hlsLanguageTagCanonicalizesCommonContainerCodes() {
+        XCTAssertEqual(AetherEngine.hlsLanguageTag(from: "eng"), "en")
+        XCTAssertEqual(AetherEngine.hlsLanguageTag(from: "deu"), "de")
+        XCTAssertEqual(AetherEngine.hlsLanguageTag(from: "ger"), "de")
+        XCTAssertEqual(AetherEngine.hlsLanguageTag(from: "EN_us"), "en-US")
+        XCTAssertEqual(AetherEngine.hlsLanguageTag(from: nil), "und")
+    }
+
     func test_bitmapCodecPredicateMatchesNativeExclusionSet() {
         for codec in ["hdmv_pgs_subtitle", "dvb_subtitle", "dvd_subtitle", "xsub", "vobsub", "pgssub"] {
             XCTAssertTrue(AetherEngine.isBitmapSubtitleCodec(codec), "\(codec) should be bitmap")

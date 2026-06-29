@@ -46,8 +46,8 @@ extension AetherEngine {
     /// the engine subtitle AVStream index (`TrackInfo.id`) so the host can
     /// correlate AVKit's selected legible option back to the track; the
     /// `name` is a human label (the track's localized language name, then
-    /// its declared name, then "Subtitle N"); `language` is the ISO code
-    /// (fallback "und").
+    /// its declared name, then "Subtitle N"); `language` is the BCP-47 tag
+    /// emitted into HLS (fallback "und").
     nonisolated static func makeSubtitleRenditions(
         from tracks: [TrackInfo]
     ) -> [SubtitleRendition] {
@@ -63,10 +63,10 @@ extension AetherEngine {
         var renditions: [SubtitleRendition] = []
         var usedNameCounts: [String: Int] = [:]
         for (offset, track) in tracks.enumerated() {
-            let language = track.language?.trimmingCharacters(in: .whitespaces)
-            let langCode = (language?.isEmpty == false) ? language! : "und"
-            let localizedLang = (langCode != "und")
-                ? Locale.current.localizedString(forLanguageCode: langCode)
+            let sourceLanguage = track.language?.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+            let hlsLanguage = hlsLanguageTag(from: sourceLanguage)
+            let localizedLang = (hlsLanguage != "und")
+                ? Locale.current.localizedString(forLanguageCode: hlsLanguage)
                 : nil
             let format = subtitleFormatLabel(track.codec)
             let title = track.name.trimmingCharacters(in: .whitespaces)
@@ -77,17 +77,22 @@ extension AetherEngine {
             // "ENG (srt)", "FRE (dvdsub)") -- the auto-pattern is matched against
             // THIS track's language code so real labels like "SDH" survive.
             let lowerTitle = title.lowercased()
-            let lowerLang = langCode.lowercased()
+            let lowerLang = hlsLanguage.lowercased()
+            let lowerSourceLang = sourceLanguage ?? ""
+            let lowerLocalizedFormat = localizedLang.map { "\($0.lowercased()) (\(format.lowercased()))" }
             let echoesLanguageName = localizedLang.map { lowerTitle == $0.lowercased() } ?? false
             let isEcho = title.isEmpty
                 || lowerTitle == lowerLang
+                || (!lowerSourceLang.isEmpty && lowerTitle == lowerSourceLang)
                 || echoesLanguageName
+                || lowerLocalizedFormat.map { lowerTitle == $0 } ?? false
                 || lowerTitle == format.lowercased()
                 || (lowerTitle.hasPrefix(lowerLang + " (") && lowerTitle.hasSuffix(")"))
+                || (!lowerSourceLang.isEmpty && lowerTitle.hasPrefix(lowerSourceLang + " (") && lowerTitle.hasSuffix(")"))
             let distinguisher = isEcho ? nil : title
 
             // Compose "Language Distinguisher (FORMAT)".
-            let languageLabel: String? = localizedLang ?? (langCode != "und" ? langCode : nil)
+            let languageLabel: String? = localizedLang ?? (hlsLanguage != "und" ? hlsLanguage : nil)
             let base: String
             switch (languageLabel, distinguisher) {
             case let (lang?, dist?):
@@ -107,11 +112,47 @@ extension AetherEngine {
             renditions.append(SubtitleRendition(
                 renditionID: "sub\(track.id)",
                 name: displayName,
-                language: langCode,
+                language: hlsLanguage,
                 trackIndex: track.id
             ))
         }
         return renditions
+    }
+
+    /// HLS `LANGUAGE=` values are RFC-5646/BCP-47 language tags. FFmpeg often
+    /// reports Matroska language metadata as ISO-639-2 (`eng`, `ger`, `deu`),
+    /// which AVKit displays as Unknown in the subtitle menu. Canonicalize the
+    /// common tags we already support for language matching, preserving region
+    /// subtags for inputs that are already BCP-47 (`pt-BR`, `en-US`).
+    nonisolated static func hlsLanguageTag(from language: String?) -> String {
+        guard let language else { return "und" }
+        let normalized = language
+            .replacingOccurrences(of: "_", with: "-")
+            .lowercased()
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { return "und" }
+
+        if let exact = isoLanguageCodeToBCP47[normalized] {
+            return exact
+        }
+
+        let parts = normalized.split(separator: "-", omittingEmptySubsequences: false)
+        if let first = parts.first,
+           let canonicalLanguage = isoLanguageCodeToBCP47[String(first)] {
+            return ([canonicalLanguage] + parts.dropFirst().map(Self.canonicalBCP47Subtag)).joined(separator: "-")
+        }
+
+        return parts.enumerated().map { index, subtag in
+            index == 0 ? String(subtag) : Self.canonicalBCP47Subtag(subtag)
+        }.joined(separator: "-")
+    }
+
+    nonisolated private static func canonicalBCP47Subtag(_ subtag: Substring) -> String {
+        let value = String(subtag)
+        if value.count == 2, value.allSatisfy(\.isLetter) {
+            return value.uppercased()
+        }
+        return value
     }
 
     /// Map an FFmpeg subtitle codec name to a short, user-facing format label.
@@ -438,6 +479,43 @@ extension AetherEngine {
         ["uk", "ukr", "ukrainian"], ["ro", "ron", "rum", "romanian"], ["sk", "slk", "slo", "slovak"],
         ["hr", "hrv", "croatian"], ["bg", "bul", "bulgarian"], ["sr", "srp", "serbian"],
         ["pt-br", "por"], ["pt-pt", "por"],
+    ]
+
+    nonisolated private static let isoLanguageCodeToBCP47: [String: String] = [
+        "de": "de", "deu": "de", "ger": "de",
+        "en": "en", "eng": "en",
+        "fr": "fr", "fra": "fr", "fre": "fr",
+        "es": "es", "spa": "es",
+        "it": "it", "ita": "it",
+        "ja": "ja", "jpn": "ja",
+        "ko": "ko", "kor": "ko",
+        "zh": "zh", "zho": "zh", "chi": "zh",
+        "pt": "pt", "por": "pt",
+        "ru": "ru", "rus": "ru",
+        "nl": "nl", "nld": "nl", "dut": "nl",
+        "sv": "sv", "swe": "sv",
+        "da": "da", "dan": "da",
+        "no": "no", "nor": "no",
+        "nb": "nb", "nob": "nb",
+        "nn": "nn", "nno": "nn",
+        "fi": "fi", "fin": "fi",
+        "pl": "pl", "pol": "pl",
+        "cs": "cs", "ces": "cs", "cze": "cs",
+        "hu": "hu", "hun": "hu",
+        "tr": "tr", "tur": "tr",
+        "el": "el", "ell": "el", "gre": "el",
+        "ar": "ar", "ara": "ar",
+        "he": "he", "heb": "he",
+        "hi": "hi", "hin": "hi",
+        "id": "id", "ind": "id",
+        "th": "th", "tha": "th",
+        "vi": "vi", "vie": "vi",
+        "uk": "uk", "ukr": "uk",
+        "ro": "ro", "ron": "ro", "rum": "ro",
+        "sk": "sk", "slk": "sk", "slo": "sk",
+        "hr": "hr", "hrv": "hr",
+        "bg": "bg", "bul": "bg",
+        "sr": "sr", "srp": "sr",
     ]
 
     // MARK: - Decoder identity helpers

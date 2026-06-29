@@ -317,7 +317,7 @@ public struct SubtitleRendition: Sendable, Equatable {
     public let renditionID: String
     /// Display name shown in the picker (the language label).
     public let name: String
-    /// ISO language code emitted as `LANGUAGE=` (fallback `"und"`).
+    /// BCP-47 language tag emitted as `LANGUAGE=` (fallback `"und"`).
     public let language: String
     /// The engine subtitle AVStream index (`TrackInfo.id`) this rendition stands for; the host decodes + paints this track's cues when the rendition is selected.
     public let trackIndex: Int
