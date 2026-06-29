@@ -22,6 +22,7 @@ struct LoadOptionsTests {
         #expect(opts.audioOnly == false)
         // #68: probe-budget overrides default to nil so the engine keeps the
         // built-in .playback budget (50 MB / 60 s) unless a caller opts in.
+        #expect(opts.subtitleLanguageHintsByStreamIndex.isEmpty)
         #expect(opts.probesize == nil)
         #expect(opts.maxAnalyzeDuration == nil)
     }
@@ -42,6 +43,10 @@ struct LoadOptionsTests {
         let c = LoadOptions(panelIsInHDRMode: true)
         let d = LoadOptions(panelIsInHDRMode: false)
         #expect(c != d)
+
+        let e = LoadOptions(subtitleLanguageHintsByStreamIndex: [2: "English"])
+        let f = LoadOptions(subtitleLanguageHintsByStreamIndex: [2: "German"])
+        #expect(e != f)
     }
 
     @Test("audioBridgeMode is preserved through init")
@@ -85,10 +90,10 @@ struct LoadOptionsTests {
 
     @Test("existing positional/labeled callers stay source-compatible")
     func sourceCompatibleWithExistingCallers() {
-        // The two new params are appended at the end with nil defaults, so a
-        // pre-#68 call site that omits them must still compile and leave the
-        // probe budget unset.
+        // Newer params have defaults, so older call sites that omit them must
+        // still compile and leave optional behavior unset.
         let opts = LoadOptions(httpHeaders: ["a": "b"])
+        #expect(opts.subtitleLanguageHintsByStreamIndex.isEmpty)
         #expect(opts.probesize == nil)
         #expect(opts.maxAnalyzeDuration == nil)
     }

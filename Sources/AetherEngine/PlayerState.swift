@@ -91,6 +91,12 @@ public struct LoadOptions: Sendable, Equatable {
     /// Declare a mov_text track in the init moov so text subtitles survive PiP / AirPlay / external display via AVMediaSelection. Bitmap codecs (PGS / DVB / DVD) excluded automatically. Default `false` (#55).
     public var prepareNativeSubtitles: Bool = false
 
+    /// Host-supplied subtitle language fallbacks keyed by source stream index. Used only when the container
+    /// subtitle stream has no language metadata, e.g. Plex knows a stream is English but the MKV stream itself
+    /// is unlabeled. Values may be ISO-639-1/2, BCP-47, or common English names; rendition generation
+    /// canonicalizes them for HLS. Default empty. (Rivulet fork-only.)
+    public var subtitleLanguageHintsByStreamIndex: [Int: String]
+
     /// Caller-bounded demux probe budget in bytes, mapped to `AVFormatContext.probesize` for the main playback open. nil keeps the engine default (50 MB). A smaller value speeds `find_stream_info` on slow remote sources whose sparse streams (PGS, mjpeg cover art) would otherwise read to the full budget. An over-tight budget fails OPEN, not closed: `find_stream_info` still returns success with a logged warning, so the session loads with late-resolving tracks silently missing rather than throwing a load error. The value is written to the context verbatim (FFmpeg's AVOption floor of 32 is bypassed), so validate track presence after load if you set this aggressively. The routing `probe(url:)` API and still extraction keep the full budget; the embedded subtitle side-demuxer caps its own probe (it only needs codec ids, not resolved sparse tracks) and tightens to this value when it is smaller (#76). Default nil (#68).
     public var probesize: Int64?
 
@@ -134,6 +140,7 @@ public struct LoadOptions: Sendable, Equatable {
         preserveASSMarkup: Bool = false,
         advertiseSubtitleRenditions: Bool = false,
         prepareNativeSubtitles: Bool = false,
+        subtitleLanguageHintsByStreamIndex: [Int: String] = [:],
         probesize: Int64? = nil,
         maxAnalyzeDuration: Int64? = nil,
         preferredAudioLanguages: [String] = [],
@@ -153,6 +160,7 @@ public struct LoadOptions: Sendable, Equatable {
         self.preserveASSMarkup = preserveASSMarkup
         self.advertiseSubtitleRenditions = advertiseSubtitleRenditions
         self.prepareNativeSubtitles = prepareNativeSubtitles
+        self.subtitleLanguageHintsByStreamIndex = subtitleLanguageHintsByStreamIndex
         self.probesize = probesize
         self.maxAnalyzeDuration = maxAnalyzeDuration
         self.preferredAudioLanguages = preferredAudioLanguages

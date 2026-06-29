@@ -49,7 +49,8 @@ extension AetherEngine {
     /// its declared name, then "Subtitle N"); `language` is the BCP-47 tag
     /// emitted into HLS (fallback "und").
     nonisolated static func makeSubtitleRenditions(
-        from tracks: [TrackInfo]
+        from tracks: [TrackInfo],
+        languageHintsByStreamIndex: [Int: String] = [:]
     ) -> [SubtitleRendition] {
         // The native picker lists each rendition by its NAME, and AVKit
         // collapses entries sharing NAME + LANGUAGE. Build a consistent,
@@ -63,7 +64,10 @@ extension AetherEngine {
         var renditions: [SubtitleRendition] = []
         var usedNameCounts: [String: Int] = [:]
         for (offset, track) in tracks.enumerated() {
-            let sourceLanguage = track.language?.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+            let containerLanguage = track.language?.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+            let sourceLanguage = (containerLanguage?.isEmpty == false)
+                ? containerLanguage
+                : languageHintsByStreamIndex[track.id]?.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
             let hlsLanguage = hlsLanguageTag(from: sourceLanguage)
             let localizedLang = (hlsLanguage != "und")
                 ? Locale.current.localizedString(forLanguageCode: hlsLanguage)
@@ -504,40 +508,40 @@ extension AetherEngine {
     ]
 
     nonisolated private static let isoLanguageCodeToBCP47: [String: String] = [
-        "de": "de", "deu": "de", "ger": "de",
-        "en": "en", "eng": "en",
-        "fr": "fr", "fra": "fr", "fre": "fr",
-        "es": "es", "spa": "es",
-        "it": "it", "ita": "it",
-        "ja": "ja", "jpn": "ja",
-        "ko": "ko", "kor": "ko",
-        "zh": "zh", "zho": "zh", "chi": "zh",
-        "pt": "pt", "por": "pt",
-        "ru": "ru", "rus": "ru",
-        "nl": "nl", "nld": "nl", "dut": "nl",
-        "sv": "sv", "swe": "sv",
-        "da": "da", "dan": "da",
-        "no": "no", "nor": "no",
+        "de": "de", "deu": "de", "ger": "de", "german": "de",
+        "en": "en", "eng": "en", "english": "en",
+        "fr": "fr", "fra": "fr", "fre": "fr", "french": "fr",
+        "es": "es", "spa": "es", "spanish": "es",
+        "it": "it", "ita": "it", "italian": "it",
+        "ja": "ja", "jpn": "ja", "japanese": "ja",
+        "ko": "ko", "kor": "ko", "korean": "ko",
+        "zh": "zh", "zho": "zh", "chi": "zh", "chinese": "zh",
+        "pt": "pt", "por": "pt", "portuguese": "pt",
+        "ru": "ru", "rus": "ru", "russian": "ru",
+        "nl": "nl", "nld": "nl", "dut": "nl", "dutch": "nl",
+        "sv": "sv", "swe": "sv", "swedish": "sv",
+        "da": "da", "dan": "da", "danish": "da",
+        "no": "no", "nor": "no", "norwegian": "no",
         "nb": "nb", "nob": "nb",
         "nn": "nn", "nno": "nn",
-        "fi": "fi", "fin": "fi",
-        "pl": "pl", "pol": "pl",
-        "cs": "cs", "ces": "cs", "cze": "cs",
-        "hu": "hu", "hun": "hu",
-        "tr": "tr", "tur": "tr",
-        "el": "el", "ell": "el", "gre": "el",
-        "ar": "ar", "ara": "ar",
-        "he": "he", "heb": "he",
-        "hi": "hi", "hin": "hi",
-        "id": "id", "ind": "id",
-        "th": "th", "tha": "th",
-        "vi": "vi", "vie": "vi",
-        "uk": "uk", "ukr": "uk",
-        "ro": "ro", "ron": "ro", "rum": "ro",
-        "sk": "sk", "slk": "sk", "slo": "sk",
-        "hr": "hr", "hrv": "hr",
-        "bg": "bg", "bul": "bg",
-        "sr": "sr", "srp": "sr",
+        "fi": "fi", "fin": "fi", "finnish": "fi",
+        "pl": "pl", "pol": "pl", "polish": "pl",
+        "cs": "cs", "ces": "cs", "cze": "cs", "czech": "cs",
+        "hu": "hu", "hun": "hu", "hungarian": "hu",
+        "tr": "tr", "tur": "tr", "turkish": "tr",
+        "el": "el", "ell": "el", "gre": "el", "greek": "el",
+        "ar": "ar", "ara": "ar", "arabic": "ar",
+        "he": "he", "heb": "he", "hebrew": "he",
+        "hi": "hi", "hin": "hi", "hindi": "hi",
+        "id": "id", "ind": "id", "indonesian": "id",
+        "th": "th", "tha": "th", "thai": "th",
+        "vi": "vi", "vie": "vi", "vietnamese": "vi",
+        "uk": "uk", "ukr": "uk", "ukrainian": "uk",
+        "ro": "ro", "ron": "ro", "rum": "ro", "romanian": "ro",
+        "sk": "sk", "slk": "sk", "slo": "sk", "slovak": "sk",
+        "hr": "hr", "hrv": "hr", "croatian": "hr",
+        "bg": "bg", "bul": "bg", "bulgarian": "bg",
+        "sr": "sr", "srp": "sr", "serbian": "sr",
     ]
 
     // MARK: - Decoder identity helpers

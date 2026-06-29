@@ -920,7 +920,10 @@ public final class AetherEngine: ObservableObject {
         // change). Mapping is published so the host can correlate the
         // picked legible option back to the engine subtitle track.
         subtitleRenditions = options.advertiseSubtitleRenditions
-            ? Self.makeSubtitleRenditions(from: probedSubtitleTracks)
+            ? Self.makeSubtitleRenditions(
+                from: probedSubtitleTracks,
+                languageHintsByStreamIndex: options.subtitleLanguageHintsByStreamIndex
+            )
             : []
         metadata = probeOpened ? probe.mediaMetadata() : nil
         fontAttachments = probeOpened ? probe.fontAttachmentInfos() : []

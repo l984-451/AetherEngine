@@ -43,6 +43,30 @@ final class SubtitleRenditionAdvertisementTests: XCTestCase {
         XCTAssertEqual(renditions[0].name, "Subtitle 1 (SRT)")
     }
 
+    func test_languageHintFillsMissingContainerLanguage() {
+        let renditions = AetherEngine.makeSubtitleRenditions(
+            from: [
+                TrackInfo(id: 2, name: "Track 2 (srt)", codec: "subrip", language: nil, isDefault: false),
+            ],
+            languageHintsByStreamIndex: [2: "English"]
+        )
+
+        XCTAssertEqual(renditions[0].language, "en")
+        XCTAssertEqual(renditions[0].name, "English (SRT)")
+    }
+
+    func test_containerLanguageBeatsLanguageHint() {
+        let renditions = AetherEngine.makeSubtitleRenditions(
+            from: [
+                TrackInfo(id: 2, name: "", codec: "subrip", language: "deu", isDefault: false),
+            ],
+            languageHintsByStreamIndex: [2: "English"]
+        )
+
+        XCTAssertEqual(renditions[0].language, "de")
+        XCTAssertEqual(renditions[0].name, "German (SRT)")
+    }
+
     func test_genericTrackTitleIsNotUsedAsDisplayName() {
         let renditions = AetherEngine.makeSubtitleRenditions(from: [
             TrackInfo(id: 2, name: "Track 2 (srt)", codec: "subrip", language: nil, isDefault: false),
@@ -61,6 +85,7 @@ final class SubtitleRenditionAdvertisementTests: XCTestCase {
         XCTAssertEqual(AetherEngine.hlsLanguageTag(from: "eng"), "en")
         XCTAssertEqual(AetherEngine.hlsLanguageTag(from: "deu"), "de")
         XCTAssertEqual(AetherEngine.hlsLanguageTag(from: "ger"), "de")
+        XCTAssertEqual(AetherEngine.hlsLanguageTag(from: "English"), "en")
         XCTAssertEqual(AetherEngine.hlsLanguageTag(from: "EN_us"), "en-US")
         XCTAssertEqual(AetherEngine.hlsLanguageTag(from: nil), "und")
     }
